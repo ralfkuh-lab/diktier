@@ -176,6 +176,9 @@ pub fn quote_exec(exe: &Path) -> Result<String, AutostartError> {
                     out.push_str("\\\\");
                     out.push(ch);
                 }
+                // Desktop Entry 1.5: `%` leitet Feldcodes ein (`%f`, `%u`, …);
+                // ein literales Prozentzeichen muss verdoppelt werden (agy B3).
+                '%' => out.push_str("%%"),
                 _ => out.push(ch),
             }
         }
@@ -284,6 +287,24 @@ mod tests {
         let quoted = quote_exec(Path::new("/tmp/a$b`c\\d\"e/diktier")).unwrap();
         assert_eq!(quoted, r#""/tmp/a\\$b\\`c\\\\d\\"e/diktier""#, "{quoted}");
         assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+    }
+
+    /// Desktop Entry 1.5: `%` leitet Feldcodes ein, ein literales Prozentzeichen
+    /// muss `%%` werden — sonst schluckt der Autostart Teile des Pfades (agy B3).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_doubles_literal_percent_signs() {
+        let quoted = quote_exec(Path::new("/tmp/100%/diktier")).unwrap();
+        assert_eq!(quoted, "\"/tmp/100%%/diktier\"", "{quoted}");
+
+        // Ein Pfad, der wie ein Feldcode aussieht, darf keiner werden.
+        let quoted = quote_exec(Path::new("/tmp/%f%u/diktier")).unwrap();
+        assert_eq!(quoted, "\"/tmp/%%f%%u/diktier\"", "{quoted}");
+
+        let (_home, path) = temp_home();
+        install_at(&path, Path::new("/tmp/a%20b/diktier")).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Exec=\"/tmp/a%%20b/diktier\""), "{text}");
     }
 
     #[cfg(target_os = "linux")]

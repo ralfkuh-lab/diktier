@@ -17,6 +17,7 @@
 // Windows-Zweig — wie in `download.rs` ist das kein toter Code.
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -113,7 +114,14 @@ fn acquire_all(
     on_problem: &mut dyn FnMut(String),
 ) -> Result<InstanceAcquire, LockError> {
     let mut held: Vec<FileLock> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     for path in candidates {
+        // codex M4: Zeigen zwei Kandidaten (Symlink, `..`, gleicher Pfad) auf
+        // dieselbe Datei, sähe der zweite `open()+flock()` den **eigenen** Lock
+        // als „belegt" — der erste Daemon sperrte sich selbst aus.
+        if !seen.insert(identity(path)) {
+            continue;
+        }
         match try_lock(path) {
             Ok(Acquire::Held(lock)) => held.push(lock),
             // Ein belegter Ort genügt: es läuft schon einer. Die bereits
@@ -132,6 +140,25 @@ fn acquire_all(
         )));
     }
     Ok(InstanceAcquire::Held(InstanceLock { locks: held }))
+}
+
+/// Stabile Identität eines Sperrkandidaten.
+///
+/// Die Datei selbst existiert beim ersten Start noch nicht, das Verzeichnis
+/// aber schon (`try_lock` legt es an) — deshalb wird das **Elternverzeichnis**
+/// aufgelöst und der Dateiname angehängt. Lässt sich nichts auflösen, bleibt
+/// der Pfad selbst der Schlüssel: dann sind zwei Schreibweisen zwar nicht
+/// erkennbar, aber auch nicht schlechter als vorher.
+fn identity(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            match parent.canonicalize() {
+                Ok(dir) => dir.join(name),
+                Err(_) => path.to_path_buf(),
+            }
+        }
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Ort des per-user Download-Locks aus §6.3 — dieselbe Reihenfolge wie bei der
@@ -369,6 +396,48 @@ mod tests {
         // Beide Orte sind jetzt belegt — egal, welchen ein zweiter Start ansieht.
         assert!(matches!(try_lock(&runtime).unwrap(), Acquire::Busy));
         assert!(matches!(try_lock(&state).unwrap(), Acquire::Busy));
+    }
+
+    /// codex M4: Derselbe Pfad zweimal in der Liste darf den ersten Start nicht
+    /// gegen sich selbst sperren.
+    #[test]
+    fn duplicate_candidates_do_not_lock_the_process_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run").join(INSTANCE_LOCK_NAME);
+
+        let mut noop = quiet();
+        let held = match acquire_all(&[path.clone(), path.clone()], &mut noop).unwrap() {
+            InstanceAcquire::Held(lock) => lock,
+            InstanceAcquire::Busy => panic!("der eigene Lock darf nicht als belegt gelten"),
+        };
+        assert_eq!(held.paths().count(), 1, "genau eine Sperre");
+    }
+
+    /// Derselbe Fall über einen Symlink: `$XDG_RUNTIME_DIR` zeigt auf dasselbe
+    /// Verzeichnis wie der State-Fallback (codex M4).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlinked_candidates_are_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("state");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = dir.path().join("run");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let via_real = real.join(INSTANCE_LOCK_NAME);
+        let via_alias = alias.join(INSTANCE_LOCK_NAME);
+        assert_ne!(via_real, via_alias, "lexikalisch verschieden");
+        assert_eq!(identity(&via_real), identity(&via_alias), "gleiche Datei");
+
+        let mut noop = quiet();
+        let held = match acquire_all(&[via_alias, via_real.clone()], &mut noop).unwrap() {
+            InstanceAcquire::Held(lock) => lock,
+            InstanceAcquire::Busy => panic!("Selbstsperre über den Symlink-Alias"),
+        };
+        assert_eq!(held.paths().count(), 1);
+
+        // Ein echter zweiter Start sieht die Datei weiterhin als belegt.
+        assert!(matches!(try_lock(&via_real).unwrap(), Acquire::Busy));
     }
 
     /// Der Fall, der mit reinem Fallback zwei Instanzen erlaubte: A kennt nur

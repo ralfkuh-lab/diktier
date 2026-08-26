@@ -32,18 +32,20 @@ use std::time::{Duration, Instant};
 
 use crate::config::{self, ConfigError};
 use crate::download::{self, ArtifactManifest, load_manifest};
+use crate::hotkey::HotkeySpec;
 use crate::inject::ClipboardSave;
 use crate::paths;
 use crate::single_instance::{self, InstanceAcquire};
 use crate::state::{
-    AppState, AudioInfo, CopyReason, ErrorKind, Event, LogEvent, RunId, Runtime, transition,
+    AppState, AudioInfo, CopyReason, ErrorInfo, ErrorKind, Event, LogEvent, RunId, Runtime,
 };
 use crate::tray;
 
-use dispatch::{Actors, Timers, dispatch};
+use dispatch::{Actors, QuitLatch, Timers, drive, enqueue_batch};
 use logging::Logger;
 use workers::{
     AudioWorker, DownloadWorker, EngineWorker, HotkeyWorker, InjectWorker, Msg, TrayWorker,
+    WorkerKind,
 };
 
 /// Takt der Kern-Uhr (`Event::Tick`). Kurz genug, dass Tray-Klicks und
@@ -104,17 +106,77 @@ fn attach_file_log(log: &Logger, foreground: bool) {
     }
 }
 
+/// §8-Tabelle „Fatal … Tray `error`" (codex M3): Ein Configfehler beendet den
+/// Prozess nicht stumm, sondern zeigt einen bedienbaren Tray, der den Grund
+/// nennt, den Config-Ordner öffnet und sich beenden lässt. Ohne Audio, ohne
+/// Hotkey, ohne Engine — es gibt nichts zu diktieren.
+///
+/// Scheitert schon der Tray, gilt weiter §10: Prozessende, Exit 1.
+fn config_error_mode(message: String, log: &Arc<Logger>) -> u8 {
+    log.error(&message);
+    signals::install();
+
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let mut tray = match TrayWorker::spawn(
+        config::DEFAULT_MODEL.to_string(),
+        AppState::Error,
+        false,
+        tx,
+        log.clone(),
+    ) {
+        Ok(worker) => worker,
+        Err(err) => {
+            log.error(format!("Tray-Aufbau gescheitert: {err}"));
+            return 1;
+        }
+    };
+    tray.update(
+        AppState::Error,
+        false,
+        Some(ErrorInfo {
+            kind: ErrorKind::Config,
+            message,
+        }),
+    );
+    log.info("Configfehler — Tray zeigt `error`, Beenden über das Menü");
+
+    loop {
+        if signals::take_quit_request() {
+            break;
+        }
+        match rx.recv_timeout(TICK) {
+            Ok(Msg::Event(Event::QuitRequested)) => break,
+            Ok(Msg::OpenConfigDir) => match tray::open_config_dir() {
+                Ok(()) => log.info("Config-Ordner geöffnet"),
+                Err(err) => log.warn(format!("Config-Ordner: {err}")),
+            },
+            Ok(Msg::TrayLost(err)) => {
+                log.error(format!("Tray verloren: {err}"));
+                break;
+            }
+            // Pause/Tray-Click haben ohne Engine keine Wirkung.
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    tray.shutdown(Duration::from_secs(2));
+    // §9: Bedien-/Configfehler.
+    2
+}
+
 fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
     let log = log.clone();
     let loaded = match config::load() {
         Ok(loaded) => loaded,
-        Err(err) => {
-            log.error(err.to_string());
-            return match err {
-                ConfigError::Io(_) => 1,
-                _ => 2,
-            };
+        Err(ConfigError::Io(err)) => {
+            // Kein Config-Inhalt, sondern ein I/O-Problem: dafür sieht §8 keinen
+            // bedienbaren Zustand vor.
+            log.error(format!("Config-Datei: {err}"));
+            return 1;
         }
+        // §8-Tabelle: „kein Hotkey, keine Aufnahme, Tray `error`" (codex M3).
+        Err(err) => return config_error_mode(err.to_string(), &log),
     };
     for warning in &loaded.warnings {
         log.warn(format!("Config: {warning}"));
@@ -132,12 +194,15 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
         }
     };
     if config.engine.model != manifest.key {
-        // §6.2: unbekannter Modellschlüssel ist ein fataler Configfehler.
-        log.error(format!(
-            "engine.model {:?} ist unbekannt — v1 kennt nur {:?}",
-            config.engine.model, manifest.key
-        ));
-        return 2;
+        // §6.2: unbekannter Modellschlüssel ist ein fataler Configfehler —
+        // auch der zeigt sich im Tray (§8-Tabelle, codex M3).
+        return config_error_mode(
+            format!(
+                "engine.model {:?} ist unbekannt — v1 kennt nur {:?}",
+                config.engine.model, manifest.key
+            ),
+            &log,
+        );
     }
 
     signals::install();
@@ -179,8 +244,31 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
         }
     };
 
-    let audio = AudioWorker::spawn(config.audio.clone(), tx.clone(), log.clone());
-    let hotkey = HotkeyWorker::spawn(tx.clone(), log.clone());
+    // codex M2: Ein Worker, der nicht startet, ist ein Startfehler — sonst
+    // liefe der Daemon ohne Mikrofon bzw. ohne Hotkey stumm weiter.
+    let audio = match AudioWorker::spawn(config.audio.clone(), tx.clone(), log.clone()) {
+        Ok(worker) => worker,
+        Err(err) => {
+            log.error(format!("Audio-Worker nicht gestartet: {err}"));
+            let (mut inject, mut tray_worker) = (inject, tray_worker);
+            inject.shutdown(Duration::from_secs(2));
+            tray_worker.shutdown(Duration::from_secs(2));
+            return 1;
+        }
+    };
+    // §4.4: Die konfigurierte Taste — nicht mehr hart F9 (codex H3).
+    let spec = HotkeySpec::from_config(&config.hotkey);
+    let hotkey = match HotkeyWorker::spawn(spec.clone(), tx.clone(), log.clone()) {
+        Ok(worker) => worker,
+        Err(err) => {
+            log.error(format!("Hotkey-Worker nicht gestartet: {err}"));
+            let (mut inject, mut tray_worker, mut audio) = (inject, tray_worker, audio);
+            inject.shutdown(Duration::from_secs(2));
+            tray_worker.shutdown(Duration::from_secs(2));
+            audio.shutdown(Duration::from_secs(2));
+            return 1;
+        }
+    };
 
     let mut daemon = Daemon {
         log: log.clone(),
@@ -192,10 +280,13 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
         inject,
         tray: tray_worker,
         hotkey,
+        hotkey_grabbed: true,
         download: None,
         pending_audio: None,
         emitted: Vec::new(),
-        quit: false,
+        tray_dirty: false,
+        shown: None,
+        audio_intent: None,
     };
 
     let cap = Duration::from_secs(u64::from(config.audio.max_duration_secs.max(1)));
@@ -216,18 +307,103 @@ struct Daemon {
     inject: InjectWorker,
     tray: TrayWorker,
     hotkey: HotkeyWorker,
+    /// §4.4: Hält der Hotkey-Worker die Taste gerade gegriffen?
+    hotkey_grabbed: bool,
     /// Läuft nur, solange der Kern in `downloading` steht (§6.3).
     download: Option<DownloadWorker>,
     /// Samples der letzten Aufnahme; der Kern kennt nur ihre Länge.
     pending_audio: Option<(RunId, Vec<f32>)>,
     /// Events, die ein Effekt synchron erzeugt hat (Artefaktprüfung, Fehler).
     emitted: Vec<Event>,
-    quit: bool,
+    /// Der Kern hat `UpdateTray` gemeldet — beim nächsten Abgleich neu malen.
+    tray_dirty: bool,
+    /// Was der Tray zuletzt gezeigt hat (inklusive Fehlergrund, codex M1).
+    shown: Option<Presentation>,
+    /// Was das Audio-Gerät zuletzt tun sollte (agy B5).
+    audio_intent: Option<AudioIntent>,
+}
+
+/// Sichtbarer Zustand — mehr, als `Effect::UpdateTray` transportiert: der
+/// Fehlergrund kommt aus dem `Runtime` dazu, damit §4.4 („Tooltip nennt den
+/// Konflikt") erfüllt ist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Presentation {
+    state: AppState,
+    paused: bool,
+    error: Option<ErrorInfo>,
+}
+
+/// agy B5: Der Gerätelebenszyklus hängt jetzt am beobachteten Kernzustand,
+/// nicht mehr als Seiteneffekt am Tray-Update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioIntent {
+    /// §5: In `idle` steht das Gerät bereit, damit die Aufnahme sofort startet.
+    Ready,
+    /// §4.3: Pausiert heißt „jetzt nicht diktieren" — Mikrofon hergeben.
+    Released,
+}
+
+/// Was soll mit dem Aufnahmegerät geschehen? `None` = nicht anfassen
+/// (`recording` gehört dem laufenden Diktat, in der Startsequenz und in
+/// `transcribing`/`injecting` folgt gleich wieder `idle`).
+fn audio_intent(runtime: &Runtime) -> Option<AudioIntent> {
+    match runtime.state {
+        AppState::Idle if runtime.paused => Some(AudioIntent::Released),
+        AppState::Idle => Some(AudioIntent::Ready),
+        _ => None,
+    }
 }
 
 impl Daemon {
-    fn take_emitted(&mut self) -> Vec<Event> {
-        std::mem::take(&mut self.emitted)
+    /// Nach jedem Kern-Durchlauf: Tray, Hotkey-Grab und Audio-Gerät an den
+    /// tatsächlichen Zustand angleichen. Bewusst **hier** und nicht im
+    /// `UpdateTray`-Effekt — Geräte- und Grab-Steuerung sind eigene Anliegen
+    /// (agy B5), und der Fehlergrund steht nur im `Runtime` (codex M1).
+    fn flush_presentation(&mut self, runtime: &Runtime) {
+        let next = Presentation {
+            state: runtime.state,
+            paused: runtime.paused,
+            error: runtime.error.clone(),
+        };
+        if self.tray_dirty || self.shown.as_ref() != Some(&next) {
+            self.tray
+                .update(next.state, next.paused, next.error.clone());
+            self.shown = Some(next);
+            self.tray_dirty = false;
+        }
+
+        // §4.4: „paused = Hotkey aus" heißt Grab freigeben, nicht nur ignorieren.
+        let grabbed = !runtime.paused;
+        if self.hotkey_grabbed != grabbed {
+            self.hotkey.set_grabbed(grabbed);
+            self.hotkey_grabbed = grabbed;
+        }
+
+        if let Some(intent) = audio_intent(runtime)
+            && self.audio_intent != Some(intent)
+        {
+            match intent {
+                AudioIntent::Ready => self.audio.prepare(),
+                AudioIntent::Released => self.audio.release(),
+            }
+            self.audio_intent = Some(intent);
+        }
+    }
+
+    /// codex M2: Ein ausgefallener Worker wird vergessen, damit der nächste
+    /// Anlauf einen frischen spawnt statt in einen toten Kanal zu schreiben.
+    fn forget_worker(&mut self, what: WorkerKind) {
+        match what {
+            WorkerKind::Engine => {
+                if let Some(engine) = self.engine.take() {
+                    engine.abandon();
+                }
+            }
+            // Audio und Inject leben so lange wie der Daemon; ein Neuaufbau
+            // wäre ein eigener Fehlerpfad (§6.4 heilt das Mikrofon über den
+            // nächsten Press, der Inject-Sink über das nächste Diktat).
+            WorkerKind::Audio | WorkerKind::Inject => {}
+        }
     }
 
     /// §6.3: Existenz und Größe der Artefakte. Der SHA-256-Vollcheck gehört in
@@ -352,22 +528,37 @@ impl Actors for Daemon {
             run,
             format!("Modellartefakte fehlen in {}", self.model_dir_hint()),
         );
-        self.download = Some(DownloadWorker::spawn(
+        match DownloadWorker::spawn(
             run,
             self.manifest.clone(),
             self.tx.clone(),
             self.log.clone(),
-        ));
+        ) {
+            Ok(worker) => self.download = Some(worker),
+            // codex M2: sonst bliebe der Kern für immer in `downloading`.
+            Err(message) => {
+                self.log.error(&message);
+                self.emitted.push(Event::DownloadFailed { run, message });
+            }
+        }
     }
 
     fn load_model(&mut self, run: RunId) {
         if self.engine.is_none() {
-            self.engine = Some(EngineWorker::spawn(
+            match EngineWorker::spawn(
                 self.manifest.key.clone(),
                 self.threads,
                 self.tx.clone(),
                 self.log.clone(),
-            ));
+            ) {
+                Ok(worker) => self.engine = Some(worker),
+                // codex M2: sonst bliebe der Kern für immer in `loading`.
+                Err(message) => {
+                    self.log.error(&message);
+                    self.emitted.push(Event::ModelLoadFailed { run, message });
+                    return;
+                }
+            }
         }
         if let Some(engine) = &self.engine {
             self.log.run(run, "Modell wird geladen");
@@ -441,25 +632,9 @@ impl Actors for Daemon {
 
     fn update_tray(&mut self, state: AppState, paused: bool) {
         self.log.transition(state, paused);
-        self.tray.update(state, paused);
-        // §5: „Aufnahme aus `idle` startet sofort." Das Gerät wird deshalb im
-        // Ruhezustand offen gehalten — sonst kostet jeder Aufnahmestart das
-        // Neuöffnen (~2 s gemessen) und schneidet den Anfang des Diktats ab.
-        //
-        // §4.3: `paused` heißt „jetzt nicht diktieren" — dann gibt Diktier das
-        // Mikrofon wieder her (Owner-Entscheidung 3c). Der Tray-Click bleibt
-        // bedienbar, zahlt in der Pause aber wieder den Geräteanlauf.
-        //
-        // Beide Kommandos sind idempotent; die übrigen Zustände fassen das
-        // Gerät nicht an (`recording` gehört dem laufenden Diktat, und in
-        // `transcribing`/`injecting` folgt gleich wieder `idle`).
-        if state == AppState::Idle {
-            if paused {
-                self.audio.release();
-            } else {
-                self.audio.prepare();
-            }
-        }
+        // Gemalt wird im Abgleich nach dem Kern-Durchlauf: erst dort steht der
+        // Fehlergrund für den Tooltip zur Verfügung (codex M1).
+        self.tray_dirty = true;
     }
 
     fn log(&mut self, event: &LogEvent) {
@@ -467,7 +642,17 @@ impl Actors for Daemon {
     }
 
     fn quit(&mut self) {
-        self.quit = true;
+        self.log.info("Kern hat das Beenden bestätigt");
+    }
+
+    fn output_suppressed(&mut self, run: RunId) {
+        // §5.2: „kein Inject mehr" — der Text bleibt, wo er ist.
+        self.log
+            .run(run, "Ausgabe nach dem Beenden unterdrückt (kein Inject)");
+    }
+
+    fn take_emitted(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.emitted)
     }
 }
 
@@ -480,27 +665,34 @@ enum Flow {
 fn event_loop(daemon: &mut Daemon, runtime: &mut Runtime, rx: &Receiver<Msg>) -> u8 {
     let mut queue: VecDeque<Event> = VecDeque::new();
     let mut timers = Timers::default();
+    let mut latch = QuitLatch::default();
     let mut hotkey_error: Option<String> = None;
     let mut last_tick = Instant::now();
     queue.push_back(Event::Startup);
 
     loop {
-        // 1. Kern treiben, bis nichts mehr ansteht.
-        while let Some(event) = queue.pop_front() {
-            let effects = transition(runtime, event);
-            dispatch(effects, &mut timers, daemon, Instant::now());
-            queue.extend(daemon.take_emitted());
-            if daemon.quit {
-                return 0;
+        // 1. §5.2/codex H2: Das Quit hat Vorrang **vor** allem, was schon in
+        //    der Queue liegt — sonst injizierte ein zeitgleich eingetroffenes
+        //    Engine-Ergebnis noch, bevor der Kern das Beenden sieht.
+        if signals::take_quit_request() {
+            if latch.close() {
+                daemon.log.info("Signal empfangen — Beenden angefordert");
             }
+            queue.push_front(Event::QuitRequested);
         }
 
-        // 2. SIGTERM/SIGINT auf den regulären Quit-Pfad.
-        if signals::take_quit_request() {
-            daemon.log.info("Signal empfangen — Beenden angefordert");
-            queue.push_back(Event::QuitRequested);
-            continue;
+        // 2. Kern treiben, bis nichts mehr ansteht.
+        if drive(
+            &mut queue,
+            runtime,
+            &mut timers,
+            daemon,
+            &mut latch,
+            Instant::now(),
+        ) {
+            return 0;
         }
+        daemon.flush_presentation(runtime);
 
         // 3. §4.4/§10: Der Hotkey-Fehler wird erst gemeldet, wenn das Modell
         //    steht. Sonst stürbe die Startsequenz, und der Tray-Click — der
@@ -517,15 +709,17 @@ fn event_loop(daemon: &mut Daemon, runtime: &mut Runtime, rx: &Receiver<Msg>) ->
         }
 
         // 4. Auf Worker-Nachrichten warten — höchstens bis zum nächsten Tick
-        //    bzw. bis zur nächsten Frist.
+        //    bzw. bis zur nächsten Frist. Die ganze Batch wird eingesammelt und
+        //    gemeinsam einsortiert, damit ein Quit darin nach vorn kommt.
         let now = Instant::now();
         let mut wait = (last_tick + TICK).saturating_duration_since(now);
         if let Some(deadline) = timers.next_deadline() {
             wait = wait.min(deadline.saturating_duration_since(now));
         }
+        let mut batch: Vec<Event> = Vec::new();
         match rx.recv_timeout(wait.max(Duration::from_millis(1))) {
             Ok(msg) => {
-                if let Flow::Stop(code) = handle_msg(msg, &mut queue, daemon, &mut hotkey_error) {
+                if let Flow::Stop(code) = handle_msg(msg, &mut batch, daemon, &mut hotkey_error) {
                     return code;
                 }
             }
@@ -533,9 +727,12 @@ fn event_loop(daemon: &mut Daemon, runtime: &mut Runtime, rx: &Receiver<Msg>) ->
             Err(RecvTimeoutError::Disconnected) => return 1,
         }
         while let Ok(msg) = rx.try_recv() {
-            if let Flow::Stop(code) = handle_msg(msg, &mut queue, daemon, &mut hotkey_error) {
+            if let Flow::Stop(code) = handle_msg(msg, &mut batch, daemon, &mut hotkey_error) {
                 return code;
             }
+        }
+        if enqueue_batch(&mut queue, batch) && latch.close() {
+            daemon.log.info("Beenden angefordert — keine Ausgabe mehr");
         }
 
         // 5. Fristen **vor** dem Tick: sonst löst die Kern-Uhr denselben
@@ -554,24 +751,31 @@ fn event_loop(daemon: &mut Daemon, runtime: &mut Runtime, rx: &Receiver<Msg>) ->
 
 fn handle_msg(
     msg: Msg,
-    queue: &mut VecDeque<Event>,
+    batch: &mut Vec<Event>,
     daemon: &mut Daemon,
     hotkey_error: &mut Option<String>,
 ) -> Flow {
     match msg {
-        Msg::Event(event) => queue.push_back(event),
+        Msg::Event(event) => batch.push(event),
         Msg::Audio { run, samples } => {
             let audio = AudioInfo {
                 duration: audio_duration(samples.len()),
             };
             daemon.pending_audio = Some((run, samples));
-            queue.push_back(Event::AudioReady { run, audio });
+            batch.push(Event::AudioReady { run, audio });
         }
         Msg::HotkeyUnavailable(message) => {
             daemon.log.warn(format!(
                 "Hotkey nicht verfügbar: {message} — Tray-Linksklick bleibt bedienbar"
             ));
             *hotkey_error = Some(message);
+        }
+        // codex M2: Ein Worker, der nicht mehr erreichbar ist, darf den Daemon
+        // nicht stumm hängen lassen — er wird zum Fehlerzustand seiner Klasse.
+        Msg::WorkerFailed { what, message } => {
+            daemon.log.error(format!("{}: {message}", what.label()));
+            daemon.forget_worker(what);
+            batch.push(what.to_fatal(message));
         }
         Msg::TrayLost(message) => {
             // §10: ohne Tray gibt es keinen zweiten GUI-Kanal.
@@ -607,5 +811,48 @@ mod tests {
         assert_eq!(remaining(past), Duration::ZERO);
         let future = Instant::now() + Duration::from_secs(30);
         assert!(remaining(future) > Duration::from_secs(29));
+    }
+
+    fn runtime_in(state: AppState, paused: bool) -> Runtime {
+        Runtime {
+            state,
+            paused,
+            ..Runtime::default()
+        }
+    }
+
+    /// agy B5: Der Gerätezustand hängt am Kernzustand, nicht am Tray-Effekt.
+    /// In `idle` bereit, pausiert freigegeben — sonst wird nichts angefasst.
+    #[test]
+    fn audio_intent_follows_the_core_state() {
+        assert_eq!(
+            audio_intent(&runtime_in(AppState::Idle, false)),
+            Some(AudioIntent::Ready)
+        );
+        assert_eq!(
+            audio_intent(&runtime_in(AppState::Idle, true)),
+            Some(AudioIntent::Released)
+        );
+        for state in [
+            AppState::Starting,
+            AppState::Downloading,
+            AppState::Loading,
+            AppState::Error,
+            AppState::Recording {
+                source: crate::state::RecordingSource::Hotkey,
+            },
+            AppState::Transcribing {
+                source: crate::state::RecordingSource::Hotkey,
+            },
+            AppState::Injecting {
+                source: crate::state::RecordingSource::TrayClick,
+            },
+        ] {
+            assert_eq!(
+                audio_intent(&runtime_in(state, false)),
+                None,
+                "{state:?} darf das Gerät nicht anfassen"
+            );
+        }
     }
 }

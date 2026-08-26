@@ -21,7 +21,7 @@ use clap::Parser;
 use audio::{AudioError, AudioSource, CpalAudioSource};
 use config::ConfigError;
 use engine::{ParakeetTranscriber, transcribe_pcm};
-use hotkey::{HotkeyBackend, HotkeyEvent, new_backend};
+use hotkey::{HotkeyBackend, HotkeyEvent, HotkeySpec, new_backend};
 use inject::{CaptureContext, InjectOutcome, OutputSink};
 use state::{AppState, RecordingSource, Runtime};
 use tray::{TrayBackend, TrayEvent};
@@ -368,8 +368,25 @@ fn format_window(id: Option<inject::WindowId>) -> String {
 
 fn hotkey_test() -> u8 {
     eprintln!("SPIKE --hotkey-test (kein Produktionspfad)");
-    eprintln!("SPIKE: F9 30s lang halten/loslassen; Exit mit Ctrl+C");
-    let mut backend = new_backend();
+    // §4.4: die konfigurierte Taste, nicht mehr hart F9.
+    let spec = match config::load() {
+        Ok(loaded) => HotkeySpec::from_config(&loaded.config.hotkey),
+        Err(err) => {
+            eprintln!("{err}");
+            return 2;
+        }
+    };
+    eprintln!(
+        "SPIKE: {} 30s lang halten/loslassen; Exit mit Ctrl+C",
+        spec.describe()
+    );
+    let mut backend = match new_backend(&spec) {
+        Ok(backend) => backend,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
     eprintln!("SPIKE hotkey-backend={}", backend.backend_name());
     if let Err(err) = backend.register() {
         eprintln!("{err}");

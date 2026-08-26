@@ -5,9 +5,10 @@
 //! Beides ist über das Trait [`Actors`] gegen Fakes testbar — der echte Daemon
 //! implementiert es mit Threads, die Tests mit einem Rekorder.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::state::{AppState, CopyReason, Effect, Event, LogEvent, RunId};
+use crate::state::{AppState, CopyReason, Effect, Event, LogEvent, RunId, Runtime, transition};
 
 /// Ausgabeseite des Wirings: eine Methode je Aktionseffekt.
 pub trait Actors {
@@ -28,6 +29,80 @@ pub trait Actors {
     fn update_tray(&mut self, state: AppState, paused: bool);
     fn log(&mut self, event: &LogEvent);
     fn quit(&mut self);
+    /// §5.2 „kein Inject mehr": Ein Ausgabeeffekt wurde nach dem Quit-Latch
+    /// verworfen. Nur zum Protokollieren — es passiert nichts mehr.
+    fn output_suppressed(&mut self, run: RunId);
+    /// Events, die ein Effekt synchron erzeugt hat (Artefaktprüfung, Fehler).
+    fn take_emitted(&mut self) -> Vec<Event> {
+        Vec::new()
+    }
+}
+
+/// §5.2 „Beenden während Inferenz: … kein Inject mehr."
+///
+/// Der Kern verwirft nach `QuitRequested` alles (`IgnoredAfterQuit`), aber
+/// zwischen einem zeitgleich eintreffenden Engine-Ergebnis und dem Quit gäbe es
+/// sonst eine Prioritätsinversion: FIFO würde erst `StartInject` dispatchen und
+/// den Lauf danach verwerfen (codex H2). Der Latch schließt in dem Moment, in
+/// dem das Quit **bekannt** wird — nicht erst, wenn der Kern es verarbeitet hat.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct QuitLatch {
+    closed: bool,
+}
+
+impl QuitLatch {
+    /// `true`, wenn dieser Aufruf den Latch geschlossen hat (für genau eine
+    /// Logzeile).
+    pub fn close(&mut self) -> bool {
+        let first = !self.closed;
+        self.closed = true;
+        first
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+/// Eine empfangene Nachrichten-Batch einreihen — ein enthaltenes
+/// `QuitRequested` kommt **vor** allem, was schon wartet (codex H2).
+/// Rückgabe: war ein Quit dabei?
+pub fn enqueue_batch(queue: &mut VecDeque<Event>, batch: Vec<Event>) -> bool {
+    let has_quit = batch.iter().any(|e| matches!(e, Event::QuitRequested));
+    if has_quit {
+        queue.push_front(Event::QuitRequested);
+    }
+    for event in batch {
+        if matches!(event, Event::QuitRequested) {
+            continue;
+        }
+        queue.push_back(event);
+    }
+    has_quit
+}
+
+/// Die Queue vollständig abarbeiten: Kern rechnen lassen, Effekte verteilen,
+/// synchron erzeugte Events anhängen. Rückgabe: `true` = der Kern hat `Quit`
+/// gemeldet, die Event-Loop endet.
+pub fn drive<A: Actors>(
+    queue: &mut VecDeque<Event>,
+    runtime: &mut Runtime,
+    timers: &mut Timers,
+    actors: &mut A,
+    latch: &mut QuitLatch,
+    now: Instant,
+) -> bool {
+    while let Some(event) = queue.pop_front() {
+        let effects = transition(runtime, event);
+        let quit = dispatch(effects, timers, actors, latch, now);
+        for extra in actors.take_emitted() {
+            queue.push_back(extra);
+        }
+        if quit {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,12 +180,15 @@ impl Timers {
 }
 
 /// Ein Effektpaket ausführen. Reihenfolge bleibt exakt die des Kerns.
+/// Rückgabe: `true`, wenn `Effect::Quit` dabei war.
 pub fn dispatch<A: Actors>(
     effects: Vec<Effect>,
     timers: &mut Timers,
     actors: &mut A,
+    latch: &mut QuitLatch,
     now: Instant,
-) {
+) -> bool {
+    let mut quit = false;
     for effect in effects {
         match effect {
             Effect::CheckArtifacts { run } => actors.check_artifacts(run),
@@ -128,23 +206,40 @@ pub fn dispatch<A: Actors>(
             }
             Effect::StartTranscription { run } => actors.start_transcription(run),
             Effect::AbortTranscription { run } => actors.abort_transcription(run),
-            Effect::StartInject { run, text } => actors.start_inject(run, text),
-            Effect::CopyOnly { run, text, reason } => actors.copy_only(run, text, reason),
+            // §5.2: Nach dem Quit verlässt kein Text mehr den Prozess.
+            Effect::StartInject { run, text } => {
+                if latch.is_closed() {
+                    actors.output_suppressed(run);
+                } else {
+                    actors.start_inject(run, text);
+                }
+            }
+            Effect::CopyOnly { run, text, reason } => {
+                if latch.is_closed() {
+                    actors.output_suppressed(run);
+                } else {
+                    actors.copy_only(run, text, reason);
+                }
+            }
             Effect::UpdateTray { state, paused } => actors.update_tray(state, paused),
             Effect::ArmWatchdog { run, timeout } => timers.arm_watchdog(run, timeout, now),
             Effect::DisarmWatchdog => timers.disarm_watchdog(),
             Effect::Log(event) => actors.log(&event),
-            Effect::Quit => actors.quit(),
+            Effect::Quit => {
+                latch.close();
+                quit = true;
+                actors.quit();
+            }
         }
     }
+    quit
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{
-        AudioInfo, InjectReport, RecordingSource, Runtime, WATCHDOG_MIN, transition,
-        watchdog_timeout,
+        AudioInfo, InjectReport, RecordingSource, Runtime, WATCHDOG_MIN, watchdog_timeout,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,11 +256,22 @@ mod tests {
         UpdateTray(AppState, bool),
         Log(LogEvent),
         Quit,
+        Suppressed(RunId),
     }
 
     #[derive(Debug, Default)]
     struct Recorder {
         calls: Vec<Call>,
+        emitted: Vec<Event>,
+    }
+
+    impl Recorder {
+        fn injects(&self) -> usize {
+            self.calls
+                .iter()
+                .filter(|c| matches!(c, Call::StartInject(..) | Call::CopyOnly(..)))
+                .count()
+        }
     }
 
     impl Actors for Recorder {
@@ -205,6 +311,12 @@ mod tests {
         fn quit(&mut self) {
             self.calls.push(Call::Quit);
         }
+        fn output_suppressed(&mut self, run: RunId) {
+            self.calls.push(Call::Suppressed(run));
+        }
+        fn take_emitted(&mut self) -> Vec<Event> {
+            std::mem::take(&mut self.emitted)
+        }
     }
 
     /// Treibt den Kern und den Dispatcher gemeinsam — so läuft auch der Daemon.
@@ -215,10 +327,9 @@ mod tests {
         now: Instant,
         events: Vec<Event>,
     ) {
-        for event in events {
-            let effects = transition(runtime, event);
-            dispatch(effects, timers, rec, now);
-        }
+        let mut latch = QuitLatch::default();
+        let mut queue: VecDeque<Event> = events.into_iter().collect();
+        drive(&mut queue, runtime, timers, rec, &mut latch, now);
     }
 
     fn booted(now: Instant) -> (Runtime, Timers, Recorder) {
@@ -685,6 +796,209 @@ mod tests {
             ]
         );
         assert_eq!(timers.next_deadline(), None);
+    }
+
+    // ------------------------------------------------- Quit-Latch (codex H2)
+
+    /// Läuft bis `transcribing` und gibt die laufende `RunId` zurück.
+    fn transcribing(now: Instant) -> (Runtime, Timers, Recorder, RunId) {
+        let (mut runtime, mut timers, mut rec) = booted(now);
+        feed(
+            &mut runtime,
+            &mut timers,
+            &mut rec,
+            now,
+            vec![Event::HotkeyPress],
+        );
+        let run = runtime.run;
+        feed(
+            &mut runtime,
+            &mut timers,
+            &mut rec,
+            now,
+            vec![
+                Event::HotkeyRelease,
+                Event::AudioReady {
+                    run,
+                    audio: AudioInfo::from_millis(2_000),
+                },
+            ],
+        );
+        rec.calls.clear();
+        (runtime, timers, rec, run)
+    }
+
+    /// §5.2 „kein Inject mehr": Kommen Engine-Ergebnis und Quit in **einer**
+    /// Batch, darf das Ergebnis nicht mehr injiziert werden — auch wenn es in
+    /// der Reihenfolge vorne stand.
+    #[test]
+    fn quit_in_the_same_batch_beats_a_finished_transcription() {
+        let now = Instant::now();
+        let (mut runtime, mut timers, mut rec, run) = transcribing(now);
+        let mut queue: VecDeque<Event> = VecDeque::new();
+        let mut latch = QuitLatch::default();
+
+        let quit = enqueue_batch(
+            &mut queue,
+            vec![
+                Event::TranscriptionDone {
+                    run,
+                    text: "Diktat".into(),
+                },
+                Event::QuitRequested,
+            ],
+        );
+        assert!(quit, "die Batch enthält ein Quit");
+        latch.close();
+        assert_eq!(
+            queue.front(),
+            Some(&Event::QuitRequested),
+            "Quit steht vorn"
+        );
+
+        let ended = drive(
+            &mut queue,
+            &mut runtime,
+            &mut timers,
+            &mut rec,
+            &mut latch,
+            now,
+        );
+        assert!(ended, "der Kern hat Quit gemeldet");
+        assert_eq!(rec.injects(), 0, "kein Inject: {:?}", rec.calls);
+        assert!(rec.calls.contains(&Call::Quit));
+        assert!(runtime.quitting);
+    }
+
+    /// Derselbe Fall aus der anderen Richtung: Das Signal ist gesetzt, während
+    /// das Ergebnis **schon** in der Queue liegt.
+    #[test]
+    fn pending_transcription_is_not_injected_when_the_signal_arrived() {
+        let now = Instant::now();
+        let (mut runtime, mut timers, mut rec, run) = transcribing(now);
+        let mut queue: VecDeque<Event> = VecDeque::new();
+        let mut latch = QuitLatch::default();
+
+        // Ergebnis wartet bereits …
+        queue.push_back(Event::TranscriptionDone {
+            run,
+            text: "Diktat".into(),
+        });
+        // … dann sieht die Loop das Signal und zieht das Quit nach vorn.
+        latch.close();
+        queue.push_front(Event::QuitRequested);
+
+        let ended = drive(
+            &mut queue,
+            &mut runtime,
+            &mut timers,
+            &mut rec,
+            &mut latch,
+            now,
+        );
+        assert!(ended);
+        assert_eq!(rec.injects(), 0, "kein Inject: {:?}", rec.calls);
+    }
+
+    /// Der Latch allein genügt: Selbst wenn ein Ausgabeeffekt entstünde,
+    /// verlässt kein Text mehr den Prozess.
+    #[test]
+    fn closed_latch_suppresses_output_effects() {
+        let now = Instant::now();
+        let mut timers = Timers::default();
+        let mut rec = Recorder::default();
+        let mut latch = QuitLatch::default();
+        assert!(latch.close(), "erster Schluss meldet sich");
+        assert!(!latch.close(), "danach nicht mehr");
+
+        dispatch(
+            vec![
+                Effect::StartInject {
+                    run: RunId(3),
+                    text: "Diktat".into(),
+                },
+                Effect::CopyOnly {
+                    run: RunId(3),
+                    text: "Diktat".into(),
+                    reason: CopyReason::TrayClickPath,
+                },
+            ],
+            &mut timers,
+            &mut rec,
+            &mut latch,
+            now,
+        );
+        assert_eq!(rec.injects(), 0);
+        assert_eq!(
+            rec.calls,
+            vec![Call::Suppressed(RunId(3)), Call::Suppressed(RunId(3))]
+        );
+    }
+
+    /// Ohne Quit bleibt alles wie gehabt — der Latch darf nichts blockieren,
+    /// solange niemand beenden will.
+    #[test]
+    fn open_latch_lets_output_through() {
+        let now = Instant::now();
+        let (mut runtime, mut timers, mut rec, run) = transcribing(now);
+        feed(
+            &mut runtime,
+            &mut timers,
+            &mut rec,
+            now,
+            vec![Event::TranscriptionDone {
+                run,
+                text: "Diktat".into(),
+            }],
+        );
+        assert!(rec.calls.contains(&Call::StartInject(run, "Diktat".into())));
+    }
+
+    /// `enqueue_batch` erhält die Reihenfolge der übrigen Events.
+    #[test]
+    fn batch_without_quit_keeps_its_order() {
+        let mut queue: VecDeque<Event> = VecDeque::new();
+        queue.push_back(Event::Tick {
+            elapsed: Duration::from_millis(20),
+        });
+        let quit = enqueue_batch(&mut queue, vec![Event::HotkeyPress, Event::HotkeyRelease]);
+        assert!(!quit);
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![
+                Event::Tick {
+                    elapsed: Duration::from_millis(20)
+                },
+                Event::HotkeyPress,
+                Event::HotkeyRelease,
+            ]
+        );
+    }
+
+    /// Synchron erzeugte Events (Artefaktprüfung, Worker-Fehler) laufen im
+    /// selben Durchlauf weiter — sonst bliebe die Startsequenz stehen.
+    #[test]
+    fn emitted_events_are_processed_in_the_same_pass() {
+        let now = Instant::now();
+        let mut runtime = Runtime::default();
+        let mut timers = Timers::default();
+        let mut rec = Recorder::default();
+        let mut latch = QuitLatch::default();
+        rec.emitted = vec![Event::ArtifactsChecked {
+            run: RunId(0),
+            complete: true,
+        }];
+        let mut queue: VecDeque<Event> = VecDeque::from(vec![Event::Startup]);
+        drive(
+            &mut queue,
+            &mut runtime,
+            &mut timers,
+            &mut rec,
+            &mut latch,
+            now,
+        );
+        assert_eq!(runtime.state, AppState::Loading);
+        assert!(rec.calls.contains(&Call::LoadModel(RunId(0))));
     }
 
     /// `next_deadline` weckt die Event-Loop auf die frühere der beiden Fristen.

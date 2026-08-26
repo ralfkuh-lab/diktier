@@ -14,15 +14,14 @@ use super::convert::{
     i32_interleaved_to_f32, i64_interleaved_to_f32, u8_interleaved_to_f32, u16_interleaved_to_f32,
     u32_interleaved_to_f32,
 };
+use super::gate::CaptureGate;
 use super::resample::resample_mono_to_16k;
 use super::spsc::OverwriteSpsc;
 use super::{AudioError, CapturedAudio, ENGINE_RATE};
 
-/// Schrittweite beim Warten auf den ruhenden cpal-Callback.
-const PRODUCER_QUIET_STEP: std::time::Duration = std::time::Duration::from_millis(10);
-
-/// Obergrenze dafür — ein hängender Callback darf den Stop nicht aufhalten.
-const PRODUCER_QUIET_LIMIT: std::time::Duration = std::time::Duration::from_millis(200);
+/// Frist, in der der cpal-Callback das Gate verlassen haben muss (codex H1).
+/// Läuft sie ab, gilt die Aufnahme als gescheitert — gelesen wird nicht.
+const PRODUCER_IDLE_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub struct CaptureStats {
@@ -78,20 +77,6 @@ impl TypedRing {
         }
     }
 
-    fn write_pos(&self) -> usize {
-        match self {
-            Self::I8(r) => r.write_pos(),
-            Self::U8(r) => r.write_pos(),
-            Self::I16(r) => r.write_pos(),
-            Self::U16(r) => r.write_pos(),
-            Self::I32(r) => r.write_pos(),
-            Self::U32(r) => r.write_pos(),
-            Self::I64(r) => r.write_pos(),
-            Self::F32(r) => r.write_pos(),
-            Self::F64(r) => r.write_pos(),
-        }
-    }
-
     fn drain_f32(&self) -> Vec<f32> {
         match self {
             Self::I8(r) => drain_map(r, i8_interleaved_to_f32),
@@ -123,10 +108,11 @@ pub struct CpalAudioSource {
     stream: Option<Stream>,
     ring: Option<TypedRing>,
     lost: Arc<AtomicBool>,
-    /// Nimmt der cpal-Callback die Frames an? Nur zwischen `start()` und
-    /// `stop()`; sonst verwirft er sie sofort (der Stream läuft trotzdem
-    /// weiter, damit das Gerät nicht suspendiert).
-    armed: Arc<AtomicBool>,
+    /// Nimmt der cpal-Callback die Frames an, und steht gerade einer im Ring?
+    /// Scharf nur zwischen `start()` und `stop()`; sonst verwirft der Callback
+    /// sofort (der Stream läuft trotzdem weiter, damit das Gerät nicht
+    /// suspendiert).
+    gate: Arc<CaptureGate>,
     recording: bool,
     native_rate: u32,
     native_channels: u16,
@@ -144,7 +130,7 @@ impl CpalAudioSource {
             stream: None,
             ring: None,
             lost: Arc::new(AtomicBool::new(false)),
-            armed: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(CaptureGate::new()),
             recording: false,
             native_rate: 0,
             native_channels: 0,
@@ -172,7 +158,7 @@ impl CpalAudioSource {
 
     /// Nimmt der Callback gerade Frames an? Nur während einer Aufnahme.
     pub fn is_armed(&self) -> bool {
-        self.armed.load(Ordering::Acquire)
+        self.gate.is_armed()
     }
 
     fn host_and_device(&self) -> Result<(cpal::Host, cpal::Device), AudioError> {
@@ -216,34 +202,37 @@ impl CpalAudioSource {
             * u64::from(channels)) as usize;
         self.lost.store(false, Ordering::Release);
 
-        let armed = &self.armed;
+        // Frischer Ring, frisches Gate: ein Callback der alten Sitzung hält den
+        // alten `Arc` und kann den neuen Ring nicht mehr sehen.
+        self.gate = Arc::new(CaptureGate::new());
+        let gate = &self.gate;
         let (stream, ring) = match sample_format {
             SampleFormat::I8 => {
-                build_i8(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_i8(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             SampleFormat::U8 => {
-                build_u8(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_u8(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             SampleFormat::I16 => {
-                build_i16(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_i16(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             SampleFormat::U16 => {
-                build_u16(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_u16(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             SampleFormat::I32 => {
-                build_i32(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_i32(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             SampleFormat::U32 => {
-                build_u32(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_u32(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             SampleFormat::I64 => {
-                build_i64(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_i64(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             SampleFormat::F32 => {
-                build_f32(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_f32(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             SampleFormat::F64 => {
-                build_f64(&device, &config, min_samples, channels, &self.lost, armed)?
+                build_f64(&device, &config, min_samples, channels, &self.lost, gate)?
             }
             other => {
                 return Err(AudioError::Failed(format!(
@@ -277,21 +266,14 @@ impl CpalAudioSource {
         result
     }
 
-    /// Nach dem Entwaffnen kann ein bereits laufender cpal-Callback noch schreiben.
-    /// `drain`/`reset` gehören aber dem Consumer allein (codex H5), also warten
-    /// wir, bis der Write-Cursor kurz stillsteht — normalerweise eine
-    /// Callback-Periode, im Fehlerfall höchstens [`PRODUCER_QUIET_LIMIT`].
-    fn wait_for_producer_quiet(ring: &TypedRing) {
-        let deadline = Instant::now() + PRODUCER_QUIET_LIMIT;
-        let mut last = ring.write_pos();
-        loop {
-            std::thread::sleep(PRODUCER_QUIET_STEP);
-            let now = ring.write_pos();
-            if now == last || Instant::now() >= deadline {
-                return;
-            }
-            last = now;
-        }
+    /// Gerät und Ring wegwerfen, weil der Producer nicht zur Ruhe kam
+    /// (codex H1). Der `Arc` auf Ring und Gate lebt im Callback weiter, bis der
+    /// Stream-Drop ihn abräumt — der neue Lauf bekommt frische Exemplare.
+    fn discard_after_stuck_producer(&mut self) {
+        self.lost.store(true, Ordering::Release);
+        self.stream = None;
+        self.ring = None;
+        self.gate = Arc::new(CaptureGate::new());
     }
 }
 
@@ -305,21 +287,24 @@ fn err_fn(lost: Arc<AtomicBool>) -> impl FnMut(cpal::Error) + Send + 'static {
 
 /// Der komplette cpal-Callback: lock-frei, allokationsfrei (§6.4).
 ///
-/// Außerhalb einer Aufnahme (`armed == false`) werden die Frames sofort
-/// verworfen — nichts wird gepuffert, gespeichert oder weitergereicht. Der
-/// Stream läuft trotzdem weiter, sonst suspendiert das Gerät und der nächste
-/// Aufnahmestart wartet auf das Aufwecken (§5: „Aufnahme aus `idle` startet
-/// sofort").
+/// Außerhalb einer Aufnahme lässt das Gate niemanden herein — die Frames
+/// werden sofort verworfen, nichts wird gepuffert, gespeichert oder
+/// weitergereicht. Der Stream läuft trotzdem weiter, sonst suspendiert das
+/// Gerät und der nächste Aufnahmestart wartet auf das Aufwecken (§5: „Aufnahme
+/// aus `idle` startet sofort").
+///
+/// Der Guard hält den In-flight-Zähler über **alle** Ringzugriffe — daran
+/// erkennt der Consumer, wann `drain`/`reset` sicher sind (codex H1).
 #[inline]
 fn push_if_armed<T: Copy + Default>(
-    armed: &AtomicBool,
+    gate: &CaptureGate,
     ring: &OverwriteSpsc<T>,
     data: &[T],
     channels: usize,
 ) {
-    if !armed.load(Ordering::Acquire) {
+    let Some(_guard) = gate.enter() else {
         return;
-    }
+    };
     for frame in data.chunks_exact(channels) {
         ring.push_frame(frame);
     }
@@ -333,11 +318,11 @@ macro_rules! impl_build {
             min_samples: usize,
             channels: u16,
             lost: &Arc<AtomicBool>,
-            armed: &Arc<AtomicBool>,
+            gate: &Arc<CaptureGate>,
         ) -> Result<(Stream, TypedRing), AudioError> {
             let ring = Arc::new(OverwriteSpsc::<$ty>::new(min_samples, channels as usize));
             let prod = ring.clone();
-            let gate = armed.clone();
+            let gate = gate.clone();
             let ch = channels as usize;
             let stream = device
                 .build_input_stream(
@@ -376,7 +361,7 @@ impl super::AudioSource for CpalAudioSource {
         // Laufen lassen, ohne anzunehmen: Ein nur geöffneter (pausierter)
         // Stream hält das Gerät nicht wach — PipeWire suspendiert die Quelle
         // nach wenigen Sekunden, und das Entkorken kostet dann wieder ~2 s.
-        self.armed.store(false, Ordering::Release);
+        self.gate.disarm();
         self.play_stream()
     }
 
@@ -388,7 +373,7 @@ impl super::AudioSource for CpalAudioSource {
             // Nie mitten in einer Aufnahme — die gehört dem laufenden Diktat.
             return;
         }
-        self.armed.store(false, Ordering::Release);
+        self.gate.disarm();
         self.stream = None;
         self.ring = None;
     }
@@ -401,13 +386,20 @@ impl super::AudioSource for CpalAudioSource {
         if lost || self.stream.is_none() {
             self.open()?;
         }
-        // Der Producer nimmt nichts an (`armed == false`): `reset` ist sicher.
-        self.armed.store(false, Ordering::Release);
+        // `reset` gehört dem Consumer allein: erst entwaffnen, dann nachweislich
+        // warten, bis kein Callback mehr im Ring steht (codex H1).
+        self.gate.disarm();
+        if !self.gate.wait_idle(PRODUCER_IDLE_LIMIT) {
+            self.discard_after_stuck_producer();
+            return Err(AudioError::Failed(
+                "Aufnahme-Callback reagiert nicht — Gerät wird neu geöffnet".into(),
+            ));
+        }
         if let Some(ring) = &self.ring {
             ring.reset();
         }
         self.play_stream()?;
-        self.armed.store(true, Ordering::Release);
+        self.gate.arm();
         self.recording = true;
         Ok(())
     }
@@ -417,10 +409,16 @@ impl super::AudioSource for CpalAudioSource {
         // Der Stream läuft weiter — nur die Annahme wird abgeschaltet. Würde
         // hier pausiert, suspendierte das Gerät und der nächste Aufnahmestart
         // kostete wieder ~2 s (gemessen auf Mint 22, Owner-Entscheidung 3c).
-        self.armed.store(false, Ordering::Release);
-        // Producer zur Ruhe kommen lassen, bevor gedraint wird (codex H5).
-        if let Some(ring) = &self.ring {
-            Self::wait_for_producer_quiet(ring);
+        self.gate.disarm();
+        // codex H1: Erst wenn nachweislich kein Callback mehr im Ring steht,
+        // darf gedraint werden. Kommt er nicht heraus, wird **nicht** gelesen —
+        // die Aufnahme gilt als gescheitert und das Gerät wird neu aufgebaut.
+        if !self.gate.wait_idle(PRODUCER_IDLE_LIMIT) {
+            self.discard_after_stuck_producer();
+            return Err(AudioError::Failed(
+                "Aufnahme-Callback reagiert nicht — Aufnahme verworfen, Gerät wird neu geöffnet"
+                    .into(),
+            ));
         }
         let Some(ring) = &self.ring else {
             return Err(AudioError::Failed("keine Aufnahme".into()));
@@ -480,6 +478,7 @@ pub fn process_interleaved_f32(
 mod tests {
     use super::*;
     use crate::audio::AudioSource;
+    use std::time::Duration;
 
     /// Spiegelt die Öffnungslogik von [`CpalAudioSource`]: geöffnet wird nur,
     /// wenn kein Stream offen ist oder das Gerät als verloren gilt.
@@ -656,45 +655,77 @@ mod tests {
     #[test]
     fn unarmed_callback_discards_every_frame() {
         let ring = OverwriteSpsc::<f32>::new(64, 1);
-        let armed = AtomicBool::new(false);
+        let gate = CaptureGate::new();
         for _ in 0..50 {
-            push_if_armed(&armed, &ring, &[0.5, 0.5, 0.5, 0.5], 1);
+            push_if_armed(&gate, &ring, &[0.5, 0.5, 0.5, 0.5], 1);
         }
         let mut out = Vec::new();
         ring.drain(&mut out);
         assert!(out.is_empty(), "Ruhezustand darf nichts puffern: {out:?}");
         assert_eq!(ring.overflow(), 0, "und auch keinen Overflow erzeugen");
         assert_eq!(ring.write_pos(), 0);
+        assert_eq!(gate.in_flight(), 0, "kein Producer bleibt im Gate hängen");
 
-        armed.store(true, Ordering::Release);
-        push_if_armed(&armed, &ring, &[0.25, 0.5], 1);
+        gate.arm();
+        push_if_armed(&gate, &ring, &[0.25, 0.5], 1);
         let mut out = Vec::new();
         ring.drain(&mut out);
-        assert_eq!(out, vec![0.25, 0.5], "armed nimmt die Frames an");
+        assert_eq!(out, vec![0.25, 0.5], "scharf nimmt der Callback an");
+        assert_eq!(gate.in_flight(), 0);
     }
 
     /// Stereo bleibt frame-aligned, auch über das Gate.
     #[test]
     fn armed_callback_keeps_frame_alignment() {
         let ring = OverwriteSpsc::<i16>::new(8, 2);
-        let armed = AtomicBool::new(true);
-        push_if_armed(&armed, &ring, &[1, 2, 3, 4, 5], 2);
+        let gate = CaptureGate::new();
+        gate.arm();
+        push_if_armed(&gate, &ring, &[1, 2, 3, 4, 5], 2);
         let mut out = Vec::new();
         ring.drain(&mut out);
         assert_eq!(out, vec![1, 2, 3, 4], "unvollständiges Frame bleibt liegen");
     }
 
-    /// Der Consumer darf erst drainen, wenn der Producer steht (codex H5):
-    /// stillstehender Write-Cursor beendet das Warten sofort.
+    /// codex H1, der harte Fall: Ein Callback hängt **im** Ring fest. Dann darf
+    /// der Consumer nicht drainen — er wirft die Aufnahme weg und baut das Gerät
+    /// neu auf. Der Test hält den Producer an einer Barriere fest.
     #[test]
-    fn producer_quiet_wait_returns_when_write_cursor_stands_still() {
-        let ring = TypedRing::F32(Arc::new(OverwriteSpsc::<f32>::new(64, 1)));
-        ring.write_pos();
-        let t0 = Instant::now();
-        CpalAudioSource::wait_for_producer_quiet(&ring);
+    fn stuck_producer_makes_the_take_fail_instead_of_racing_the_drain() {
+        let gate = Arc::new(CaptureGate::new());
+        let ring = Arc::new(OverwriteSpsc::<f32>::new(1_024, 1));
+        gate.arm();
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let producer = {
+            let (gate, ring) = (gate.clone(), ring.clone());
+            let (entered, release) = (entered.clone(), release.clone());
+            std::thread::spawn(move || {
+                let guard = gate.enter().expect("Gate war scharf");
+                ring.push_frame(&[0.5]);
+                entered.wait();
+                release.wait();
+                ring.push_frame(&[0.75]);
+                drop(guard);
+            })
+        };
+
+        entered.wait();
+        gate.disarm();
+        // Genau das Fenster, das die alte Heuristik nicht abgedeckt hat:
+        // Write-Cursor steht still, der Callback ist aber noch drin.
+        assert_eq!(ring.write_pos(), 1);
         assert!(
-            t0.elapsed() < PRODUCER_QUIET_LIMIT,
-            "ruhiger Producer darf nicht bis zur Obergrenze warten"
+            !gate.wait_idle(Duration::from_millis(20)),
+            "der Consumer darf hier nicht 'ruhig' melden"
         );
+
+        release.wait();
+        producer.join().unwrap();
+        assert!(gate.wait_idle(Duration::from_secs(2)));
+        // Erst jetzt ist der Ring dem Consumer allein überlassen.
+        let mut out = Vec::new();
+        ring.drain(&mut out);
+        assert_eq!(out, vec![0.5, 0.75]);
     }
 }

@@ -6,6 +6,11 @@ Verbindlich bleibt [docs/SPEC.md](../SPEC.md) v1.3. Dieses Dokument beschreibt
 ersetzt keine eigene Prüfung und ist bewusst auch dort ehrlich, wo es unangenehm
 wird (Abschnitte 4 und 5).
 
+**Nachtrag 2026-08-27:** Das Kreuz-Review ist gelaufen
+([codex](impl-phase3-codex.md), [agy](impl-phase3-agy.md)), das konsolidierte
+Fixpaket ist umgesetzt — siehe Abschnitt 6. Die Abschnitte 1–5 beschreiben den
+Stand **davor** und bleiben als Reviewkontext stehen.
+
 Reviewgegenstand ist der Diff von `3b7b98d` nach `8eb46e1`:
 
 ```
@@ -227,3 +232,60 @@ Priorisiert, mit Fundstelle. Genau hier lohnt der zweite Blick:
 9. **Signal-Handler** (`daemon/signals.rs`) nutzt `signal()` mit einer eigenen
    `extern "C"`-Deklaration statt `sigaction`; der Handler schreibt nur ein
    `AtomicBool`. Bitte auf async-signal-safety und Wiederinstallation prüfen.
+
+## 6. Fixpaket nach dem Kreuz-Review (umgesetzt, 2026-08-27)
+
+Konsolidiert aus [codex](impl-phase3-codex.md) H1–H3/M1–M4 und
+[agy](impl-phase3-agy.md) B1–B5. Gates danach: `cargo build`, `cargo test`
+(271 grün, 1 `#[ignore]`), `cargo fmt --check`, `cargo clippy --all-targets --
+-D warnings`. `src/state.rs` blieb unberührt.
+
+| # | Befund | Änderung | Live belegt |
+|---|---|---|---|
+| 1 | codex H1 / agy B4 | Neu `audio/gate.rs`: `CaptureGate` mit atomarem In-flight-Zähler; der Callback betritt es **vor** der `armed`-Prüfung, `stop()`/`start()` warten auf `in_flight == 0`, bevor `drain`/`reset` läuft. Bleibt der Producer stecken, wird **nicht** gelesen — Aufnahme gilt als gescheitert, Stream und Ring werden neu aufgebaut. Die alte Write-Cursor-Heuristik ist weg. | Deterministischer Barriere-Test (Producer im Ring festgehalten, `wait_idle` meldet korrekt `false`); Diktate live unverändert, `overflow 0` |
+| 2 | codex H2 | `QuitLatch` + `enqueue_batch()` + `drive()`: Signal wird **vor** jedem Queue-Drain geprüft, `QuitRequested` per `push_front` vorgezogen, empfangene Batches zuerst auf Quit gescannt; ab geschlossenem Latch werden `StartInject`/`CopyOnly` nicht mehr dispatcht. | Integrationstests `[TranscriptionDone, QuitRequested]` und „Signal gesetzt + Ergebnis queued" → kein Inject; live: SIGTERM in `transcribing` beendet in 0,21 s ohne Ausgabe |
+| 3 | codex H3 | `HotkeySpec` reicht Taste **und** Modifier bis in beide Linux-Backends (kein hartes F9 mehr); `HotkeyBackend::unregister()`, Worker-Kommando `Grab`/`Ungrab`, Angleich an `runtime.paused`. | siehe „H3-Nachweisweg" unten |
+| 4 | codex M1 | `TrayCmd::Update` trägt jetzt `ErrorInfo`; `tooltip_text` hängt im Fehlerzustand den Grund an (§4.4 „Tooltip nennt den Konflikt"). | Tooltip live: `error — parakeet-tdt-0.6b-v3-int8 — ungültiges hotkey.mode "nonsense" (v1 nur push_to_talk)` |
+| 5 | codex M2 | Alle Worker-Spawns liefern `Result`; jeder Kommando-Send meldet bei totem Kanal `Msg::WorkerFailed{WorkerKind}` → `FatalError` der passenden §10-Klasse, `forget_worker` verwirft den Handle. | Unit-Tests für Klassenzuordnung und toten/lebenden Kanal |
+| 6 | codex M3 | `config_error_mode()`: fataler Configfehler beendet nicht mehr stumm, sondern zeigt einen bedienbaren Tray (`error`, Grund im Tooltip, Config-Ordner, Beenden). Tray-Aufbaufehler bleibt §10/Exit 1. | Live mit kaputter `hotkey.mode`: Daemon läuft, Tooltip nennt den Grund, Quit über Menü in 0,11 s, **Exit 2** |
+| 7 | codex M4 | `identity()` kanonisiert das Elternverzeichnis, `acquire_all` dedupliziert die Kandidaten — kein Aussperren des eigenen Prozesses bei aliasierten Pfaden. | Tests für doppelten Pfad und zwei Symlink-Aliase |
+| 8 | agy B1 | `xdg-open` wird in einem Helferthread ge-`wait()`et (synchroner Fallback, falls kein Thread startet). | Nach „Config-Ordner öffnen": 0 Kindprozesse im Zustand `Z` |
+| 9 | agy B2 | `libc::sigaction` mit `SA_RESTART` statt eigener `signal()`-Deklaration; Handler setzt weiterhin nur ein `AtomicBool`. | SIGTERM-Quit live in 0,21 s |
+| 10 | agy B3 | `quote_exec` verdoppelt `%` zu `%%` (Desktop Entry 1.5). | Test mit `/tmp/100%/…` und `/tmp/%f%u/…` |
+| 11 | agy B5 | Gerätelebenszyklus vom `UpdateTray`-Effekt entkoppelt: `flush_presentation(runtime)` leitet Tray, Hotkey-Grab und `audio_intent()` aus dem beobachteten Kernzustand ab; `update_tray` setzt nur noch ein Dirty-Flag. | Test `audio_intent_follows_the_core_state`; live Pause/Resume mit `source-outputs` 1↔0 |
+
+**Nicht umgesetzt (Owner-Entscheidung):** agy B6 / Poll-Intervalle (Inject 10 ms,
+Hotkey 5 ms, ~2,3 % Ruhelast) bleiben offener Punkt für Phase 4.
+
+### H3-Nachweisweg (und ein Befund zu `global-hotkey`)
+
+Beim Live-Test zeigte sich, dass `GlobalHotKeyManager::unregister()` den Hotkey
+nur aus seiner eigenen Tabelle entfernt — der **X11-Grab bleibt bestehen**. Die
+Pause hätte die Taste also weiterhin geschluckt. Deshalb hält
+`GlobalHotkeyBackend` den Manager jetzt als `Option` und **lässt ihn beim
+Pausieren fallen**: erst das Schließen seiner X11-Verbindung gibt den Grab frei.
+Beim Fortsetzen entsteht ein neuer Manager, Reste im globalen Event-Kanal werden
+verworfen.
+
+Nachgewiesen wurde das nicht über „F9 in xed tippen" (F9 ist dort funktionslos,
+ein Nichtereignis beweist nichts), sondern über die Grab-Eigentümerschaft:
+
+1. Daemon läuft, nicht pausiert → zweiter Prozess (`--hotkey-test`) bekommt die
+   Taste **nicht** (`XGrabKey: Access`).
+2. Pause an → Log `Hotkey F9 freigegeben (pausiert)`; derselbe zweite Prozess
+   bekommt den Grab **und empfängt die F9-Drücke** (2× press/release entprellt).
+3. Der Daemon selbst protokolliert in der Pause **keine** Hotkey-Zeile.
+4. Pause aus → `Hotkey F9 wieder scharf`, Diktat landet wieder vollständig in xed.
+
+### Testumgebungs-Notiz: Bildschirmschoner
+
+Die erste Live-Runde schlug scheinbar vollständig fehl — weder F9 noch ein
+simples `xdotool type` erreichten irgendeine Anwendung. Ursache war **nicht der
+Code**, sondern der aktive Bildschirmschoner, der den Keyboard-Grab hielt; ein
+Referenz-Build des Commit-Stands `85f853c` in einem separaten Worktree verhielt
+sich identisch. Nach `loginctl unlock-session` liefen alle Tests durch.
+
+Für künftige Live-Läufe: vor dem Test `dbus-send … org.cinnamon.ScreenSaver.GetActive`
+prüfen. Und: `xdotool keydown` ohne zugehöriges `keyup` (etwa wenn ein Testlauf
+abbricht) hinterlässt eine logisch gedrückte Taste — im Zweifel einmal
+`xdotool keyup <taste>` senden.

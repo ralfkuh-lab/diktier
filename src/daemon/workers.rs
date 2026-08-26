@@ -17,12 +17,14 @@ use crate::audio::{AudioSource, CpalAudioSource};
 use crate::config::{AudioConfig, OutputConfig};
 use crate::download::{self, ArtifactManifest, DownloadError, HttpTransport, Progress};
 use crate::engine::{ParakeetTranscriber, transcribe_pcm};
-use crate::hotkey::{HotkeyBackend, HotkeyEvent, new_backend};
+use crate::hotkey::{HotkeyBackend, HotkeyEvent, HotkeySpec, new_backend};
 use crate::inject::{
     self, CaptureContext, ClipboardSave, CopyOnlyReason, InjectOutcome, OutputSink, WindowId,
 };
 use crate::single_instance;
-use crate::state::{AppState, CopyReason, Event, InjectReport, RunId, Runtime};
+use crate::state::{
+    AppState, CopyReason, ErrorInfo, ErrorKind, Event, InjectReport, RunId, Runtime,
+};
 use crate::tray::{self, TrayBackend, TrayError, TrayEvent};
 
 use super::debug_wav;
@@ -37,10 +39,62 @@ pub enum Msg {
     Audio { run: RunId, samples: Vec<f32> },
     /// §4.4 / §10: Hotkey nicht registrierbar — Tray-Click bleibt bedienbar.
     HotkeyUnavailable(String),
+    /// codex M2: Ein Worker ist nicht mehr erreichbar (Spawn gescheitert,
+    /// Thread weg, Kanal zu). Ohne diese Meldung bliebe der Daemon stumm in
+    /// `loading`, `downloading`, `recording` oder `transcribing` stehen.
+    WorkerFailed { what: WorkerKind, message: String },
     /// §10: Tray weg heißt kein GUI-Kanal mehr → Prozessende, Exit 1.
     TrayLost(String),
     /// §4.3-Menü „Config-Ordner öffnen" — kein Kern-Event.
     OpenConfigDir,
+}
+
+/// Welcher Worker ausgefallen ist — und in welche Fehlerklasse aus §10 das fällt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerKind {
+    Engine,
+    Audio,
+    Inject,
+}
+
+impl WorkerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Engine => "Engine-Worker",
+            Self::Audio => "Audio-Worker",
+            Self::Inject => "Inject-Worker",
+        }
+    }
+
+    /// §10-Zuordnung: Mic, Engine und Inject bleiben bedienbar — der Retry ist
+    /// der nächste Press. (Der Download meldet seine Fehler selbst als
+    /// `DownloadFailed`, er hat keinen Kommandokanal, der brechen könnte.)
+    pub fn to_fatal(self, message: String) -> Event {
+        match self {
+            Self::Engine => Event::FatalError {
+                kind: ErrorKind::Engine,
+                message,
+            },
+            Self::Audio => Event::FatalError {
+                kind: ErrorKind::Mic,
+                message,
+            },
+            Self::Inject => Event::FatalError {
+                kind: ErrorKind::Inject,
+                message,
+            },
+        }
+    }
+}
+
+/// Kommando abschicken; ein toter Worker wird zur Meldung an die Event-Loop.
+fn send_or_report<C>(tx: &Sender<C>, cmd: C, out: &Sender<Msg>, what: WorkerKind) {
+    if tx.send(cmd).is_err() {
+        let _ = out.send(Msg::WorkerFailed {
+            what,
+            message: "Worker-Thread ist nicht mehr erreichbar".into(),
+        });
+    }
 }
 
 /// §4.3: Tray-Ereignisse, die den Kern erreichen. „Config-Ordner öffnen" ist
@@ -105,25 +159,46 @@ pub enum EngineCmd {
 /// Modell resident auf einem eigenen Thread (§5).
 pub struct EngineWorker {
     tx: Sender<EngineCmd>,
+    out: Sender<Msg>,
     join: Option<JoinHandle<()>>,
 }
 
 impl EngineWorker {
-    pub fn spawn(model: String, threads: u32, out: Sender<Msg>, log: Arc<Logger>) -> Self {
+    pub fn spawn(
+        model: String,
+        threads: u32,
+        out: Sender<Msg>,
+        log: Arc<Logger>,
+    ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
+        let worker_out = out.clone();
         let join = thread::Builder::new()
             .name("diktier-engine".into())
-            .spawn(move || engine_loop(rx, out, &model, threads, &log))
-            .ok();
-        Self { tx, join }
+            .spawn(move || engine_loop(rx, worker_out, &model, threads, &log))
+            .map_err(|e| format!("Engine-Thread: {e}"))?;
+        Ok(Self {
+            tx,
+            out,
+            join: Some(join),
+        })
     }
 
     pub fn load(&self, run: RunId) {
-        let _ = self.tx.send(EngineCmd::Load { run });
+        send_or_report(
+            &self.tx,
+            EngineCmd::Load { run },
+            &self.out,
+            WorkerKind::Engine,
+        );
     }
 
     pub fn transcribe(&self, run: RunId, samples: Vec<f32>) {
-        let _ = self.tx.send(EngineCmd::Transcribe { run, samples });
+        send_or_report(
+            &self.tx,
+            EngineCmd::Transcribe { run, samples },
+            &self.out,
+            WorkerKind::Engine,
+        );
     }
 
     pub fn request_shutdown(&self) {
@@ -223,14 +298,17 @@ impl DownloadWorker {
         manifest: ArtifactManifest,
         out: Sender<Msg>,
         log: Arc<Logger>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         let join = thread::Builder::new()
             .name("diktier-download".into())
             .spawn(move || download_loop(run, &manifest, &out, &log, &flag))
-            .ok();
-        Self { cancel, join }
+            .map_err(|e| format!("Download-Thread: {e}"))?;
+        Ok(Self {
+            cancel,
+            join: Some(join),
+        })
     }
 
     /// Bricht zwischen zwei Blöcken ab (Quit-Pfad, §5.2).
@@ -368,35 +446,51 @@ pub enum AudioCmd {
 /// Downmix/Resample beim Stop gehören ohnehin nicht in die Event-Loop (§6.4).
 pub struct AudioWorker {
     tx: Sender<AudioCmd>,
+    out: Sender<Msg>,
     join: Option<JoinHandle<()>>,
 }
 
 impl AudioWorker {
-    pub fn spawn(config: AudioConfig, out: Sender<Msg>, log: Arc<Logger>) -> Self {
+    pub fn spawn(config: AudioConfig, out: Sender<Msg>, log: Arc<Logger>) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
+        let worker_out = out.clone();
         let join = thread::Builder::new()
             .name("diktier-audio".into())
-            .spawn(move || audio_loop(rx, out, &config, &log))
-            .ok();
-        Self { tx, join }
+            .spawn(move || audio_loop(rx, worker_out, &config, &log))
+            .map_err(|e| format!("Audio-Thread: {e}"))?;
+        Ok(Self {
+            tx,
+            out,
+            join: Some(join),
+        })
     }
 
     /// Idempotent: der Worker öffnet nur, wenn kein Stream bereitsteht.
     pub fn prepare(&self) {
-        let _ = self.tx.send(AudioCmd::Prepare);
+        send_or_report(&self.tx, AudioCmd::Prepare, &self.out, WorkerKind::Audio);
     }
 
     /// Idempotent: der Worker gibt nur her, was offen ist.
     pub fn release(&self) {
-        let _ = self.tx.send(AudioCmd::Release);
+        send_or_report(&self.tx, AudioCmd::Release, &self.out, WorkerKind::Audio);
     }
 
     pub fn start(&self, run: RunId) {
-        let _ = self.tx.send(AudioCmd::Start { run });
+        send_or_report(
+            &self.tx,
+            AudioCmd::Start { run },
+            &self.out,
+            WorkerKind::Audio,
+        );
     }
 
     pub fn stop(&self, run: RunId, discard: bool) {
-        let _ = self.tx.send(AudioCmd::Stop { run, discard });
+        send_or_report(
+            &self.tx,
+            AudioCmd::Stop { run, discard },
+            &self.out,
+            WorkerKind::Audio,
+        );
     }
 
     pub fn shutdown(&mut self, timeout: Duration) -> bool {
@@ -559,6 +653,7 @@ pub enum InjectCmd {
 /// die Event-Loop bleibt reaktiv, `QuitRequested` greift jederzeit (codex H4).
 pub struct InjectWorker {
     tx: Sender<InjectCmd>,
+    out: Sender<Msg>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -570,13 +665,15 @@ impl InjectWorker {
     ) -> Result<Self, inject::InjectError> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let worker_out = out.clone();
         let join = thread::Builder::new()
             .name("diktier-inject".into())
-            .spawn(move || inject_loop(rx, out, output, &ready_tx, &log))
+            .spawn(move || inject_loop(rx, worker_out, output, &ready_tx, &log))
             .map_err(|e| inject::InjectError::Failed(format!("Inject-Thread: {e}")))?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(Self {
                 tx,
+                out,
                 join: Some(join),
             }),
             Ok(Err(message)) => {
@@ -593,19 +690,39 @@ impl InjectWorker {
     }
 
     pub fn mark_start(&self, run: RunId) {
-        let _ = self.tx.send(InjectCmd::MarkStart { run });
+        send_or_report(
+            &self.tx,
+            InjectCmd::MarkStart { run },
+            &self.out,
+            WorkerKind::Inject,
+        );
     }
 
     pub fn mark_target(&self, run: RunId) {
-        let _ = self.tx.send(InjectCmd::MarkTarget { run });
+        send_or_report(
+            &self.tx,
+            InjectCmd::MarkTarget { run },
+            &self.out,
+            WorkerKind::Inject,
+        );
     }
 
     pub fn paste(&self, run: RunId, text: String) {
-        let _ = self.tx.send(InjectCmd::Paste { run, text });
+        send_or_report(
+            &self.tx,
+            InjectCmd::Paste { run, text },
+            &self.out,
+            WorkerKind::Inject,
+        );
     }
 
     pub fn copy_only(&self, run: RunId, text: String, reason: CopyReason) {
-        let _ = self.tx.send(InjectCmd::CopyOnly { run, text, reason });
+        send_or_report(
+            &self.tx,
+            InjectCmd::CopyOnly { run, text, reason },
+            &self.out,
+            WorkerKind::Inject,
+        );
     }
 
     /// Blockiert höchstens `timeout` — der Thread kann noch in einem Paste stehen.
@@ -780,25 +897,50 @@ fn window_str(id: Option<WindowId>) -> String {
 
 // --------------------------------------------------------------- Hotkey
 
+/// §4.4: Was der Daemon dem Hotkey-Thread sagen kann.
+pub enum HotkeyCmd {
+    /// Pause aufgehoben — Taste wieder greifen.
+    Grab,
+    /// Pausiert — Taste freigeben, damit die fokussierte App sie bekommt.
+    Ungrab,
+    Shutdown,
+}
+
 /// §5: eigener Thread, entprellte Press/Release-Events in den Kanal.
 pub struct HotkeyWorker {
+    tx: Sender<HotkeyCmd>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
 impl HotkeyWorker {
-    pub fn spawn(out: Sender<Msg>, log: Arc<Logger>) -> Self {
+    pub fn spawn(spec: HotkeySpec, out: Sender<Msg>, log: Arc<Logger>) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let (tx, rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("diktier-hotkey".into())
-            .spawn(move || hotkey_loop(&flag, &out, &log))
-            .ok();
-        Self { stop, join }
+            .spawn(move || hotkey_loop(&spec, &flag, &rx, &out, &log))
+            .map_err(|e| format!("Hotkey-Thread: {e}"))?;
+        Ok(Self {
+            tx,
+            stop,
+            join: Some(join),
+        })
+    }
+
+    /// §4.4: Grab an den Pausezustand angleichen. Idempotent.
+    pub fn set_grabbed(&self, grabbed: bool) {
+        let _ = self.tx.send(if grabbed {
+            HotkeyCmd::Grab
+        } else {
+            HotkeyCmd::Ungrab
+        });
     }
 
     pub fn shutdown(&mut self, timeout: Duration) -> bool {
         self.stop.store(true, Ordering::Release);
+        let _ = self.tx.send(HotkeyCmd::Shutdown);
         match self.join.take() {
             Some(join) => join_with_timeout(join, timeout),
             None => true,
@@ -806,24 +948,56 @@ impl HotkeyWorker {
     }
 }
 
-fn hotkey_loop(stop: &AtomicBool, out: &Sender<Msg>, log: &Logger) {
-    let mut backend = new_backend();
-    let name = backend.backend_name();
+fn hotkey_loop(
+    spec: &HotkeySpec,
+    stop: &AtomicBool,
+    cmd_rx: &Receiver<HotkeyCmd>,
+    out: &Sender<Msg>,
+    log: &Logger,
+) {
+    let mut backend = match new_backend(spec) {
+        Ok(backend) => backend,
+        Err(err) => {
+            // §4.4/§10: kein Hotkey heißt Fehlerzustand — der Tray-Click
+            // bleibt der bedienbare Weg, und der Tooltip nennt den Konflikt.
+            log.error(format!("Hotkey-Registrierung: {err}"));
+            let _ = out.send(Msg::HotkeyUnavailable(err.to_string()));
+            return;
+        }
+    };
     if let Err(err) = backend.register() {
         log.error(format!("Hotkey-Registrierung: {err}"));
-        let _ = out.send(Msg::HotkeyUnavailable(err.to_string()));
+        let _ = out.send(Msg::HotkeyUnavailable(format!(
+            "{} nicht greifbar: {err}",
+            spec.describe()
+        )));
         return;
     }
-    if name == "stub" {
-        // §4.4: kein Backend heißt kein PTT — Tray-Click bleibt der Weg.
-        let _ = out.send(Msg::HotkeyUnavailable(
-            "kein Hotkey-Backend verfügbar (global-hotkey und XGrabKey fehlgeschlagen)".into(),
-        ));
-        return;
-    }
-    log.info(format!("Hotkey-Backend: {name} (F9, Push-to-Talk)"));
+    log.info(format!(
+        "Hotkey-Backend: {} ({}, Push-to-Talk)",
+        backend.backend_name(),
+        spec.describe()
+    ));
 
     while !stop.load(Ordering::Acquire) {
+        match cmd_rx.try_recv() {
+            Ok(HotkeyCmd::Grab) => {
+                if let Err(err) = backend.register() {
+                    log.warn(format!("Hotkey erneut greifen: {err}"));
+                } else if backend.is_registered() {
+                    log.info(format!("Hotkey {} wieder scharf", spec.describe()));
+                }
+            }
+            Ok(HotkeyCmd::Ungrab) => {
+                if let Err(err) = backend.unregister() {
+                    log.warn(format!("Hotkey freigeben: {err}"));
+                } else {
+                    log.info(format!("Hotkey {} freigegeben (pausiert)", spec.describe()));
+                }
+            }
+            Ok(HotkeyCmd::Shutdown) | Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {}
+        }
         match backend.poll() {
             Ok(Some(event)) => {
                 if out.send(Msg::Event(hotkey_event_to_core(event))).is_err() {
@@ -838,12 +1012,20 @@ fn hotkey_loop(stop: &AtomicBool, out: &Sender<Msg>, log: &Logger) {
             }
         }
     }
+    // Beim Beenden die Taste zurückgeben, bevor die Verbindung fällt.
+    let _ = backend.unregister();
 }
 
 // ----------------------------------------------------------------- Tray
 
 pub enum TrayCmd {
-    Update { state: AppState, paused: bool },
+    /// §4.3/§4.4: Zustand **und** Fehlergrund — der Tooltip muss den Konflikt
+    /// nennen können (codex M1).
+    Update {
+        state: AppState,
+        paused: bool,
+        error: Option<ErrorInfo>,
+    },
     Shutdown,
 }
 
@@ -884,8 +1066,12 @@ impl TrayWorker {
         }
     }
 
-    pub fn update(&self, state: AppState, paused: bool) {
-        let _ = self.tx.send(TrayCmd::Update { state, paused });
+    pub fn update(&self, state: AppState, paused: bool, error: Option<ErrorInfo>) {
+        let _ = self.tx.send(TrayCmd::Update {
+            state,
+            paused,
+            error,
+        });
     }
 
     pub fn shutdown(&mut self, timeout: Duration) -> bool {
@@ -926,10 +1112,16 @@ fn tray_loop(
     loop {
         let mut idle = true;
         match rx.try_recv() {
-            Ok(TrayCmd::Update { state, paused }) => {
+            Ok(TrayCmd::Update {
+                state,
+                paused,
+                error,
+            }) => {
                 idle = false;
                 runtime.state = state;
                 runtime.paused = paused;
+                // §4.4: Der Fehlergrund gehört in den Tooltip, nicht nur ins Log.
+                runtime.error = error;
                 if let Err(err) = tray.update(&runtime, model) {
                     log.warn(format!("Tray-Update: {err}"));
                 }
@@ -1055,5 +1247,58 @@ mod tests {
     fn window_ids_are_logged_as_hex_or_unknown() {
         assert_eq!(window_str(Some(WindowId(0x6600325))), "0x6600325");
         assert_eq!(window_str(None), "unbekannt");
+    }
+
+    /// codex M2: Jeder Worker-Ausfall landet in seiner §10-Fehlerklasse — statt
+    /// den Daemon stumm in `loading`/`recording`/`transcribing` stehen zu lassen.
+    #[test]
+    fn worker_failures_map_to_their_error_class() {
+        let cases = [
+            (WorkerKind::Engine, ErrorKind::Engine),
+            (WorkerKind::Audio, ErrorKind::Mic),
+            (WorkerKind::Inject, ErrorKind::Inject),
+        ];
+        for (what, expected) in cases {
+            match what.to_fatal("Thread weg".into()) {
+                Event::FatalError { kind, message } => {
+                    assert_eq!(kind, expected, "{}", what.label());
+                    assert_eq!(message, "Thread weg");
+                }
+                other => panic!("erwartet FatalError, bekam {other:?}"),
+            }
+            assert!(!what.label().is_empty());
+        }
+    }
+
+    /// Ein toter Kommandokanal meldet sich bei der Event-Loop, statt still zu
+    /// verpuffen (codex M2).
+    #[test]
+    fn a_dead_command_channel_reports_to_the_loop() {
+        let (out_tx, out_rx) = mpsc::channel::<Msg>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<u8>();
+        drop(cmd_rx); // Worker-Thread ist weg.
+
+        send_or_report(&cmd_tx, 1_u8, &out_tx, WorkerKind::Engine);
+        match out_rx.try_recv() {
+            Ok(Msg::WorkerFailed { what, message }) => {
+                assert_eq!(what, WorkerKind::Engine);
+                assert!(message.contains("nicht mehr erreichbar"), "{message}");
+            }
+            other => panic!(
+                "erwartet WorkerFailed, bekam etwas anderes: {}",
+                other.is_ok()
+            ),
+        }
+    }
+
+    /// Ein lebender Kanal meldet nichts — sonst hätte jeder normale Befehl
+    /// einen Fehlerzustand ausgelöst.
+    #[test]
+    fn a_live_command_channel_stays_quiet() {
+        let (out_tx, out_rx) = mpsc::channel::<Msg>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<u8>();
+        send_or_report(&cmd_tx, 7_u8, &out_tx, WorkerKind::Audio);
+        assert_eq!(cmd_rx.try_recv().unwrap(), 7);
+        assert!(out_rx.try_recv().is_err(), "keine Fehlermeldung");
     }
 }

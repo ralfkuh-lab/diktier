@@ -4,6 +4,7 @@
 
 mod capture;
 mod convert;
+mod gate;
 mod resample;
 mod spsc;
 

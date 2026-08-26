@@ -165,8 +165,17 @@ pub fn tray_status(runtime: &Runtime) -> TrayStatus {
     }
 }
 
+/// §4.3: „Zustand + Modellschlüssel". Im Fehlerzustand kommt der Grund dazu —
+/// §4.4 verlangt für den Hotkey-Konflikt ausdrücklich, dass der Tooltip ihn
+/// nennt; §6.3/§7.1 wollen dasselbe für Download- und Injectfehler (codex M1).
 pub fn tooltip_text(runtime: &Runtime, model_key: &str) -> String {
-    format!("{} — {model_key}", tray_status(runtime).as_str())
+    let base = format!("{} — {model_key}", tray_status(runtime).as_str());
+    match &runtime.error {
+        Some(info) if tray_status(runtime) == TrayStatus::Error && !info.message.is_empty() => {
+            format!("{base} — {}", info.message)
+        }
+        _ => base,
+    }
 }
 
 pub fn pause_menu_label(paused: bool) -> &'static str {
@@ -206,6 +215,33 @@ pub fn config_dir() -> Result<PathBuf, TrayError> {
         .ok_or_else(|| TrayError::Failed("Config-Pfad hat kein Elternverzeichnis".into()))
 }
 
+/// Kindprozess einsammeln, sonst bleibt er bis zum Prozessende ein Zombie
+/// (agy B1). Der Helferthread endet, sobald `xdg-open` fertig ist — auf den
+/// Rückgabewert wartet niemand, das Öffnen ist „fire and forget".
+#[cfg(target_os = "linux")]
+fn reap(child: std::process::Child) {
+    use std::sync::{Arc, Mutex};
+
+    let slot = Arc::new(Mutex::new(Some(child)));
+    let worker = slot.clone();
+    let spawned = std::thread::Builder::new()
+        .name("diktier-xdg-open".into())
+        .spawn(move || {
+            let taken = worker.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(mut child) = taken {
+                let _ = child.wait();
+            }
+        });
+    if spawned.is_err() {
+        // Kein Helferthread verfügbar: lieber hier kurz warten als einen
+        // Zombie hinterlassen — `xdg-open` startet nur den Dateimanager.
+        let taken = slot.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(mut child) = taken {
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Öffnet den Config-Ordner. Linux: `xdg-open`. Kein Fokusklau auf dem PTT-Pfad —
 /// nur nach explizitem Menüklick.
 pub fn open_config_dir() -> Result<(), TrayError> {
@@ -213,13 +249,14 @@ pub fn open_config_dir() -> Result<(), TrayError> {
     std::fs::create_dir_all(&dir).map_err(|e| TrayError::Failed(e.to_string()))?;
     #[cfg(target_os = "linux")]
     {
-        std::process::Command::new("xdg-open")
+        let child = std::process::Command::new("xdg-open")
             .arg(&dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| TrayError::Failed(format!("xdg-open: {e}")))?;
+        reap(child);
     }
     #[cfg(windows)]
     {
@@ -518,6 +555,41 @@ mod tests {
         tray.update(&paused, DEFAULT_MODEL).unwrap();
         assert_eq!(tray.status, Some(TrayStatus::Paused));
         assert_eq!(tray.pause_label, "Hotkey wieder aktivieren");
+    }
+
+    /// §4.4: „Tooltip nennt den Konflikt" — der Fehlergrund steht im Tooltip,
+    /// nicht nur im Log (codex M1).
+    #[test]
+    fn error_tooltip_names_the_reason() {
+        let mut rt = runtime(AppState::Error, false);
+        rt.error = Some(crate::state::ErrorInfo {
+            kind: crate::state::ErrorKind::HotkeyRegistration,
+            message: "F9 nicht greifbar: HotKey already registered".into(),
+        });
+        let tip = tooltip_text(&rt, DEFAULT_MODEL);
+        assert!(tip.starts_with("error — "), "{tip}");
+        assert!(tip.contains(DEFAULT_MODEL), "{tip}");
+        assert!(tip.contains("HotKey already registered"), "{tip}");
+    }
+
+    /// Ohne Fehler bleibt der Tooltip exakt wie in §4.3 beschrieben.
+    #[test]
+    fn tooltip_without_error_stays_short() {
+        let mut rt = runtime(AppState::Idle, false);
+        assert_eq!(
+            tooltip_text(&rt, DEFAULT_MODEL),
+            format!("idle — {DEFAULT_MODEL}")
+        );
+        // Ein Fehlergrund aus einem früheren Lauf zeigt sich nicht in `idle`.
+        rt.error = Some(crate::state::ErrorInfo {
+            kind: crate::state::ErrorKind::Mic,
+            message: "Mikrofon weg".into(),
+        });
+        assert_eq!(
+            tooltip_text(&rt, DEFAULT_MODEL),
+            format!("idle — {DEFAULT_MODEL}"),
+            "nur der sichtbare Fehlerzustand nennt einen Grund"
+        );
     }
 
     #[test]

@@ -12,25 +12,26 @@ mod imp {
 
     static REQUESTED: AtomicBool = AtomicBool::new(false);
 
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
-
-    unsafe extern "C" {
-        fn signal(signum: i32, handler: usize) -> usize;
-    }
-
-    extern "C" fn on_signal(_signum: i32) {
+    extern "C" fn on_signal(_signum: libc::c_int) {
         REQUESTED.store(true, Ordering::SeqCst);
     }
 
+    /// `sigaction` statt `signal` (agy B2): definierte Semantik ohne
+    /// Handler-Reset, `SA_RESTART` für unterbrochene Syscalls, und kein Cast
+    /// eines Funktionszeigers über `usize` in einer eigenen Deklaration.
+    ///
+    /// SIGHUP bleibt bewusst unangetastet: ein per Autostart gestarteter Daemon
+    /// hat kein Terminal, und `nohup` soll weiter greifen.
     pub fn install() {
-        let handler = on_signal as extern "C" fn(i32) as usize;
-        // SAFETY: `signal` ist POSIX; der Handler schreibt nur ein AtomicBool.
-        // SIGHUP bleibt bewusst unangetastet: ein per Autostart gestarteter
-        // Daemon hat kein Terminal, und `nohup` soll weiter greifen.
+        // SAFETY: `sa` wird vollständig initialisiert, der Handler schreibt nur
+        // ein `AtomicBool` (async-signal-safe), und die Signalnummern sind gültig.
         unsafe {
-            signal(SIGINT, handler);
-            signal(SIGTERM, handler);
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_signal as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
         }
     }
 

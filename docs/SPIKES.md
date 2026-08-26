@@ -134,6 +134,35 @@ D-Bus-Eventpfad, sauberes Quit (Exit 0, kein Prozess-Leak). 99 Unit-Tests.
 Offen: Panel-Neustart-Fall (invasiv, bei Gelegenheit im Alltag) und
 Menü-Sichtprüfung durch den User. Kreuz-Review: zusammen mit Phase 3.
 
-## Phase 3 / 4
+## Phase 3 — Daemon (Linux)
 
-Spec §12.
+2026-08-27, ralf-Legion-S7-15ACH6. TDD-Etappe (3a Tests-zuerst mit
+Orchestrator-Abnahme, 3b Implementierung, 3c Wiring, 3d Infrastruktur),
+Owner-Entscheidungen per Remote Control. Details + Live-Belege:
+`docs/reviews/impl-phase3-context.md`.
+
+Gate §12 Phase 3 — alle Fälle live bestanden:
+- Kalter Start MIT echtem Modell-Download (650 MB von HF, .part→SHA→
+  atomar→COMPLETE), danach Diktat.
+- F9-PTT-Diktat landet in xed (mehrfach, auch nach Pause/Resume und mit
+  konfigurierter Ausweichtaste F8).
+- Parallelstart Exit 0 (Doppel-Lock beide Orte, beide Richtungen),
+  kill -9 → sofortiger Neustart.
+- Beenden über Tray und SIGTERM ≤ 5 s, auch während Inferenz
+  (Quit-Latch: kein Inject nach Quit), keine Zombies.
+- Log-Rotation 2 MiB → .1 live, Ein-Writer belegt, Privacy-Grep sauber.
+- Autostart idempotent, Leerzeichen-Pfad, Exec-Quoting, %-Escaping.
+
+Kreuz-Review (impl-phase3-codex.md / -agy.md): 3×Hoch + 4×Mittel (codex),
+2×Mittel + Rest niedrig (agy) — 11-Punkte-Fixpaket umgesetzt und live
+regressiert (271 Tests). Wichtigste Fixes: SPSC-In-flight-Zähler,
+Quit-Prioritäts-Latch, HotkeyConfig bis ins Backend + Grab-Freigabe bei
+Pause (Manager-Drop).
+
+Testumgebungs-Notiz: Ein nächtlicher Screensaver-Lock ließ XTEST-Events
+ins Leere laufen (Fehlalarm, per Referenz-Build ausgeschlossen;
+loginctl unlock-session).
+
+## Phase 4 — Politur/Release (Linux)
+
+*in Arbeit*
