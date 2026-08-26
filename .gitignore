@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Lokale Modelle und Laufzeitdaten
+/models/
+*.onnx
+*.onnx.data
