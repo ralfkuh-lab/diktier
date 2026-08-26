@@ -125,9 +125,14 @@ Erkenntnisse:
   48 kHz/I32/Stereo overflow=0. 89 Unit-Tests + stt-smoke grün.
   **Phase 2 (Linux) vollständig.**
 
-## Phase 2b — Tray
+## Phase 2b — Tray-Smoke
 
-Spec §12 Phase 2b.
+2026-08-26, Cinnamon 22.3: `betrayer`-TrayBackend, SNI-Item im Panel
+sichtbar (Sichtprüfung Screenshot), Zustandsrotation
+starting→…→paused mit Tooltip „<zustand> — <modellschlüssel>“,
+D-Bus-Eventpfad, sauberes Quit (Exit 0, kein Prozess-Leak). 99 Unit-Tests.
+Offen: Panel-Neustart-Fall (invasiv, bei Gelegenheit im Alltag) und
+Menü-Sichtprüfung durch den User. Kreuz-Review: zusammen mit Phase 3.
 
 ## Phase 3 / 4
 

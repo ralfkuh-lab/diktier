@@ -20,8 +20,8 @@ use download::load_manifest;
 use engine::{ParakeetTranscriber, StubTranscriber, Transcriber, transcribe_pcm};
 use hotkey::{HotkeyBackend, HotkeyEvent, new_backend};
 use inject::{CaptureContext, InjectOutcome, OutputSink, StubOutputSink};
-use state::Runtime;
-use tray::{StubTray, TrayBackend};
+use state::{AppState, RecordingSource, Runtime};
+use tray::{StubTray, TrayBackend, TrayEvent};
 
 /// Lokales Push-to-Talk-Diktiertool.
 #[derive(Debug, Parser)]
@@ -45,7 +45,11 @@ struct Cli {
     remove_autostart: bool,
 
     /// WAV transkribieren (16 kHz mono PCM). Impliziert --foreground.
-    #[arg(long, value_name = "DATEI", conflicts_with_all = ["install_autostart", "remove_autostart"])]
+    #[arg(
+        long,
+        value_name = "DATEI",
+        conflicts_with_all = ["install_autostart", "remove_autostart", "tray_test"]
+    )]
     transcribe_wav: Option<PathBuf>,
 
     /// Gemessene Inferenzläufe nach einem ungezählten Warmup (nur mit --transcribe-wav).
@@ -56,14 +60,14 @@ struct Cli {
     #[arg(
         long,
         value_name = "TEXT",
-        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "hotkey_test", "record_test"]
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "hotkey_test", "record_test", "tray_test"]
     )]
     inject_test: Option<String>,
 
     /// SPIKE: F9 Press/Release 30s loggen (nur mit --foreground). Exit mit Ctrl+C.
     #[arg(
         long,
-        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "record_test"]
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "record_test", "tray_test"]
     )]
     hotkey_test: bool,
 
@@ -71,9 +75,17 @@ struct Cli {
     #[arg(
         long,
         value_name = "SECS",
-        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test"]
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test", "tray_test"]
     )]
     record_test: Option<u32>,
+
+    /// SPIKE: Tray SECS Sekunden anzeigen, Zustände rotieren (nur mit --foreground).
+    #[arg(
+        long,
+        value_name = "SECS",
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test", "record_test"]
+    )]
+    tray_test: Option<u32>,
 }
 
 fn main() -> ExitCode {
@@ -121,6 +133,10 @@ where
         eprintln!("diktier: --record-test nur mit --foreground (SPIKE)");
         return 2;
     }
+    if cli.tray_test.is_some() && !cli.foreground {
+        eprintln!("diktier: --tray-test nur mit --foreground (SPIKE)");
+        return 2;
+    }
     if let Some(text) = cli.inject_test {
         return inject_test(&text);
     }
@@ -129,6 +145,9 @@ where
     }
     if let Some(secs) = cli.record_test {
         return record_test(secs);
+    }
+    if let Some(secs) = cli.tray_test {
+        return tray_test(secs);
     }
 
     run_daemon(cli.foreground)
@@ -434,6 +453,139 @@ fn record_test(secs: u32) -> u8 {
     0
 }
 
+fn tray_test(secs: u32) -> u8 {
+    eprintln!("SPIKE --tray-test (kein Produktionspfad)");
+    if secs == 0 {
+        eprintln!("diktier: --tray-test SECS muss ≥ 1 sein");
+        return 2;
+    }
+
+    let loaded = match config::load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("{err}");
+            return match err {
+                ConfigError::Io(_) => 1,
+                _ => 2,
+            };
+        }
+    };
+    for warning in &loaded.warnings {
+        eprintln!("Warnung: {warning}");
+    }
+
+    let model = loaded.config.engine.model.clone();
+    let cycle = tray_cycle();
+    let mut runtime = cycle[0].clone();
+    let mut tray = match tray::new_backend(&runtime, &model) {
+        Ok(tray) => tray,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    eprintln!("SPIKE tray-backend={}", tray.backend_name());
+    eprintln!(
+        "SPIKE tray-sni=org.kde.StatusNotifierItem-{}-1",
+        std::process::id()
+    );
+    eprintln!(
+        "SPIKE tray: zustand={} tooltip={}",
+        tray::tray_status(&runtime).as_str(),
+        tray::tooltip_text(&runtime, &model)
+    );
+
+    let end = Instant::now() + std::time::Duration::from_secs(u64::from(secs));
+    let mut next_rotate = Instant::now() + std::time::Duration::from_secs(5);
+    let mut idx = 0usize;
+    loop {
+        if Instant::now() >= end {
+            eprintln!("SPIKE tray-test: {secs}s vorbei");
+            break;
+        }
+        match tray.poll() {
+            Ok(Some(TrayEvent::Quit)) => {
+                eprintln!("SPIKE tray: event={}", TrayEvent::Quit.as_str());
+                break;
+            }
+            Ok(Some(event)) => {
+                eprintln!("SPIKE tray: event={}", event.as_str());
+                if event == TrayEvent::OpenConfigDir {
+                    match tray::open_config_dir() {
+                        Ok(()) => {
+                            if let Ok(dir) = tray::config_dir() {
+                                eprintln!("SPIKE tray: config-ordner={}", dir.display());
+                            }
+                        }
+                        Err(err) => eprintln!("SPIKE tray: config-ordner: {err}"),
+                    }
+                }
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(err) => {
+                eprintln!("{err}");
+                return 1;
+            }
+        }
+        if Instant::now() >= next_rotate {
+            idx = (idx + 1) % cycle.len();
+            runtime = cycle[idx].clone();
+            if let Err(err) = tray.update(&runtime, &model) {
+                eprintln!("{err}");
+                return 1;
+            }
+            eprintln!(
+                "SPIKE tray: zustand={} tooltip={}",
+                tray::tray_status(&runtime).as_str(),
+                tray::tooltip_text(&runtime, &model)
+            );
+            next_rotate += std::time::Duration::from_secs(5);
+        }
+    }
+    0
+}
+
+fn tray_cycle() -> [Runtime; 8] {
+    [
+        Runtime {
+            state: AppState::Starting,
+            paused: false,
+        },
+        Runtime {
+            state: AppState::Downloading,
+            paused: false,
+        },
+        Runtime {
+            state: AppState::Loading,
+            paused: false,
+        },
+        Runtime {
+            state: AppState::Idle,
+            paused: false,
+        },
+        Runtime {
+            state: AppState::Recording {
+                source: RecordingSource::TrayClick,
+            },
+            paused: false,
+        },
+        Runtime {
+            state: AppState::Transcribing {
+                source: RecordingSource::TrayClick,
+            },
+            paused: false,
+        },
+        Runtime {
+            state: AppState::Error,
+            paused: false,
+        },
+        Runtime {
+            state: AppState::Idle,
+            paused: true,
+        },
+    ]
+}
+
 fn run_daemon(foreground: bool) -> u8 {
     let loaded = match config::load() {
         Ok(loaded) => loaded,
@@ -580,5 +732,15 @@ mod tests {
     #[test]
     fn record_test_without_foreground_exits_2() {
         assert_eq!(cli_main(["diktier", "--record-test", "3"]), 2);
+    }
+
+    #[test]
+    fn tray_test_without_foreground_exits_2() {
+        assert_eq!(cli_main(["diktier", "--tray-test", "5"]), 2);
+    }
+
+    #[test]
+    fn tray_test_zero_exits_2() {
+        assert_eq!(cli_main(["diktier", "--foreground", "--tray-test", "0"]), 2);
     }
 }
