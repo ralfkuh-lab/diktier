@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod daemon;
 mod download;
 mod engine;
 mod hotkey;
@@ -14,14 +15,13 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use audio::{AudioError, AudioSource, CpalAudioSource, StubAudioSource};
+use audio::{AudioError, AudioSource, CpalAudioSource};
 use config::ConfigError;
-use download::load_manifest;
-use engine::{ParakeetTranscriber, StubTranscriber, Transcriber, transcribe_pcm};
+use engine::{ParakeetTranscriber, transcribe_pcm};
 use hotkey::{HotkeyBackend, HotkeyEvent, new_backend};
-use inject::{CaptureContext, InjectOutcome, OutputSink, StubOutputSink};
+use inject::{CaptureContext, InjectOutcome, OutputSink};
 use state::{AppState, RecordingSource, Runtime};
-use tray::{StubTray, TrayBackend, TrayEvent};
+use tray::{TrayBackend, TrayEvent};
 
 /// Lokales Push-to-Talk-Diktiertool.
 #[derive(Debug, Parser)]
@@ -574,54 +574,7 @@ fn tray_cycle() -> [Runtime; 8] {
 }
 
 fn run_daemon(foreground: bool) -> u8 {
-    let loaded = match config::load() {
-        Ok(loaded) => loaded,
-        Err(err) => {
-            eprintln!("{err}");
-            return match err {
-                ConfigError::Io(_) => 1,
-                _ => 2,
-            };
-        }
-    };
-    for warning in &loaded.warnings {
-        eprintln!("Warnung: {warning}");
-    }
-
-    let manifest = match load_manifest() {
-        Ok(manifest) => manifest,
-        Err(err) => {
-            eprintln!("{err}");
-            return 1;
-        }
-    };
-
-    if foreground {
-        eprintln!("diktier: --foreground");
-    }
-
-    let mut transcriber = StubTranscriber;
-    let mut sink = StubOutputSink;
-    let mut hotkey = new_backend();
-    let mut audio = StubAudioSource;
-    let mut tray = StubTray;
-    let runtime = Runtime::default();
-
-    if let Err(err) = hotkey.register() {
-        eprintln!("{err}");
-        return 1;
-    }
-    if let Err(err) = tray.update(&runtime, &manifest.key) {
-        eprintln!("{err}");
-        return 1;
-    }
-    let _ = transcriber.transcribe(&[]);
-    let _ = sink.copy_only("");
-    let _ = audio.start();
-    let _ = audio.stop();
-
-    eprintln!("Phase-0-Gerüst: Daemon-Schleife noch nicht verdrahtet.");
-    0
+    daemon::run(foreground)
 }
 
 #[cfg(test)]

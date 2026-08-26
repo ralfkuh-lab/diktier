@@ -53,6 +53,13 @@ impl<T: Copy + Default> OverwriteSpsc<T> {
         self.overflow.load(Ordering::Relaxed)
     }
 
+    /// Stand des Write-Cursors. Nur zum **Beobachten** gedacht: der Consumer
+    /// erkennt daran, ob der Producer nach dem Pausieren des Streams noch
+    /// schreibt, bevor er `drain`/`reset` aufruft (codex H5).
+    pub fn write_pos(&self) -> usize {
+        self.write.load(Ordering::Acquire)
+    }
+
     pub fn reset(&self) {
         self.write.store(0, Ordering::Relaxed);
         self.read.store(0, Ordering::Relaxed);

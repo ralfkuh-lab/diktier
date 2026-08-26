@@ -21,7 +21,9 @@ use crate::config::OutputConfig;
 use super::protocol::{
     ClipboardHost, ClipboardSnapshot, ModifierState, PumpEvents, apply_leading_space, inject_paste,
 };
-use super::{CaptureContext, InjectError, InjectOutcome, OutputSink, PasteKey, WindowId};
+use super::{
+    CaptureContext, ClipboardSave, InjectError, InjectOutcome, OutputSink, PasteKey, WindowId,
+};
 
 atom_manager! {
     Atoms: AtomsCookie {
@@ -31,8 +33,11 @@ atom_manager! {
         INCR,
         TEXT,
         TIMESTAMP,
+        CLIPBOARD_MANAGER,
+        SAVE_TARGETS,
         _NET_ACTIVE_WINDOW,
         DIKTIER_SELECTION: b"DIKTIER_SELECTION",
+        DIKTIER_SAVE_TARGETS: b"DIKTIER_SAVE_TARGETS",
     }
 }
 
@@ -461,6 +466,98 @@ impl X11OutputSink {
         Ok(Some(reply.value))
     }
 
+    /// ICCCM 2.6.3 `SAVE_TARGETS`: den eigenen CLIPBOARD-Inhalt vor dem
+    /// Prozessende an den Clipboard-Manager übergeben.
+    ///
+    /// Ohne das verliert Cinnamon beim Owner-Exit den Inhalt: `csd-clipboard`
+    /// stellt dann seinen letzten eigenen Fetch wieder her (Phase-2-Erkenntnis
+    /// in `docs/SPIKES.md`). Während des Handshakes müssen `SelectionRequest`s
+    /// weiter bedient werden — der Manager holt sich die Daten genau so.
+    fn save_targets(&mut self, timeout: Duration) -> Result<ClipboardSave, InjectError> {
+        if !self.still_owner()? {
+            return Ok(ClipboardSave::NotOwner);
+        }
+        let manager = self
+            .conn
+            .get_selection_owner(self.atoms.CLIPBOARD_MANAGER)
+            .map_err(x11_err)?
+            .reply()
+            .map_err(x11_err)?;
+        if manager.owner == NONE {
+            return Ok(ClipboardSave::NoManager);
+        }
+        let half = timeout / 2;
+        let targets = [
+            self.atoms.UTF8_STRING,
+            u32::from(AtomEnum::STRING),
+            self.atoms.TEXT,
+        ];
+        let first = self.request_save(&targets, half)?;
+        if first != ClipboardSave::Refused {
+            return Ok(first);
+        }
+        // ICCCM: eine **leere** Targetliste heißt „alles, was du kriegst".
+        // Manager, die eine explizite Liste ablehnen, akzeptieren oft diese Form.
+        self.request_save(&[], timeout.saturating_sub(half))
+    }
+
+    fn request_save(
+        &mut self,
+        targets: &[Atom],
+        timeout: Duration,
+    ) -> Result<ClipboardSave, InjectError> {
+        self.write_property32(
+            self.window,
+            self.atoms.DIKTIER_SAVE_TARGETS,
+            u32::from(AtomEnum::ATOM),
+            targets,
+        )?;
+        let time = self.next_server_time()?;
+        self.conn
+            .convert_selection(
+                self.window,
+                self.atoms.CLIPBOARD_MANAGER,
+                self.atoms.SAVE_TARGETS,
+                self.atoms.DIKTIER_SAVE_TARGETS,
+                time,
+            )
+            .map_err(x11_err)?;
+        self.conn.flush().map_err(x11_err)?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            while let Some(event) = self.conn.poll_for_event().map_err(x11_err)? {
+                match event {
+                    Event::SelectionNotify(n)
+                        if n.selection == self.atoms.CLIPBOARD_MANAGER
+                            && n.target == self.atoms.SAVE_TARGETS =>
+                    {
+                        // property == None heißt: Manager hat abgelehnt.
+                        return Ok(if n.property == NONE {
+                            ClipboardSave::Refused
+                        } else {
+                            ClipboardSave::Saved
+                        });
+                    }
+                    Event::SelectionRequest(r) => {
+                        let _ = self.handle_selection_request(&r)?;
+                    }
+                    Event::SelectionClear(c) if c.selection == self.atoms.CLIPBOARD => {
+                        self.we_own = false;
+                    }
+                    Event::Error(err) => {
+                        return Err(InjectError::Failed(format!("X11-Fehler: {err:?}")));
+                    }
+                    _ => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(ClipboardSave::Timeout);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn keymap(&self) -> Result<[u8; 32], InjectError> {
         Ok(self
             .conn
@@ -691,6 +788,13 @@ impl OutputSink for X11OutputSink {
 
     fn serve_until_read(&mut self, timeout: Duration) -> Result<u32, InjectError> {
         super::protocol::serve_restored_until_read(self, timeout)
+    }
+
+    fn save_to_clipboard_manager(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ClipboardSave, InjectError> {
+        self.save_targets(timeout)
     }
 }
 

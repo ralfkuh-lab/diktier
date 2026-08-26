@@ -18,6 +18,12 @@ use super::resample::resample_mono_to_16k;
 use super::spsc::OverwriteSpsc;
 use super::{AudioError, CapturedAudio, ENGINE_RATE};
 
+/// Schrittweite beim Warten auf den ruhenden cpal-Callback.
+const PRODUCER_QUIET_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Obergrenze dafür — ein hängender Callback darf den Stop nicht aufhalten.
+const PRODUCER_QUIET_LIMIT: std::time::Duration = std::time::Duration::from_millis(200);
+
 #[derive(Debug, Clone)]
 pub struct CaptureStats {
     pub device_name: String,
@@ -72,6 +78,20 @@ impl TypedRing {
         }
     }
 
+    fn write_pos(&self) -> usize {
+        match self {
+            Self::I8(r) => r.write_pos(),
+            Self::U8(r) => r.write_pos(),
+            Self::I16(r) => r.write_pos(),
+            Self::U16(r) => r.write_pos(),
+            Self::I32(r) => r.write_pos(),
+            Self::U32(r) => r.write_pos(),
+            Self::I64(r) => r.write_pos(),
+            Self::F32(r) => r.write_pos(),
+            Self::F64(r) => r.write_pos(),
+        }
+    }
+
     fn drain_f32(&self) -> Vec<f32> {
         match self {
             Self::I8(r) => drain_map(r, i8_interleaved_to_f32),
@@ -103,12 +123,17 @@ pub struct CpalAudioSource {
     stream: Option<Stream>,
     ring: Option<TypedRing>,
     lost: Arc<AtomicBool>,
+    /// Nimmt der cpal-Callback die Frames an? Nur zwischen `start()` und
+    /// `stop()`; sonst verwirft er sie sofort (der Stream läuft trotzdem
+    /// weiter, damit das Gerät nicht suspendiert).
+    armed: Arc<AtomicBool>,
     recording: bool,
     native_rate: u32,
     native_channels: u16,
     native_format: String,
     device_name: String,
     last_stats: Option<CaptureStats>,
+    last_open_secs: Option<f64>,
 }
 
 impl CpalAudioSource {
@@ -119,17 +144,35 @@ impl CpalAudioSource {
             stream: None,
             ring: None,
             lost: Arc::new(AtomicBool::new(false)),
+            armed: Arc::new(AtomicBool::new(false)),
             recording: false,
             native_rate: 0,
             native_channels: 0,
             native_format: String::new(),
             device_name: String::new(),
             last_stats: None,
+            last_open_secs: None,
         }
     }
 
     pub fn last_stats(&self) -> Option<&CaptureStats> {
         self.last_stats.as_ref()
+    }
+
+    /// Öffnungszeit des zuletzt aufgebauten Streams — die Zeit, die ein Diktat
+    /// ohne Vorbereitung am Anfang verlöre.
+    pub fn last_open_secs(&self) -> Option<f64> {
+        self.last_open_secs
+    }
+
+    /// Läuft ein Stream (aufnahmebereit; ob er Frames annimmt, sagt `armed`)?
+    pub fn is_open(&self) -> bool {
+        self.stream.is_some() && !self.lost.load(Ordering::Acquire)
+    }
+
+    /// Nimmt der Callback gerade Frames an? Nur während einer Aufnahme.
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
     }
 
     fn host_and_device(&self) -> Result<(cpal::Host, cpal::Device), AudioError> {
@@ -153,6 +196,7 @@ impl CpalAudioSource {
     }
 
     fn open(&mut self) -> Result<(), AudioError> {
+        let opened_at = Instant::now();
         self.stream = None;
         self.ring = None;
         let (_host, device) = self.host_and_device()?;
@@ -172,16 +216,35 @@ impl CpalAudioSource {
             * u64::from(channels)) as usize;
         self.lost.store(false, Ordering::Release);
 
+        let armed = &self.armed;
         let (stream, ring) = match sample_format {
-            SampleFormat::I8 => build_i8(&device, &config, min_samples, channels, &self.lost)?,
-            SampleFormat::U8 => build_u8(&device, &config, min_samples, channels, &self.lost)?,
-            SampleFormat::I16 => build_i16(&device, &config, min_samples, channels, &self.lost)?,
-            SampleFormat::U16 => build_u16(&device, &config, min_samples, channels, &self.lost)?,
-            SampleFormat::I32 => build_i32(&device, &config, min_samples, channels, &self.lost)?,
-            SampleFormat::U32 => build_u32(&device, &config, min_samples, channels, &self.lost)?,
-            SampleFormat::I64 => build_i64(&device, &config, min_samples, channels, &self.lost)?,
-            SampleFormat::F32 => build_f32(&device, &config, min_samples, channels, &self.lost)?,
-            SampleFormat::F64 => build_f64(&device, &config, min_samples, channels, &self.lost)?,
+            SampleFormat::I8 => {
+                build_i8(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
+            SampleFormat::U8 => {
+                build_u8(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
+            SampleFormat::I16 => {
+                build_i16(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
+            SampleFormat::U16 => {
+                build_u16(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
+            SampleFormat::I32 => {
+                build_i32(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
+            SampleFormat::U32 => {
+                build_u32(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
+            SampleFormat::I64 => {
+                build_i64(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
+            SampleFormat::F32 => {
+                build_f32(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
+            SampleFormat::F64 => {
+                build_f64(&device, &config, min_samples, channels, &self.lost, armed)?
+            }
             other => {
                 return Err(AudioError::Failed(format!(
                     "Sampleformat {other:?} wird nicht unterstützt"
@@ -195,7 +258,40 @@ impl CpalAudioSource {
         self.device_name = name;
         self.stream = Some(stream);
         self.ring = Some(ring);
+        self.last_open_secs = Some(opened_at.elapsed().as_secs_f64());
         Ok(())
+    }
+
+    /// `play()` ist idempotent; ein Fehler heißt Gerät verloren (§6.4).
+    fn play_stream(&mut self) -> Result<(), AudioError> {
+        let result = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| AudioError::Failed("Stream nicht geöffnet".into()))?
+            .play()
+            .map_err(|e| AudioError::Failed(format!("Stream play: {e}")));
+        if result.is_err() {
+            self.lost.store(true, Ordering::Release);
+            self.stream = None;
+        }
+        result
+    }
+
+    /// Nach dem Entwaffnen kann ein bereits laufender cpal-Callback noch schreiben.
+    /// `drain`/`reset` gehören aber dem Consumer allein (codex H5), also warten
+    /// wir, bis der Write-Cursor kurz stillsteht — normalerweise eine
+    /// Callback-Periode, im Fehlerfall höchstens [`PRODUCER_QUIET_LIMIT`].
+    fn wait_for_producer_quiet(ring: &TypedRing) {
+        let deadline = Instant::now() + PRODUCER_QUIET_LIMIT;
+        let mut last = ring.write_pos();
+        loop {
+            std::thread::sleep(PRODUCER_QUIET_STEP);
+            let now = ring.write_pos();
+            if now == last || Instant::now() >= deadline {
+                return;
+            }
+            last = now;
+        }
     }
 }
 
@@ -207,6 +303,28 @@ fn err_fn(lost: Arc<AtomicBool>) -> impl FnMut(cpal::Error) + Send + 'static {
     }
 }
 
+/// Der komplette cpal-Callback: lock-frei, allokationsfrei (§6.4).
+///
+/// Außerhalb einer Aufnahme (`armed == false`) werden die Frames sofort
+/// verworfen — nichts wird gepuffert, gespeichert oder weitergereicht. Der
+/// Stream läuft trotzdem weiter, sonst suspendiert das Gerät und der nächste
+/// Aufnahmestart wartet auf das Aufwecken (§5: „Aufnahme aus `idle` startet
+/// sofort").
+#[inline]
+fn push_if_armed<T: Copy + Default>(
+    armed: &AtomicBool,
+    ring: &OverwriteSpsc<T>,
+    data: &[T],
+    channels: usize,
+) {
+    if !armed.load(Ordering::Acquire) {
+        return;
+    }
+    for frame in data.chunks_exact(channels) {
+        ring.push_frame(frame);
+    }
+}
+
 macro_rules! impl_build {
     ($name:ident, $ty:ty, $variant:ident) => {
         fn $name(
@@ -215,18 +333,16 @@ macro_rules! impl_build {
             min_samples: usize,
             channels: u16,
             lost: &Arc<AtomicBool>,
+            armed: &Arc<AtomicBool>,
         ) -> Result<(Stream, TypedRing), AudioError> {
             let ring = Arc::new(OverwriteSpsc::<$ty>::new(min_samples, channels as usize));
             let prod = ring.clone();
+            let gate = armed.clone();
             let ch = channels as usize;
             let stream = device
                 .build_input_stream(
                     *config,
-                    move |data: &[$ty], _| {
-                        for frame in data.chunks_exact(ch) {
-                            prod.push_frame(frame);
-                        }
-                    },
+                    move |data: &[$ty], _| push_if_armed(&gate, &prod, data, ch),
                     err_fn(lost.clone()),
                     None,
                 )
@@ -247,6 +363,36 @@ impl_build!(build_f32, f32, F32);
 impl_build!(build_f64, f64, F64);
 
 impl super::AudioSource for CpalAudioSource {
+    /// Gerät vorab öffnen, ohne aufzunehmen (Spec §5: „Aufnahme aus `idle`
+    /// startet sofort"). Der Stream bleibt danach pausiert liegen; `start()`
+    /// muss ihn nur noch entkorken.
+    fn prepare(&mut self) -> Result<(), AudioError> {
+        if self.recording {
+            return Ok(());
+        }
+        if self.lost.load(Ordering::Acquire) || self.stream.is_none() {
+            self.open()?;
+        }
+        // Laufen lassen, ohne anzunehmen: Ein nur geöffneter (pausierter)
+        // Stream hält das Gerät nicht wach — PipeWire suspendiert die Quelle
+        // nach wenigen Sekunden, und das Entkorken kostet dann wieder ~2 s.
+        self.armed.store(false, Ordering::Release);
+        self.play_stream()
+    }
+
+    /// §4.3: Bei `paused` gibt Diktier das Mikrofon wieder her. Der Stream wird
+    /// gedroppt, die Quelle darf suspendieren; der nächste `prepare()`/`start()`
+    /// öffnet neu (und zahlt dann wieder den Geräteanlauf).
+    fn release(&mut self) {
+        if self.recording {
+            // Nie mitten in einer Aufnahme — die gehört dem laufenden Diktat.
+            return;
+        }
+        self.armed.store(false, Ordering::Release);
+        self.stream = None;
+        self.ring = None;
+    }
+
     fn start(&mut self) -> Result<(), AudioError> {
         if self.recording {
             return Ok(());
@@ -255,24 +401,26 @@ impl super::AudioSource for CpalAudioSource {
         if lost || self.stream.is_none() {
             self.open()?;
         }
+        // Der Producer nimmt nichts an (`armed == false`): `reset` ist sicher.
+        self.armed.store(false, Ordering::Release);
         if let Some(ring) = &self.ring {
             ring.reset();
         }
-        self.stream
-            .as_ref()
-            .ok_or_else(|| AudioError::Failed("Stream nicht geöffnet".into()))?
-            .play()
-            .map_err(|e| AudioError::Failed(format!("Stream play: {e}")))?;
+        self.play_stream()?;
+        self.armed.store(true, Ordering::Release);
         self.recording = true;
         Ok(())
     }
 
     fn stop(&mut self) -> Result<CapturedAudio, AudioError> {
         self.recording = false;
-        // Stream zuerst droppen/joinen, bevor drain/reset (codex H5).
-        if let Some(stream) = self.stream.take() {
-            let _ = stream.pause();
-            drop(stream);
+        // Der Stream läuft weiter — nur die Annahme wird abgeschaltet. Würde
+        // hier pausiert, suspendierte das Gerät und der nächste Aufnahmestart
+        // kostete wieder ~2 s (gemessen auf Mint 22, Owner-Entscheidung 3c).
+        self.armed.store(false, Ordering::Release);
+        // Producer zur Ruhe kommen lassen, bevor gedraint wird (codex H5).
+        if let Some(ring) = &self.ring {
+            Self::wait_for_producer_quiet(ring);
         }
         let Some(ring) = &self.ring else {
             return Err(AudioError::Failed("keine Aufnahme".into()));
@@ -333,26 +481,67 @@ mod tests {
     use super::*;
     use crate::audio::AudioSource;
 
+    /// Spiegelt die Öffnungslogik von [`CpalAudioSource`]: geöffnet wird nur,
+    /// wenn kein Stream offen ist oder das Gerät als verloren gilt.
     struct FakeCapture {
         lost: bool,
         opened: u32,
+        released: u32,
+        open: bool,
+        recording: bool,
         samples: Vec<f32>,
         pause_then_drop: bool,
         dropped: bool,
     }
 
+    impl FakeCapture {
+        fn new(samples: Vec<f32>) -> Self {
+            Self {
+                lost: false,
+                opened: 0,
+                released: 0,
+                open: false,
+                recording: false,
+                samples,
+                pause_then_drop: false,
+                dropped: false,
+            }
+        }
+    }
+
     impl AudioSource for FakeCapture {
-        fn start(&mut self) -> Result<(), AudioError> {
-            if self.lost || self.opened == 0 {
+        fn prepare(&mut self) -> Result<(), AudioError> {
+            if self.lost || !self.open {
                 self.opened += 1;
                 self.lost = false;
+                self.open = true;
             }
             Ok(())
         }
 
+        fn release(&mut self) {
+            if self.recording || !self.open {
+                return;
+            }
+            self.open = false;
+            self.released += 1;
+        }
+
+        fn start(&mut self) -> Result<(), AudioError> {
+            if self.lost || !self.open {
+                self.opened += 1;
+                self.lost = false;
+                self.open = true;
+            }
+            self.recording = true;
+            Ok(())
+        }
+
         fn stop(&mut self) -> Result<CapturedAudio, AudioError> {
+            self.recording = false;
             if self.pause_then_drop {
                 self.dropped = true;
+                self.open = false;
             }
             Ok(CapturedAudio {
                 samples: self.samples.clone(),
@@ -363,13 +552,7 @@ mod tests {
 
     #[test]
     fn device_lost_reopens_on_next_start() {
-        let mut src = FakeCapture {
-            lost: false,
-            opened: 0,
-            samples: vec![0.1; 100],
-            pause_then_drop: false,
-            dropped: false,
-        };
+        let mut src = FakeCapture::new(vec![0.1; 100]);
         src.start().unwrap();
         assert_eq!(src.opened, 1);
         src.lost = true;
@@ -380,16 +563,138 @@ mod tests {
 
     #[test]
     fn pause_failure_still_drops_before_drain() {
-        let mut src = FakeCapture {
-            lost: false,
-            opened: 0,
-            samples: vec![0.2; 50],
-            pause_then_drop: true,
-            dropped: false,
-        };
+        let mut src = FakeCapture::new(vec![0.2; 50]);
+        src.pause_then_drop = true;
         src.start().unwrap();
         let out = src.stop().unwrap();
         assert!(src.dropped);
         assert_eq!(out.samples.len(), 50);
+    }
+
+    /// §5: Nach `prepare()` wartet der Aufnahmestart nicht mehr auf das Gerät —
+    /// und über mehrere Diktate hinweg wird genau einmal geöffnet.
+    #[test]
+    fn prepare_opens_once_and_start_reuses_the_open_stream() {
+        let mut src = FakeCapture::new(vec![0.3; 20]);
+        src.prepare().unwrap();
+        assert_eq!(src.opened, 1);
+        src.prepare().unwrap();
+        assert_eq!(src.opened, 1, "prepare ist idempotent");
+
+        for _ in 0..3 {
+            src.start().unwrap();
+            src.stop().unwrap();
+            src.prepare().unwrap();
+        }
+        assert_eq!(
+            src.opened, 1,
+            "der offene Stream überlebt Start/Stop — kein Neuöffnen je Diktat"
+        );
+    }
+
+    /// §4.3: `paused` gibt das Mikrofon her, das Aufheben der Pause holt es
+    /// zurück — beides beliebig oft, ohne dass etwas hängen bleibt.
+    #[test]
+    fn pause_releases_the_device_and_resume_reopens_it() {
+        let mut src = FakeCapture::new(vec![0.5; 10]);
+        src.prepare().unwrap();
+        assert!(src.open);
+        assert_eq!(src.opened, 1);
+
+        src.release();
+        assert!(!src.open, "pausiert heißt: kein offenes Mikrofon");
+        assert_eq!(src.released, 1);
+        src.release();
+        assert_eq!(src.released, 1, "release ist idempotent");
+
+        src.prepare().unwrap();
+        assert!(src.open);
+        assert_eq!(src.opened, 2, "das Aufheben der Pause öffnet neu");
+
+        // Zweiter Durchlauf: Pause → weiter → Diktat funktioniert.
+        src.release();
+        src.prepare().unwrap();
+        src.start().unwrap();
+        let out = src.stop().unwrap();
+        assert_eq!(out.samples.len(), 10);
+        assert_eq!(src.opened, 3);
+    }
+
+    /// Eine laufende Aufnahme wird nie abgebrochen — auch nicht, wenn ein
+    /// Freigeben dazwischenkäme (§4.3: Pause während `recording` verwirft den
+    /// Lauf im Kern, der Stream gehört bis zum `stop()` dem Diktat).
+    #[test]
+    fn release_never_interrupts_a_running_capture() {
+        let mut src = FakeCapture::new(vec![0.1; 32]);
+        src.prepare().unwrap();
+        src.start().unwrap();
+        src.release();
+        assert!(src.open, "Gerät bleibt während der Aufnahme offen");
+        assert_eq!(src.released, 0);
+        let out = src.stop().unwrap();
+        assert_eq!(out.samples.len(), 32);
+        src.release();
+        assert_eq!(src.released, 1, "nach dem Stop greift das Freigeben");
+    }
+
+    /// §6.4: Ein verlorenes Gerät wird beim nächsten Vorbereiten einmal neu
+    /// geöffnet — das Offenhalten darf die Recovery nicht aushebeln.
+    #[test]
+    fn prepare_reopens_a_lost_device() {
+        let mut src = FakeCapture::new(vec![0.4; 10]);
+        src.prepare().unwrap();
+        assert_eq!(src.opened, 1);
+        src.lost = true;
+        src.prepare().unwrap();
+        assert_eq!(src.opened, 2);
+        src.start().unwrap();
+        assert_eq!(src.opened, 2, "nach der Recovery kein zweites Öffnen");
+    }
+
+    /// Der laufende Stream im Ruhezustand darf **nichts** sammeln: der Callback
+    /// verwirft jedes Frame, solange keine Aufnahme läuft.
+    #[test]
+    fn unarmed_callback_discards_every_frame() {
+        let ring = OverwriteSpsc::<f32>::new(64, 1);
+        let armed = AtomicBool::new(false);
+        for _ in 0..50 {
+            push_if_armed(&armed, &ring, &[0.5, 0.5, 0.5, 0.5], 1);
+        }
+        let mut out = Vec::new();
+        ring.drain(&mut out);
+        assert!(out.is_empty(), "Ruhezustand darf nichts puffern: {out:?}");
+        assert_eq!(ring.overflow(), 0, "und auch keinen Overflow erzeugen");
+        assert_eq!(ring.write_pos(), 0);
+
+        armed.store(true, Ordering::Release);
+        push_if_armed(&armed, &ring, &[0.25, 0.5], 1);
+        let mut out = Vec::new();
+        ring.drain(&mut out);
+        assert_eq!(out, vec![0.25, 0.5], "armed nimmt die Frames an");
+    }
+
+    /// Stereo bleibt frame-aligned, auch über das Gate.
+    #[test]
+    fn armed_callback_keeps_frame_alignment() {
+        let ring = OverwriteSpsc::<i16>::new(8, 2);
+        let armed = AtomicBool::new(true);
+        push_if_armed(&armed, &ring, &[1, 2, 3, 4, 5], 2);
+        let mut out = Vec::new();
+        ring.drain(&mut out);
+        assert_eq!(out, vec![1, 2, 3, 4], "unvollständiges Frame bleibt liegen");
+    }
+
+    /// Der Consumer darf erst drainen, wenn der Producer steht (codex H5):
+    /// stillstehender Write-Cursor beendet das Warten sofort.
+    #[test]
+    fn producer_quiet_wait_returns_when_write_cursor_stands_still() {
+        let ring = TypedRing::F32(Arc::new(OverwriteSpsc::<f32>::new(64, 1)));
+        ring.write_pos();
+        let t0 = Instant::now();
+        CpalAudioSource::wait_for_producer_quiet(&ring);
+        assert!(
+            t0.elapsed() < PRODUCER_QUIET_LIMIT,
+            "ruhiger Producer darf nicht bis zur Obergrenze warten"
+        );
     }
 }

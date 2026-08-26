@@ -37,6 +37,17 @@ pub struct CapturedAudio {
 pub trait AudioSource {
     fn start(&mut self) -> Result<(), AudioError>;
     fn stop(&mut self) -> Result<CapturedAudio, AudioError>;
+    /// Gerät öffnen, ohne aufzunehmen — damit `start()` nicht auf den
+    /// Geräteaufbau wartet (Spec §5: „Aufnahme aus `idle` startet sofort").
+    /// Idempotent; ein verlorenes Gerät wird dabei einmal neu geöffnet (§6.4).
+    fn prepare(&mut self) -> Result<(), AudioError> {
+        Ok(())
+    }
+    /// Gegenstück zu [`AudioSource::prepare`]: Gerät wieder hergeben.
+    ///
+    /// §4.3 `paused` heißt „ich will jetzt nicht diktieren" — dann soll auch
+    /// kein Mikrofon offen stehen. Eine laufende Aufnahme wird nie abgebrochen.
+    fn release(&mut self) {}
 }
 
 #[derive(Debug, Default)]

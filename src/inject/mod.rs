@@ -77,6 +77,37 @@ impl RestoreDecision {
     }
 }
 
+/// Ausgang des `CLIPBOARD_MANAGER`/`SAVE_TARGETS`-Handshakes im Quit-Pfad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardSave {
+    /// Diktier hält die Selection nicht (mehr) — nichts zu sichern.
+    NotOwner,
+    /// Kein Clipboard-Manager auf der Session.
+    NoManager,
+    /// Manager hat den Inhalt übernommen.
+    Saved,
+    /// Manager hat abgelehnt (`property == None`).
+    Refused,
+    /// Keine Antwort innerhalb der Frist.
+    Timeout,
+}
+
+impl ClipboardSave {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotOwner => "kein Clipboard-Eigentum",
+            Self::NoManager => "kein Clipboard-Manager",
+            Self::Saved => "an den Clipboard-Manager übergeben",
+            Self::Refused => "vom Clipboard-Manager abgelehnt",
+            Self::Timeout => "keine Antwort des Clipboard-Managers",
+        }
+    }
+
+    pub fn saved(self) -> bool {
+        self == Self::Saved
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InjectOutcome {
     Pasted {
@@ -113,6 +144,15 @@ pub trait OutputSink {
     /// Spike: restaurierte Selection bedienen, bis ein Daten-Read kam oder `timeout`.
     fn serve_until_read(&mut self, _timeout: Duration) -> Result<u32, InjectError> {
         Ok(0)
+    }
+    /// Quit-Pfad (Spec §7.1 Punkt 8 + Phase-2-Erkenntnis `csd-clipboard`):
+    /// den eigenen Clipboard-Inhalt vor dem Prozessende an einen laufenden
+    /// Clipboard-Manager übergeben (ICCCM `CLIPBOARD_MANAGER`/`SAVE_TARGETS`).
+    fn save_to_clipboard_manager(
+        &mut self,
+        _timeout: Duration,
+    ) -> Result<ClipboardSave, InjectError> {
+        Ok(ClipboardSave::NoManager)
     }
 }
 
@@ -188,6 +228,28 @@ mod tests {
         let outcome = sink.paste("Hallo", &ctx(1)).unwrap();
         assert!(matches!(outcome, InjectOutcome::CopyOnly { .. }));
         sink.copy_only("Hallo").unwrap();
+    }
+
+    /// Nur `Saved` heißt, dass ein Clipboard-Manager den Inhalt übernommen hat;
+    /// jeder andere Ausgang bekommt im Quit-Log eine eigene Begründung (§7.1 P8).
+    #[test]
+    fn clipboard_save_outcomes_are_distinguishable() {
+        assert!(ClipboardSave::Saved.saved());
+        for other in [
+            ClipboardSave::NotOwner,
+            ClipboardSave::NoManager,
+            ClipboardSave::Refused,
+            ClipboardSave::Timeout,
+        ] {
+            assert!(!other.saved(), "{other:?}");
+            assert_ne!(other.as_str(), ClipboardSave::Saved.as_str());
+        }
+        let mut sink = StubOutputSink;
+        assert_eq!(
+            sink.save_to_clipboard_manager(Duration::from_millis(1))
+                .unwrap(),
+            ClipboardSave::NoManager
+        );
     }
 
     #[test]
