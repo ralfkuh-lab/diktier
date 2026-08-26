@@ -29,6 +29,15 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "
 # bedient pipewire-pulse den Pulse-Socket — das erreicht PipeWire, ohne
 # libpipewire-0.3-dev (Feature `pipewire` bindgen't, Header fehlen hier).
 # 0.18 verlangt explizites stream.play().
+#
+# Am Release-Binary nachgemessen (Phase 4, `readelf -d` / `nm -D`): Das
+# Pulse-Backend spricht das Serverprotokoll **selbst über den Unix-Socket**
+# (Rust-Modul `pulseaudio::client`/`::protocol`, String „connecting to
+# PulseAudio server at“) — es gibt keine libpulse-Bindung, entsprechend weder
+# `NEEDED libpulse.so.0` noch `pa_*`-Symbole. Dynamisch gelinkt wird allein
+# `libasound.so.2` (77 undefinierte `snd_*`) für das mitkompilierte
+# ALSA-Backend, das der Fallback bleibt. Fürs Bundle heißt das: eine einzige
+# Audio-Systemabhängigkeit, und die ist auf jedem Desktop da (§11).
 cpal = { version = "=0.18.2", features = ["pulseaudio"] }
 # rubato 0.16.2: letzte 0.16-API mit FftFixedIn + process_partial (Flush).
 # Nicht 1.x/4.x (AudioAdapter-Umbruch). FFT, kein Linear-Resampler (§6.4).

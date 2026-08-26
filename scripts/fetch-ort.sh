@@ -18,6 +18,8 @@ TARBALL_SHA256="a3e1b79d7bb1bf09696ce675f49e4064e6c81f6202b8225624fff0e93f8d6407
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${ROOT}/lib"
+# Die MIT-Lizenz der ONNX Runtime gehört ins Bundle (Spec §11 „LICENSES/").
+LICENSE_DEST="${ROOT}/LICENSES/ONNXRUNTIME-LICENSE.txt"
 TMP="$(mktemp -d)"
 cleanup() { rm -rf "${TMP}"; }
 trap cleanup EXIT
@@ -39,6 +41,17 @@ mkdir -p "${DEST}"
 # -L: Symlink auflösen, feste Datei unter dem Spec-Namen ablegen.
 cp -L "${SRC}" "${DEST}/libonnxruntime.so"
 chmod 0644 "${DEST}/libonnxruntime.so"
+
+# Lizenz mitnehmen, solange das Archiv noch ausgepackt ist: das Release-Bundle
+# liefert die Library aus und muss ihre Lizenz beilegen (§11).
+mkdir -p "$(dirname "${LICENSE_DEST}")"
+if [[ -f "${EXTRACT}/LICENSE" ]]; then
+  cp "${EXTRACT}/LICENSE" "${LICENSE_DEST}"
+  chmod 0644 "${LICENSE_DEST}"
+  echo "OK: ${LICENSE_DEST}"
+else
+  echo "Warnung: LICENSE fehlt im ORT-Archiv — ${LICENSE_DEST} nicht aktualisiert" >&2
+fi
 
 # target/ darf noch fehlen (frisches Repo).
 for profile in debug release; do

@@ -13,5 +13,8 @@
 # ORT-Library (scripts/fetch-ort.sh → lib/libonnxruntime.so, Spec §11)
 /lib/
 
+# Release-Bundle und Tarball (scripts/release.sh, Spec §11)
+/dist/
+
 __pycache__/
 *.py[cod]

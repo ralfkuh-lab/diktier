@@ -165,4 +165,22 @@ loginctl unlock-session).
 
 ## Phase 4 — Politur/Release (Linux)
 
-*in Arbeit*
+2026-08-27. `scripts/release.sh` → `dist/diktier-0.1.0-linux-x64.tar.gz`
+(13,9 MB): diktier + lib/libonnxruntime.so + LICENSES/ (MIT, CC-BY-4.0,
+NOTICE-parakeet, ORT, THIRD-PARTY) + versions.toml + Bundle-README
+(Owner-Entscheidung; §11-Layout ergänzt).
+
+Release-Gate §11 in sauberem ubuntu:24.04-Container bestanden: Tarball in
+leeres Verzeichnis, ORT-Env unset, Modell read-only gemountet →
+--transcribe-wav liefert das identische Transkript wie der Host, Exit 0;
+`ldd` ohne „not found“. Einzige Audio-Systemabhängigkeit: libasound.so.2
+(cpal-pulseaudio spricht den Pulse-Socket über einen reinen
+Rust-Protokoll-Stack, kein libpulse-Link — nachgemessen via readelf/nm).
+
+Verschobene-Binary-Fall (§12): Bundle A → install → nach B verschieben →
+erneutes install aktualisiert den Eintrag. Portabler Start aus fremdem
+cwd ok. Idempotenz von release.sh belegt, shellcheck sauber.
+
+**Linux-Stand komplett: Phasen 0–4 bestanden.** Offen: Windows-Etappe
+(Pflichtmatrix Win10/11, fetch-ort.ps1-Verifikation, Named Mutex,
+Windows-Autostart, release.ps1).
