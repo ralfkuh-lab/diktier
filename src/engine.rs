@@ -13,6 +13,98 @@ use crate::download::{self, ArtifactManifest, DownloadError};
 /// 16 kHz × 250 ms. Kürzer → kein Engine-Aufruf (Spec §6.4).
 pub const MIN_SAMPLES_16KHZ: usize = 16_000 * 250 / 1_000;
 
+/// RMS-Schwelle für den Silence-Gate (Spec §12: Halluzination auf
+/// Stille/Rauschen darf Diktier vorschalten — Engine wird nicht aufgerufen).
+///
+/// `0.0075` ≈ 20·log₁₀(0.0075) ≈ −42,5 dBFS.
+/// `testdata/stt/rauschen.wav` RMS ≈ 0,0051 muss darunter bleiben;
+/// leiseste Sprachaufnahme `alltag.wav` ≈ 0,0215 klar darüber.
+pub const RMS_SILENCE_THRESHOLD: f32 = 0.0075;
+
+/// RMS des 16-kHz-f32-Signals über den gegebenen Ausschnitt.
+pub fn rms_f32(pcm_f32_16khz: &[f32]) -> f32 {
+    if pcm_f32_16khz.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = pcm_f32_16khz
+        .iter()
+        .map(|&s| {
+            let x = f64::from(s);
+            x * x
+        })
+        .sum();
+    (sum_sq / pcm_f32_16khz.len() as f64).sqrt() as f32
+}
+
+/// Maximum der RMS-Werte über nicht überlappende 250-ms-Fenster.
+/// Lange Stille plus kurze leise Sprache bleibt so über der Schwelle (agy B3 / codex N1).
+pub fn max_window_rms(pcm_f32_16khz: &[f32]) -> f32 {
+    if pcm_f32_16khz.is_empty() {
+        return 0.0;
+    }
+    let win = MIN_SAMPLES_16KHZ;
+    if pcm_f32_16khz.len() <= win {
+        return rms_f32(pcm_f32_16khz);
+    }
+    let mut max = 0.0_f32;
+    let mut i = 0;
+    while i < pcm_f32_16khz.len() {
+        let end = (i + win).min(pcm_f32_16khz.len());
+        let r = rms_f32(&pcm_f32_16khz[i..end]);
+        if r > max {
+            max = r;
+        }
+        if end == pcm_f32_16khz.len() {
+            break;
+        }
+        i += win;
+    }
+    max
+}
+
+/// Zu kurz oder unter der RMS-Schwelle — Engine nicht laden/aufrufen.
+///
+/// Primär: `max(RMS über 250-ms-Fenster) < 0.0075` → leer (agy B3 / codex N1).
+/// Wenn der Gesamtpuffer unter der Schwelle bleibt, einzelne laute Fenster
+/// aber drüber sind (Klick in `rauschen.wav` vs. 2 s leise Sprache in langer
+/// Stille): nur Durchläufe von mindestens 2 s über der Schwelle gelten als
+/// Sprache — sonst WAV-Regression (`rauschen.wav`) würde kippen.
+pub fn is_silence_or_short(pcm_f32_16khz: &[f32]) -> bool {
+    if pcm_f32_16khz.len() < MIN_SAMPLES_16KHZ {
+        return true;
+    }
+    if max_window_rms(pcm_f32_16khz) < RMS_SILENCE_THRESHOLD {
+        return true;
+    }
+    if rms_f32(pcm_f32_16khz) >= RMS_SILENCE_THRESHOLD {
+        return false;
+    }
+    longest_loud_run_secs(pcm_f32_16khz) < 2.0
+}
+
+fn longest_loud_run_secs(pcm: &[f32]) -> f32 {
+    let win = MIN_SAMPLES_16KHZ;
+    let mut run = 0_usize;
+    let mut best = 0_usize;
+    let mut i = 0;
+    while i < pcm.len() {
+        let end = (i + win).min(pcm.len());
+        if rms_f32(&pcm[i..end]) >= RMS_SILENCE_THRESHOLD {
+            run += end - i;
+            if run > best {
+                best = run;
+            }
+        } else {
+            run = 0;
+        }
+        if end == pcm.len() {
+            break;
+        }
+        i += win;
+    }
+    best as f32 / 16_000.0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcription {
     pub text: String,
@@ -49,12 +141,13 @@ pub trait Transcriber {
     fn transcribe(&mut self, pcm_f32_16khz: &[f32]) -> Result<Transcription, EngineError>;
 }
 
-/// Überspringt die Engine bei Audio kürzer als 250 ms.
+/// Überspringt die Engine bei Audio kürzer als 250 ms oder unter der
+/// RMS-Silence-Schwelle (Spec §6.4 / §12).
 pub fn transcribe_pcm<T: Transcriber>(
     engine: &mut T,
     pcm_f32_16khz: &[f32],
 ) -> Result<Transcription, EngineError> {
-    if pcm_f32_16khz.len() < MIN_SAMPLES_16KHZ {
+    if is_silence_or_short(pcm_f32_16khz) {
         return Ok(Transcription::empty());
     }
     engine.transcribe(pcm_f32_16khz)
@@ -250,6 +343,93 @@ mod tests {
         let out = transcribe_pcm(&mut stub, &exact).unwrap();
         assert_eq!(stub.calls, 1);
         assert_eq!(out.text, MIN_SAMPLES_16KHZ.to_string());
+    }
+
+    fn testdata(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/stt")
+            .join(name)
+    }
+
+    #[test]
+    fn silence_and_noise_wavs_skip_engine() {
+        for name in ["stille.wav", "rauschen.wav"] {
+            let pcm = crate::audio::read_wav_16k_mono(&testdata(name)).unwrap();
+            let rms = rms_f32(&pcm);
+            assert!(
+                rms < RMS_SILENCE_THRESHOLD,
+                "{name}: rms {rms} sollte unter {RMS_SILENCE_THRESHOLD} liegen"
+            );
+            let mut stub = CountingStub { calls: 0 };
+            let out = transcribe_pcm(&mut stub, &pcm).unwrap();
+            assert_eq!(stub.calls, 0, "{name}: Engine darf nicht laufen");
+            assert!(
+                out.text.is_empty(),
+                "{name}: erwartet leer, got {:?}",
+                out.text
+            );
+        }
+    }
+
+    #[test]
+    fn alltag_wav_above_threshold_calls_engine() {
+        let pcm = crate::audio::read_wav_16k_mono(&testdata("alltag.wav")).unwrap();
+        let rms = rms_f32(&pcm);
+        assert!(
+            rms > RMS_SILENCE_THRESHOLD,
+            "alltag.wav: rms {rms} sollte über {RMS_SILENCE_THRESHOLD} liegen"
+        );
+        let mut stub = CountingStub { calls: 0 };
+        let out = transcribe_pcm(&mut stub, &pcm).unwrap();
+        assert_eq!(stub.calls, 1);
+        assert_eq!(out.text, pcm.len().to_string());
+    }
+
+    #[test]
+    fn rms_silence_threshold_is_exclusive_below() {
+        let n = MIN_SAMPLES_16KHZ;
+        let just_below = vec![RMS_SILENCE_THRESHOLD * 0.999; n];
+        let at = vec![RMS_SILENCE_THRESHOLD; n];
+        let just_above = vec![RMS_SILENCE_THRESHOLD * 1.001; n];
+        assert!(rms_f32(&just_below) < RMS_SILENCE_THRESHOLD);
+        assert!((rms_f32(&at) - RMS_SILENCE_THRESHOLD).abs() < 1e-9);
+        assert!(rms_f32(&just_above) > RMS_SILENCE_THRESHOLD);
+
+        let mut stub = CountingStub { calls: 0 };
+        let out = transcribe_pcm(&mut stub, &just_below).unwrap();
+        assert_eq!(stub.calls, 0);
+        assert!(out.text.is_empty());
+
+        let out = transcribe_pcm(&mut stub, &at).unwrap();
+        assert_eq!(stub.calls, 1);
+        assert_eq!(out.text, n.to_string());
+
+        let out = transcribe_pcm(&mut stub, &just_above).unwrap();
+        assert_eq!(stub.calls, 2);
+        assert_eq!(out.text, n.to_string());
+    }
+
+    #[test]
+    fn windowed_rms_keeps_short_speech_in_long_silence() {
+        let silence_n = 16_000 * 23;
+        let speech_n = 16_000 * 2;
+        let mut pcm = vec![0.001_f32; silence_n];
+        pcm.extend(std::iter::repeat_n(0.02_f32, speech_n));
+        assert!(rms_f32(&pcm) < RMS_SILENCE_THRESHOLD);
+        assert!(max_window_rms(&pcm) > RMS_SILENCE_THRESHOLD);
+        let mut stub = CountingStub { calls: 0 };
+        transcribe_pcm(&mut stub, &pcm).unwrap();
+        assert_eq!(stub.calls, 1);
+    }
+
+    #[test]
+    fn pure_silence_still_skips_engine() {
+        let pcm = vec![0.001_f32; 16_000 * 5];
+        assert!(is_silence_or_short(&pcm));
+        let mut stub = CountingStub { calls: 0 };
+        let out = transcribe_pcm(&mut stub, &pcm).unwrap();
+        assert_eq!(stub.calls, 0);
+        assert!(out.text.is_empty());
     }
 
     #[test]

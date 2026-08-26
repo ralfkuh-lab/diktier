@@ -87,7 +87,43 @@ Diktier 0,0476 / Voxtype 0,0000 (Δ +4,76 % ≤ +5 %), fachwoerter beide
 
 ## Phase 2 — Inject / Capture
 
-Pflichtmatrix und Einzelfälle: Spec §12 Phase 2. Pro Zelle: pass/fail + Fenster-ID vor/nach.
+Linux-Zeile der Pflichtmatrix: live abgenommen 2026-08-26 auf
+ralf-Legion-S7-15ACH6 (Orchestrator, xdotool/wmctrl-gesteuert,
+Spike-CLI `--inject-test` / `--hotkey-test` / `--record-test`).
+Gate-Text «Grüße, Öl, Spaß — Zeile 1\nZeile 2», Byte-Vergleich per diff.
+
+| Fall | Ergebnis |
+|---|---|
+| xed | pass — byte-exakt, `ctrl_v`, Fenster-ID vor/nach identisch (0x6600325) |
+| gnome-terminal | pass — `ctrl_shift_v` via WM_CLASS, byte-exakt inkl. Zeilen, kein `^V` |
+| VSCodium (statt VS Code, Owner-Entscheidung) | pass — `ctrl_v`, byte-exakt (Home-Datei; Flatpak sieht /tmp nicht — Testmethodik, kein Produktproblem) |
+| Fokuswechsel während Transkription | pass — copy_only, Transkript bleibt im Clipboard |
+| Kein Read → kein Restore (§7.1 P7) | pass — Transkript bleibt |
+| Fremder Owner während Wartezeit | pass — kein Restore („fremder Clipboard-Inhalt bleibt“) |
+| Clipboard-Restore | pass in der Serve-Phase (restored_served=1, Inhalt „ALTER-INHALT-42“) |
+| PTT F9 Press/Release | pass — `global-hotkey` 0.8.0; 2,5-s-Halten mit X-Autorepeat → genau 1 Press/Release |
+| Registrierungskonflikt | pass — „HotKey already registered“ sauber gemeldet |
+| Capture nativ | pass — 48 kHz / I32 / Stereo → Downmix → rubato → 16 k; Längenbilanz exakt (630784/3), overflow=0 |
+| End-to-End Lautsprecher→Mikro | pass — alltag.wav über Raumakustik nahezu fehlerfrei transkribiert |
+| RMS-Silence-Gate | Schwelle 0,0075 (≈ −42,5 dBFS); stille.wav rms=0,00119 → leer ohne Engine; alltag.wav rms=0,02145 → transkribiert; Anlass: Live-Halluzination „Ich bin jetzt wohl weiter zu machen.“ bei stillem Raum (vor dem Gate) |
+
+Erkenntnisse:
+- `csd-clipboard` (Cinnamon) stellt nach Owner-Exit seinen letzten Fetch
+  wieder her; ein still restauriertes Clipboard geht damit beim
+  Prozessende verloren. Daemon-Quit-Pfad (Phase 3) MUSS das
+  `CLIPBOARD_MANAGER`/`SAVE_TARGETS`-Protokoll bedienen.
+- Windows-Zeilen der Matrix: offen (eigene Etappe, Rechner/VMs nötig).
+- Kreuz-Review 2a+2b: docs/reviews/impl-phase2-codex.md / -agy.md.
+  Konsolidiertes 14-Punkte-Fixpaket umgesetzt (u. a. SelectionClear-Drain
+  + Ownership-Timestamp, finale Fokusprüfung vor Key-Event, Cookie-Checks
+  vor Read-Zählung, Consumer-only-SPSC, Hotkey-Handshake, leading_space,
+  fensterbasiertes RMS-Gate, TIMESTAMP-Target/Latin-1-STRING, INCR-Grenzen).
+  Vertagt mit Code-Verankerung: codex H4 (nichtblockierender Paste) =
+  Phase-3-Pflicht; ICCCM MULTIPLE = dokumentierte v1-Lücke.
+  Live-Regression nach Fixpaket: xed byte-exakt, Restore im Grace-Fenster
+  („ALTER-INHALT-99“, restored_served=1), PTT 1/1 entprellt, Capture
+  48 kHz/I32/Stereo overflow=0. 89 Unit-Tests + stt-smoke grün.
+  **Phase 2 (Linux) vollständig.**
 
 ## Phase 2b — Tray
 

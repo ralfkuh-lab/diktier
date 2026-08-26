@@ -14,12 +14,12 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use audio::{AudioError, AudioSource, StubAudioSource};
+use audio::{AudioError, AudioSource, CpalAudioSource, StubAudioSource};
 use config::ConfigError;
 use download::load_manifest;
 use engine::{ParakeetTranscriber, StubTranscriber, Transcriber, transcribe_pcm};
-use hotkey::{HotkeyBackend, new_backend};
-use inject::{OutputSink, StubOutputSink};
+use hotkey::{HotkeyBackend, HotkeyEvent, new_backend};
+use inject::{CaptureContext, InjectOutcome, OutputSink, StubOutputSink};
 use state::Runtime;
 use tray::{StubTray, TrayBackend};
 
@@ -51,6 +51,29 @@ struct Cli {
     /// Gemessene Inferenzläufe nach einem ungezählten Warmup (nur mit --transcribe-wav).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     runs: u32,
+
+    /// SPIKE: nach 3s den kompletten Inject-Pfad ausführen (nur mit --foreground).
+    #[arg(
+        long,
+        value_name = "TEXT",
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "hotkey_test", "record_test"]
+    )]
+    inject_test: Option<String>,
+
+    /// SPIKE: F9 Press/Release 30s loggen (nur mit --foreground). Exit mit Ctrl+C.
+    #[arg(
+        long,
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "record_test"]
+    )]
+    hotkey_test: bool,
+
+    /// SPIKE: SECS Sekunden vom Default-Mic aufnehmen, Pipeline + Transkript (nur mit --foreground).
+    #[arg(
+        long,
+        value_name = "SECS",
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test"]
+    )]
+    record_test: Option<u32>,
 }
 
 fn main() -> ExitCode {
@@ -86,6 +109,27 @@ where
     if let Some(path) = cli.transcribe_wav {
         return transcribe_wav(&path, cli.runs);
     }
+    if cli.inject_test.is_some() && !cli.foreground {
+        eprintln!("diktier: --inject-test nur mit --foreground (SPIKE)");
+        return 2;
+    }
+    if cli.hotkey_test && !cli.foreground {
+        eprintln!("diktier: --hotkey-test nur mit --foreground (SPIKE)");
+        return 2;
+    }
+    if cli.record_test.is_some() && !cli.foreground {
+        eprintln!("diktier: --record-test nur mit --foreground (SPIKE)");
+        return 2;
+    }
+    if let Some(text) = cli.inject_test {
+        return inject_test(&text);
+    }
+    if cli.hotkey_test {
+        return hotkey_test();
+    }
+    if let Some(secs) = cli.record_test {
+        return record_test(secs);
+    }
 
     run_daemon(cli.foreground)
 }
@@ -116,8 +160,12 @@ fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
         }
     };
 
-    if pcm.len() < engine::MIN_SAMPLES_16KHZ {
-        eprintln!("Aufnahme < 250 ms, Engine nicht aufgerufen.");
+    let rms = engine::rms_f32(&pcm);
+    eprintln!("SPIKE rms={rms:.6}");
+    if engine::is_silence_or_short(&pcm) {
+        if pcm.len() < engine::MIN_SAMPLES_16KHZ {
+            eprintln!("Aufnahme < 250 ms, Engine nicht aufgerufen.");
+        }
         println!();
         return 0;
     }
@@ -156,6 +204,233 @@ fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
         eprintln!("Inferenz {:.3} s", infer_start.elapsed().as_secs_f64());
     }
     println!("{}", last.text);
+    0
+}
+
+fn inject_test(text: &str) -> u8 {
+    eprintln!("SPIKE --inject-test (kein Produktionspfad)");
+    let loaded = match config::load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("{err}");
+            return match err {
+                ConfigError::Io(_) => 1,
+                _ => 2,
+            };
+        }
+    };
+    for warning in &loaded.warnings {
+        eprintln!("Warnung: {warning}");
+    }
+
+    // SPIKE: Gate-Text aus §12 byte-exakt — leading_space nicht anwenden.
+    let mut spike_out = loaded.config.output.clone();
+    spike_out.leading_space = false;
+    let mut sink = match inject::new_sink(spike_out) {
+        Ok(sink) => sink,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+
+    let start = sink.current_window_id();
+    eprintln!("SPIKE start_window_id={}", format_window(start));
+    eprintln!("SPIKE: 3s — Ziel im Vordergrund halten für Paste, wechsele für copy_only …");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let target = sink.current_window_id();
+    eprintln!("SPIKE target_window_id={}", format_window(target));
+    let ctx = CaptureContext {
+        start_window_id: start,
+        target_window_id: target,
+        ended_at: Instant::now(),
+    };
+
+    let outcome = match sink.paste(text, &ctx) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            eprintln!("SPIKE inject-fehler: {err}");
+            return 1;
+        }
+    };
+    log_inject_outcome(text, start, target, sink.current_window_id(), &outcome);
+
+    let restored = matches!(&outcome, InjectOutcome::Pasted { restored: true, .. });
+    if restored {
+        match sink.serve_until_read(inject::RESTORED_SERVE_GRACE) {
+            Ok(n) => eprintln!("SPIKE restored_served={n}"),
+            Err(err) => eprintln!("SPIKE serve: {err}"),
+        }
+    } else if let Err(err) = sink.serve_for(std::time::Duration::from_secs(2)) {
+        eprintln!("SPIKE serve: {err}");
+    }
+    0
+}
+
+fn log_inject_outcome(
+    text: &str,
+    start: Option<inject::WindowId>,
+    target: Option<inject::WindowId>,
+    current: Option<inject::WindowId>,
+    outcome: &InjectOutcome,
+) {
+    eprintln!("SPIKE text_bytes={}", text.len());
+    eprintln!(
+        "SPIKE windows start={} target={} current={}",
+        format_window(start),
+        format_window(target),
+        format_window(current)
+    );
+    match outcome {
+        InjectOutcome::Pasted {
+            restored,
+            shortcut,
+            window,
+            wm_class,
+            reads,
+            restore,
+        } => {
+            let class = match wm_class {
+                Some((instance, class)) => format!("{instance},{class}"),
+                None => "unbekannt".into(),
+            };
+            eprintln!("SPIKE pfad=paste");
+            eprintln!("SPIKE window=0x{:x}", window.0);
+            eprintln!("SPIKE wm_class={class}");
+            eprintln!("SPIKE shortcut={} (config/auto)", shortcut.as_str());
+            eprintln!("SPIKE selection_requests(data)={reads}");
+            eprintln!("SPIKE restored={restored} ({})", restore.as_str());
+        }
+        InjectOutcome::CopyOnly { reason } => {
+            eprintln!("SPIKE pfad=copy_only");
+            eprintln!("SPIKE grund={}", reason.as_str());
+        }
+    }
+}
+
+fn format_window(id: Option<inject::WindowId>) -> String {
+    match id {
+        Some(id) => format!("0x{:x}", id.0),
+        None => "None".into(),
+    }
+}
+
+fn hotkey_test() -> u8 {
+    eprintln!("SPIKE --hotkey-test (kein Produktionspfad)");
+    eprintln!("SPIKE: F9 30s lang halten/loslassen; Exit mit Ctrl+C");
+    let mut backend = new_backend();
+    eprintln!("SPIKE hotkey-backend={}", backend.backend_name());
+    if let Err(err) = backend.register() {
+        eprintln!("{err}");
+        return 1;
+    }
+    let end = Instant::now() + std::time::Duration::from_secs(30);
+    while Instant::now() < end {
+        match backend.poll() {
+            Ok(Some(HotkeyEvent::Press)) => eprintln!("SPIKE hotkey: press (entprellt)"),
+            Ok(Some(HotkeyEvent::Release)) => eprintln!("SPIKE hotkey: release (entprellt)"),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(err) => {
+                eprintln!("{err}");
+                return 1;
+            }
+        }
+    }
+    eprintln!("SPIKE hotkey-test: 30s vorbei");
+    0
+}
+
+fn record_test(secs: u32) -> u8 {
+    eprintln!("SPIKE --record-test (kein Produktionspfad)");
+    if secs == 0 {
+        eprintln!("diktier: --record-test SECS muss ≥ 1 sein");
+        return 2;
+    }
+    let loaded = match config::load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("{err}");
+            return match err {
+                ConfigError::Io(_) => 1,
+                _ => 2,
+            };
+        }
+    };
+    for warning in &loaded.warnings {
+        eprintln!("Warnung: {warning}");
+    }
+
+    let mut src = CpalAudioSource::new(&loaded.config.audio);
+    let t_cap = Instant::now();
+    if let Err(err) = src.start() {
+        eprintln!("{err}");
+        return 1;
+    }
+    std::thread::sleep(std::time::Duration::from_secs(u64::from(secs)));
+    let captured = match src.stop() {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    let capture_secs = t_cap.elapsed().as_secs_f64();
+    if let Some(st) = src.last_stats() {
+        eprintln!("SPIKE device={}", st.device_name);
+        eprintln!(
+            "SPIKE native_rate={} native_format={} native_channels={}",
+            st.native_rate, st.native_format, st.native_channels
+        );
+        eprintln!(
+            "SPIKE input_frames={} input_samples={} output_samples_16k={}",
+            st.input_frames, st.input_samples, st.output_samples
+        );
+        eprintln!("SPIKE overflow_frames={}", st.overflow_frames);
+        eprintln!(
+            "SPIKE convert_resample_secs={:.3} capture_wall_secs={:.3}",
+            st.convert_resample_secs, capture_secs
+        );
+    }
+
+    let rms = engine::rms_f32(&captured.samples);
+    eprintln!("SPIKE rms={rms:.6}");
+    if engine::is_silence_or_short(&captured.samples) {
+        if captured.samples.len() < engine::MIN_SAMPLES_16KHZ {
+            eprintln!("Aufnahme < 250 ms, Engine nicht aufgerufen.");
+        }
+        println!();
+        return 0;
+    }
+
+    let load_start = Instant::now();
+    let mut transcriber = match ParakeetTranscriber::load(
+        &loaded.config.engine.model,
+        loaded.config.engine.threads,
+    ) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    eprintln!(
+        "SPIKE model_load_secs={:.3}",
+        load_start.elapsed().as_secs_f64()
+    );
+    let infer_start = Instant::now();
+    let result = match transcribe_pcm(&mut transcriber, &captured.samples) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    eprintln!(
+        "SPIKE infer_secs={:.3}",
+        infer_start.elapsed().as_secs_f64()
+    );
+    println!("{}", result.text);
     0
 }
 
@@ -290,5 +565,20 @@ mod tests {
     #[test]
     fn runs_without_transcribe_wav_exits_2() {
         assert_eq!(cli_main(["diktier", "--runs", "5"]), 2);
+    }
+
+    #[test]
+    fn inject_test_without_foreground_exits_2() {
+        assert_eq!(cli_main(["diktier", "--inject-test", "hi"]), 2);
+    }
+
+    #[test]
+    fn hotkey_test_without_foreground_exits_2() {
+        assert_eq!(cli_main(["diktier", "--hotkey-test"]), 2);
+    }
+
+    #[test]
+    fn record_test_without_foreground_exits_2() {
+        assert_eq!(cli_main(["diktier", "--record-test", "3"]), 2);
     }
 }

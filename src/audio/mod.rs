@@ -1,9 +1,19 @@
-//! AudioSource-Vertrag (Spec §5.1 / §6.4). Phase 1: WAV-Lesen für den Spike.
+//! AudioSource-Vertrag (Spec §5.1 / §6.4). Capture: natives Gerät → 16 kHz mono f32.
+
 #![allow(dead_code)]
+
+mod capture;
+mod convert;
+mod resample;
+mod spsc;
 
 use std::path::Path;
 
 use thiserror::Error;
+
+pub use capture::CpalAudioSource;
+
+pub const ENGINE_RATE: u32 = 16_000;
 
 #[derive(Debug, Error)]
 pub enum AudioError {
@@ -40,18 +50,18 @@ impl AudioSource for StubAudioSource {
     fn stop(&mut self) -> Result<CapturedAudio, AudioError> {
         Ok(CapturedAudio {
             samples: Vec::new(),
-            sample_rate: 16_000,
+            sample_rate: ENGINE_RATE,
         })
     }
 }
 
-/// Nur 16 kHz mono PCM (i16 oder f32). Resample/Stereo ist Phase 2.
+/// Nur 16 kHz mono PCM (i16 oder f32). Resample/Stereo ist der Capture-Pfad.
 pub fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, AudioError> {
     let mut reader = hound::WavReader::open(path).map_err(|e| map_hound_open(path, e))?;
     let spec = reader.spec();
-    if spec.sample_rate != 16_000 {
+    if spec.sample_rate != ENGINE_RATE {
         return Err(AudioError::Format(format!(
-            "WAV ist {} Hz, erwartet 16000 Hz (Capture/Resample ist Phase 2)",
+            "WAV ist {} Hz, erwartet {ENGINE_RATE} Hz (Capture/Resample ist Phase 2)",
             spec.sample_rate
         )));
     }
@@ -72,7 +82,7 @@ pub fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>, AudioError> {
             let mut samples = Vec::with_capacity(reader.duration() as usize);
             for sample in reader.samples::<i16>() {
                 let v = sample.map_err(|e| map_hound_sample(path, e))?;
-                samples.push(f32::from(v) / 32768.0);
+                samples.push(convert::i16_to_f32(v));
             }
             Ok(samples)
         }
@@ -117,7 +127,9 @@ fn map_hound_sample(path: &Path, err: hound::Error) -> AudioError {
 
 #[cfg(test)]
 mod tests {
+    use super::capture::process_interleaved_f32;
     use super::*;
+    use std::f32::consts::PI;
     use std::path::PathBuf;
 
     fn write_i16(path: &std::path::Path, rate: u32, channels: u16, bits: u16, samples: &[i16]) {
@@ -134,13 +146,37 @@ mod tests {
         writer.finalize().unwrap();
     }
 
+    fn sine(rate: u32, secs: f32, freq: f32, amp: f32) -> Vec<f32> {
+        let n = (rate as f32 * secs).round() as usize;
+        (0..n)
+            .map(|i| amp * (2.0 * PI * freq * i as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    fn rms(x: &[f32]) -> f32 {
+        if x.is_empty() {
+            return 0.0;
+        }
+        (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+    }
+
+    fn assert_len_within_pct(got: usize, expected: usize, pct: f32) {
+        let exp = expected as f32;
+        let lo = (exp * (1.0 - pct)).floor() as usize;
+        let hi = (exp * (1.0 + pct)).ceil() as usize;
+        assert!(
+            got >= lo && got <= hi,
+            "len {got} not in {lo}..={hi} (expected {expected} ±{pct})"
+        );
+    }
+
     #[test]
     fn stub_capture_returns_empty_16khz() {
         let mut src = StubAudioSource;
         src.start().unwrap();
         let captured = src.stop().unwrap();
         assert!(captured.samples.is_empty());
-        assert_eq!(captured.sample_rate, 16_000);
+        assert_eq!(captured.sample_rate, ENGINE_RATE);
     }
 
     #[test]
@@ -252,5 +288,89 @@ mod tests {
             AudioError::Io(msg) => assert!(msg.contains("WAV I/O"), "{msg}"),
             other => panic!("expected Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resample_440hz_44100_mono() {
+        let input = sine(44_100, 1.0, 440.0, 0.5);
+        let out = process_interleaved_f32(&input, 1, 44_100, 60).unwrap();
+        assert_eq!(out.sample_rate, ENGINE_RATE);
+        let expected = resample::expected_len(input.len(), 44_100);
+        assert_len_within_pct(out.samples.len(), expected, 0.01);
+        let ratio = rms(&out.samples) / rms(&input);
+        assert!(
+            (0.7..=1.3).contains(&ratio),
+            "RMS-Verhältnis {ratio} (in {} out {})",
+            rms(&input),
+            rms(&out.samples)
+        );
+    }
+
+    #[test]
+    fn resample_440hz_48000_mono() {
+        let input = sine(48_000, 1.0, 440.0, 0.5);
+        let out = process_interleaved_f32(&input, 1, 48_000, 60).unwrap();
+        assert_eq!(out.sample_rate, ENGINE_RATE);
+        let expected = resample::expected_len(input.len(), 48_000);
+        assert_len_within_pct(out.samples.len(), expected, 0.01);
+        let ratio = rms(&out.samples) / rms(&input);
+        assert!((0.7..=1.3).contains(&ratio), "RMS-Verhältnis {ratio}");
+    }
+
+    #[test]
+    fn resample_440hz_48000_stereo_downmix() {
+        let mono = sine(48_000, 1.0, 440.0, 0.5);
+        let mut stereo_eq = Vec::with_capacity(mono.len() * 2);
+        for s in &mono {
+            stereo_eq.push(*s);
+            stereo_eq.push(*s);
+        }
+        let out_eq = process_interleaved_f32(&stereo_eq, 2, 48_000, 60).unwrap();
+        let out_mono = process_interleaved_f32(&mono, 1, 48_000, 60).unwrap();
+        assert_eq!(out_eq.sample_rate, ENGINE_RATE);
+        let expected = resample::expected_len(mono.len(), 48_000);
+        assert_len_within_pct(out_eq.samples.len(), expected, 0.01);
+        let n = out_eq.samples.len().min(out_mono.samples.len());
+        let mut max_diff = 0.0_f32;
+        for i in 0..n {
+            max_diff = max_diff.max((out_eq.samples[i] - out_mono.samples[i]).abs());
+        }
+        assert!(max_diff < 1e-5, "L=R vs mono max_diff {max_diff}");
+
+        let mut stereo_inv = Vec::with_capacity(mono.len() * 2);
+        for s in &mono {
+            stereo_inv.push(*s);
+            stereo_inv.push(-*s);
+        }
+        let out_inv = process_interleaved_f32(&stereo_inv, 2, 48_000, 60).unwrap();
+        assert!(
+            rms(&out_inv.samples) < 1e-4,
+            "L=-R RMS {}",
+            rms(&out_inv.samples)
+        );
+    }
+
+    #[test]
+    fn resample_flush_keeps_tail() {
+        let rate = 48_000;
+        let n = 1024 + 100;
+        let input: Vec<f32> = (0..n)
+            .map(|i| (2.0 * PI * 440.0 * i as f32 / rate as f32).sin() * 0.5)
+            .collect();
+        let out = process_interleaved_f32(&input, 1, rate, 60).unwrap();
+        let expected = resample::expected_len(n, rate);
+        assert_len_within_pct(out.samples.len(), expected, 0.01);
+        assert!(
+            out.samples.len() as f32 > expected as f32 * 0.95,
+            "Flush verlor den Rest: got {} expected ~{expected}",
+            out.samples.len()
+        );
+    }
+
+    #[test]
+    fn max_duration_truncates_first_cap_seconds() {
+        let input = sine(16_000, 3.0, 440.0, 0.2);
+        let out = process_interleaved_f32(&input, 1, 16_000, 1).unwrap();
+        assert_eq!(out.samples.len(), ENGINE_RATE as usize);
     }
 }
