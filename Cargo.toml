@@ -8,9 +8,20 @@ publish = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+hound = "3.5"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"
+
+# Phase 1: exakt pinnen. parakeet-rs 0.3.7 ist die aktuelle Release (crates.io)
+# und zieht ort 2.0.0-rc.13 (Wrapper für ONNX Runtime 1.28).
+# default-features aus: parakeet-rs' `ort-defaults` aktiviert `ort/default`,
+# das `download-binaries` enthält — verboten, ORT kommt als externe Library (§11).
+# load-dynamic + api-28: Runtime-Laden per ort::init_from, C-API 1.28.
+# ORT-Binary: ONNX Runtime CPU 1.28.0 (linux-x64), siehe scripts/fetch-ort.sh.
+parakeet-rs = { version = "=0.3.7", default-features = false, features = ["cpu", "api-28", "load-dynamic"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-28"] }
 
 [dev-dependencies]
 tempfile = "3"

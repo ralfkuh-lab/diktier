@@ -1,9 +1,12 @@
-//! Modell-Artefakte (Spec §6.3). Phase 0: Manifest laden, kein Netz.
+//! Modell-Artefakte (Spec §6.3). Phase 0/1: Manifest + Existenz/Größe, kein Netz.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MANIFEST_TOML: &str = include_str!("models.toml");
@@ -16,6 +19,22 @@ pub enum DownloadError {
     Path(String),
     #[error("Download ist noch nicht implementiert")]
     NotImplemented,
+    #[error("Modellartefakt fehlt: {0}")]
+    Missing(PathBuf),
+    #[error("Modellartefakt {path} hat {actual} Bytes, erwartet {expected}")]
+    SizeMismatch {
+        path: PathBuf,
+        actual: u64,
+        expected: u64,
+    },
+    #[error("Modellartefakt: {0}")]
+    Io(#[from] io::Error),
+    #[error("Modellartefakt {path}: SHA-256 {actual} stimmt nicht mit Manifest {expected}")]
+    HashMismatch {
+        path: PathBuf,
+        actual: String,
+        expected: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -40,7 +59,7 @@ pub fn load_manifest() -> Result<ArtifactManifest, DownloadError> {
 /// Linux: `~/.local/share/diktier/models/<key>/`.
 /// Windows: `%LOCALAPPDATA%\diktier\models\<key>\`.
 pub fn model_dir(key: &str) -> Result<PathBuf, DownloadError> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         let home = std::env::var_os("HOME").ok_or_else(|| {
             DownloadError::Path("Umgebungsvariable HOME ist nicht gesetzt".into())
@@ -62,13 +81,73 @@ pub fn model_dir(key: &str) -> Result<PathBuf, DownloadError> {
             .join("models")
             .join(key))
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
-        compile_error!("diktier unterstützt nur Unix und Windows");
+        compile_error!("diktier unterstützt nur Linux und Windows");
     }
 }
 
-/// Phase 0: kein Netz, kein Schreiben.
+/// Existenz und Dateigröße gegen das Manifest. SHA-256 nur im Download-Pfad
+/// und in `verify_artifacts_sha256` (stt-smoke / Phase 3).
+pub fn check_artifacts(dir: &Path, manifest: &ArtifactManifest) -> Result<(), DownloadError> {
+    for file in &manifest.files {
+        let path = dir.join(&file.name);
+        if !path.is_file() {
+            return Err(DownloadError::Missing(path));
+        }
+        let actual = std::fs::metadata(&path)?.len();
+        if actual != file.bytes {
+            return Err(DownloadError::SizeMismatch {
+                path,
+                actual,
+                expected: file.bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// SHA-256-Vollprüfung, streaming.
+///
+/// Pflicht im Download-Pfad (Spec §6.3, Phase 3). Der normale Start prüft nur
+/// Existenz+Größe (`check_artifacts`) — Kaltstart-Budget. stt-smoke ruft diese
+/// Routine einmal auf.
+pub fn verify_artifacts_sha256(
+    dir: &Path,
+    manifest: &ArtifactManifest,
+) -> Result<(), DownloadError> {
+    for file in &manifest.files {
+        let path = dir.join(&file.name);
+        if !path.is_file() {
+            return Err(DownloadError::Missing(path));
+        }
+        let actual = sha256_file(&path)?;
+        if !actual.eq_ignore_ascii_case(&file.sha256) {
+            return Err(DownloadError::HashMismatch {
+                path,
+                actual,
+                expected: file.sha256.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String, DownloadError> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Phase 0/1: kein Netz, kein Schreiben.
 pub fn download_model(_manifest: &ArtifactManifest) -> Result<(), DownloadError> {
     Err(DownloadError::NotImplemented)
 }
@@ -77,11 +156,14 @@ pub fn download_model(_manifest: &ArtifactManifest) -> Result<(), DownloadError>
 mod tests {
     use super::*;
     use crate::config::DEFAULT_MODEL;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn golden_set_matches_spec() {
         let manifest = load_manifest().unwrap();
         assert_eq!(manifest.key, DEFAULT_MODEL);
+        const REV: &str = "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce";
+        const BASE: &str = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve";
         let expected = [
             (
                 "encoder-model.int8.onnx",
@@ -109,12 +191,7 @@ mod tests {
             assert_eq!(file.name, name);
             assert_eq!(file.bytes, bytes);
             assert_eq!(file.sha256, sha);
-            assert!(
-                file.url.is_empty(),
-                "{}: URL erst im STT-Spike, got {:?}",
-                file.name,
-                file.url
-            );
+            assert_eq!(file.url, format!("{BASE}/{REV}/{name}"));
         }
     }
 
@@ -126,9 +203,60 @@ mod tests {
     }
 
     #[test]
+    fn check_artifacts_reports_missing_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = load_manifest().unwrap();
+        let err = check_artifacts(dir.path(), &manifest).unwrap_err();
+        assert!(matches!(err, DownloadError::Missing(_)));
+
+        let first = &manifest.files[0];
+        std::fs::write(dir.path().join(&first.name), vec![0_u8; 4]).unwrap();
+        let err = check_artifacts(dir.path(), &manifest).unwrap_err();
+        match err {
+            DownloadError::SizeMismatch {
+                actual, expected, ..
+            } => {
+                assert_eq!(actual, 4);
+                assert_eq!(expected, first.bytes);
+            }
+            other => panic!("expected SizeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_sha256_detects_wrong_content_same_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny.bin");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"aaaa"));
+        let good = ArtifactManifest {
+            key: "tiny".into(),
+            files: vec![Artifact {
+                name: "tiny.bin".into(),
+                bytes: 4,
+                sha256: expected.clone(),
+                url: String::new(),
+            }],
+        };
+        verify_artifacts_sha256(dir.path(), &good).unwrap();
+
+        std::fs::write(&path, b"bbbb").unwrap();
+        let err = verify_artifacts_sha256(dir.path(), &good).unwrap_err();
+        match err {
+            DownloadError::HashMismatch {
+                actual, expected, ..
+            } => {
+                assert_ne!(actual, expected);
+                assert_eq!(actual, format!("{:x}", Sha256::digest(b"bbbb")));
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn model_dir_matches_spec() {
         let dir = model_dir(DEFAULT_MODEL).unwrap();
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             assert!(dir.ends_with(format!(".local/share/diktier/models/{DEFAULT_MODEL}")));
         }

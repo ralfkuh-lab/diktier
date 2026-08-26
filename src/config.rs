@@ -302,7 +302,7 @@ impl Default for RawTray {
 
 /// Linux: `~/.config/diktier/config.toml`. Windows: `%APPDATA%\diktier\config.toml`.
 pub fn config_path() -> Result<PathBuf, ConfigError> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         let home = std::env::var_os("HOME")
             .ok_or_else(|| ConfigError::Path("Umgebungsvariable HOME ist nicht gesetzt".into()))?;
@@ -318,9 +318,9 @@ pub fn config_path() -> Result<PathBuf, ConfigError> {
         })?;
         Ok(PathBuf::from(appdata).join("diktier").join("config.toml"))
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
-        compile_error!("diktier unterstützt nur Unix und Windows");
+        compile_error!("diktier unterstützt nur Linux und Windows");
     }
 }
 
@@ -779,7 +779,7 @@ max_duration_secs = 15
     #[test]
     fn config_path_matches_spec() {
         let path = config_path().unwrap();
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         assert!(path.ends_with(".config/diktier/config.toml"));
         #[cfg(windows)]
         assert!(path.ends_with("diktier\\config.toml") || path.ends_with("diktier/config.toml"));

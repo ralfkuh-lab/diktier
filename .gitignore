@@ -9,3 +9,9 @@
 /models/
 *.onnx
 *.onnx.data
+
+# ORT-Library (scripts/fetch-ort.sh → lib/libonnxruntime.so, Spec §11)
+/lib/
+
+__pycache__/
+*.py[cod]

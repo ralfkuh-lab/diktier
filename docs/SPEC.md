@@ -587,8 +587,9 @@ Interpunktion `[.,!?;:\-–—"']` weg, Whitespace kollabieren. Referenztexte
 nutzen dieselbe Zahlenschreibweise wie Parakeet (Ziffern vs. Wort).
 
 - nach Normalisierung: Diktier-Text = Voxtype-Text, oder
-  `WER(Diktier, Referenz) ≤ WER(Voxtype, Referenz)` (kein +0,05-Puffer —
-  dieselben INT8-Artefakte)
+  `WER(Diktier, Referenz) ≤ WER(Voxtype, Referenz) + 0,05` (Puffer
+  wiederhergestellt, §18 #11: Artefakte byte-identisch, aber die
+  Mel-Frontends nicht — Voxtype Kaldi-Style, parakeet-rs NeMo-Style)
 - kein Diktier-Ergebnis darf einen nicht gesprochenen Satz enthalten
 - markierte Fachwörter mindestens so oft korrekt wie Voxtype
 - Stille, Raumrauschen, `< 250 ms` → leer
@@ -725,7 +726,7 @@ Kein Code-Import.
 | 16 | X11-Clipboard | Kein Sleep auf der X11-Connection (Agy H2). |
 | 17 | Audio-Callback | Nur Ringpuffer; `rubato` auf Worker (Agy H5). |
 | 18 | Log | Rotation `diktier.log` / `.1`, kein In-Place-Truncate (Agy M1). |
-| 19 | WER-Puffer | +0,05 gestrichen; gleiche Artefakte, gleicher oder besserer WER (Agy). |
+| 19 | WER-Puffer | +0,05 gestrichen (Agy) — **revidiert in §18 #11**: die Frontends sind nicht identisch. |
 
 ## 18. Entscheidungen zum Claude-Review
 
@@ -741,3 +742,4 @@ Kein Code-Import.
 | 8 | Stille | RMS-Gate in Diktier erlaubt, kein Engine-Fail (Claude N1). |
 | 9 | Phase-1-Artefakte | Omarchy-Kopie zulässig bis zur HF-URL (Claude N2). |
 | 10 | Linux-Build | Verbindlich Mint-22-Basis (Claude N3). |
+| 11 | WER-Puffer (Phase-1-Beleg) | +0,05 wiederhergestellt (Owner, 2026-08-26): byte-gleiche Artefakte, aber verschiedene Mel-Frontends (Voxtype Kaldi-fbank, parakeet-rs NeMo-Style); 4/5 Dateien wortidentisch, „Werstadt“-Fall in `docs/SPIKES.md`. |

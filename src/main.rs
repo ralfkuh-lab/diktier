@@ -8,14 +8,16 @@ mod state;
 mod tray;
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::Parser;
 
-use audio::{AudioSource, StubAudioSource};
+use audio::{AudioError, AudioSource, StubAudioSource};
 use config::ConfigError;
 use download::load_manifest;
-use engine::{StubTranscriber, Transcriber};
+use engine::{ParakeetTranscriber, StubTranscriber, Transcriber, transcribe_pcm};
 use hotkey::{HotkeyBackend, new_backend};
 use inject::{OutputSink, StubOutputSink};
 use state::Runtime;
@@ -41,6 +43,14 @@ struct Cli {
     /// Autostart-Eintrag entfernen.
     #[arg(long)]
     remove_autostart: bool,
+
+    /// WAV transkribieren (16 kHz mono PCM). Impliziert --foreground.
+    #[arg(long, value_name = "DATEI", conflicts_with_all = ["install_autostart", "remove_autostart"])]
+    transcribe_wav: Option<PathBuf>,
+
+    /// Gemessene Inferenzläufe nach einem ungezählten Warmup (nur mit --transcribe-wav).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    runs: u32,
 }
 
 fn main() -> ExitCode {
@@ -69,8 +79,84 @@ where
         eprintln!("diktier: --remove-autostart ist noch nicht implementiert");
         return 1;
     }
+    if cli.runs != 1 && cli.transcribe_wav.is_none() {
+        eprintln!("diktier: --runs gilt nur zusammen mit --transcribe-wav");
+        return 2;
+    }
+    if let Some(path) = cli.transcribe_wav {
+        return transcribe_wav(&path, cli.runs);
+    }
 
     run_daemon(cli.foreground)
+}
+
+fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
+    let loaded = match config::load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("{err}");
+            return match err {
+                ConfigError::Io(_) => 1,
+                _ => 2,
+            };
+        }
+    };
+    for warning in &loaded.warnings {
+        eprintln!("Warnung: {warning}");
+    }
+
+    let pcm = match audio::read_wav_16k_mono(path) {
+        Ok(pcm) => pcm,
+        Err(err) => {
+            eprintln!("{err}");
+            return match err {
+                AudioError::Format(_) => 2,
+                AudioError::Io(_) | AudioError::Failed(_) => 1,
+            };
+        }
+    };
+
+    if pcm.len() < engine::MIN_SAMPLES_16KHZ {
+        eprintln!("Aufnahme < 250 ms, Engine nicht aufgerufen.");
+        println!();
+        return 0;
+    }
+
+    let load_start = Instant::now();
+    let mut transcriber = match ParakeetTranscriber::load(
+        &loaded.config.engine.model,
+        loaded.config.engine.threads,
+    ) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    eprintln!(
+        "Modell geladen in {:.3} s",
+        load_start.elapsed().as_secs_f64()
+    );
+
+    if let Err(err) = transcribe_pcm(&mut transcriber, &pcm) {
+        eprintln!("{err}");
+        return 1;
+    }
+
+    let mut last = engine::Transcription::empty();
+    for _ in 0..runs {
+        let infer_start = Instant::now();
+        match transcribe_pcm(&mut transcriber, &pcm) {
+            Ok(result) => last = result,
+            Err(err) => {
+                eprintln!("{err}");
+                return 1;
+            }
+        }
+        eprintln!("Inferenz {:.3} s", infer_start.elapsed().as_secs_f64());
+    }
+    println!("{}", last.text);
+    0
 }
 
 fn run_daemon(foreground: bool) -> u8 {
@@ -159,5 +245,50 @@ mod tests {
             cli_main(["diktier", "--install-autostart", "--remove-autostart"]),
             2
         );
+    }
+
+    #[test]
+    fn transcribe_wav_without_path_exits_2() {
+        assert_eq!(cli_main(["diktier", "--transcribe-wav"]), 2);
+    }
+
+    #[test]
+    fn transcribe_wav_missing_file_exits_1() {
+        assert_eq!(
+            cli_main([
+                "diktier",
+                "--transcribe-wav",
+                "/no/such/diktier-missing.wav"
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn transcribe_wav_invalid_format_exits_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        writer.write_sample(0_i16).unwrap();
+        writer.finalize().unwrap();
+        assert_eq!(
+            cli_main([
+                "diktier",
+                "--transcribe-wav",
+                path.to_str().expect("utf-8 path"),
+            ]),
+            2
+        );
+    }
+
+    #[test]
+    fn runs_without_transcribe_wav_exits_2() {
+        assert_eq!(cli_main(["diktier", "--runs", "5"]), 2);
     }
 }

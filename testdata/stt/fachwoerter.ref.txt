@@ -1,0 +1,1 @@
+Der Rust-Daemon lädt das ONNX-Modell über die Runtime, danach schreibt der Worker-Thread das Transkript in die Zwischenablage.
