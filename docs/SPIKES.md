@@ -12,7 +12,8 @@ Vorlage. Nichts abhaken, das nicht auf der genannten Maschine gelaufen ist.
 | Windows 11 | x64 | | | |
 | Mint 22 | Cinnamon **X11** x86_64 | | | |
 
-Peak-RSS-Ziel: ≤ 2 GiB mit geladenem Default-Modell.
+Peak-RSS-Ziel: ≤ 2 GiB mit geladenem Default-Modell; zusätzlich mit
+einer 60-s-Datei messen (Spec §12 Phase 1).
 
 ## Artefakte
 

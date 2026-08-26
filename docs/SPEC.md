@@ -1,10 +1,11 @@
-# Diktier — Spec v1.2
+# Diktier — Spec v1.3
 
 Stand: 2026-08-26. Verbindlich für die Implementierung. Änderungen nur über
 diesen Text.
 
 v1.1: Codex-Review (`docs/reviews/spec-codex.md`). v1.2: Agy-Kreuz-Review
-(`docs/reviews/spec-agy.md`). Entscheidungen in §17.
+(`docs/reviews/spec-agy.md`). v1.3: Claude-Review
+(`docs/reviews/spec-claude.md`). Entscheidungen in §17 und §18.
 
 ## 1. Ziel
 
@@ -57,8 +58,10 @@ Kein CUDA. v1 ist CPU/INT8. Designpunkt für Tempo: Haswell-Klasse
 schnelles Gate. Beide Rechner in `docs/SPIKES.md` namentlich eintragen.
 Peak-RSS-Ziel: **≤ 2 GiB** mit geladenem Default-Modell.
 
-Release in der ältesten Zielumgebung bauen oder dort testen. Linux-glibc-
-Baseline: Mint 22 (Ubuntu 24.04, glibc 2.39). Windows: MSVC x64.
+Linux-Release-Builds entstehen verbindlich auf Mint-22-Basis (VM,
+Container oder CI; Ubuntu 24.04, glibc 2.39) — eine neuere Build-glibc
+lässt sich nicht „wegtesten“, das Binary fällt auf Mint schlicht um.
+Windows: MSVC x64.
 
 ## 4. UX
 
@@ -72,6 +75,9 @@ Baseline: Mint 22 (Ubuntu 24.04, glibc 2.39). Windows: MSVC x64.
 4. Fertig und Fenster unverändert: Text einfügen. Tray „idle“.
 5. Leer / nur Stille / Transkript nach Normalisierung leer: nichts
    einfügen, kein Fehlerdialog, Tray „idle“.
+
+„60-s-Cap“ meint in dieser Spec durchgehend `audio.max_duration_secs`
+(Default 60, §8).
 
 ### 4.2 Fokusregel (nicht verhandelbar)
 
@@ -115,6 +121,12 @@ die Quelle (`Hotkey` vs. `TrayClick`):
 - `recording(TrayClick)`: F9 Press/Release ignorieren (Log). Stop nur
   durch zweiten Klick oder 60-s-Cap.
 
+TrayClick-Diktate enden **immer** in `copy_only` — kein Paste-Key auf
+diesem Pfad. Beim Klick aufs Tray-Icon kann Panel/Taskbar den Vordergrund
+halten; eine Fokusprüfung gegen das eigentliche Ziel ist nicht
+verlässlich. Transkript ins Clipboard, Tooltip „Text liegt in der
+Zwischenablage“.
+
 Während `transcribing`/`downloading`/`loading`: beide Eingaben ignorieren
 (Log-Warnung).
 
@@ -123,6 +135,11 @@ Während `transcribing`/`downloading`/`loading`: beide Eingaben ignorieren
 `F9`, ohne Modifier, Push-to-Talk. Nur über Config änderbar in v1.
 Registrierungsfehler → Zustand `error` (Hotkey tot), Tray-Click bleibt
 aktiv. Tooltip nennt den Konflikt.
+
+Der PTT-Hotkey erreicht die fokussierte Anwendung **nie** (X11:
+`XGrabKey` schluckt implizit; Windows: der `WH_KEYBOARD_LL`-Hook gibt
+für den PTT-Key non-zero zurück). Sonst togglet jedes Diktat in VS Code
+einen Breakpoint.
 
 Auto-Repeat der Haltetaste wird entprellt: ein logisches Press, ein
 logisches Release.
@@ -180,7 +197,7 @@ Verträge, die v2 nicht umwerfen (ohne v2-Code):
 
 ```text
 Transcription { text, language?, timing? }
-CaptureContext { target_window_id, ended_at }
+CaptureContext { start_window_id, target_window_id, ended_at }
 OutputSink: paste | copy_only   // v2 ergänzt review
 ```
 
@@ -197,7 +214,8 @@ idle + Press                → recording(Hotkey)
 idle + ClickStart           → recording(TrayClick)
 recording(Hotkey) + Release|Cap     → transcribing
 recording(TrayClick) + ClickStop|Cap → transcribing
-transcribing + Text + Fokus gleich → inject → idle
+transcribing(Hotkey) + Text + Fokus gleich → inject → idle
+transcribing(TrayClick) + Text             → copy_only → idle
 transcribing + leer                → idle
 transcribing + Fokus ungleich      → copy_only → idle
 jeder Zustand + fatal              → error
@@ -212,6 +230,10 @@ Regeln:
 - Beenden während Inferenz: Prozess darf nach Inferenz-Timeout (5 s)
   hart enden; kein Inject mehr.
 - 60-s-Cap: genau einmal nach `transcribing`; folgendes Release ignorieren.
+- Watchdog in `transcribing`: kein Engine-Ergebnis nach
+  max(30 s, 5 × Audiolänge) → Lauf verwerfen, Engine neu initialisieren,
+  `error` (Tooltip „Transkription hängt“); Retry beim nächsten Press.
+  Ein verspätetes Ergebnis eines verworfenen Laufs wird nie injiziert.
 - `idle` heißt: Modell geladen, bereit. Das widerspricht nicht dem
   Audio-Callback-Verbot — Aufnahme gibt es erst ab `idle`.
 
@@ -281,7 +303,9 @@ Verzeichnis `~/.local/share/voxtype/models/parakeet-tdt-0.6b-v3-int8/`.
 
 `models.toml` im Repo hält dieselben Werte plus **immutable** Download-URLs
 (`resolve/<git-commit>/…` auf Hugging Face, sobald die Herkunfts-Revision
-im STT-Spike dokumentiert ist). Lizenz/Notice der Artefakte (NVIDIA
+im STT-Spike dokumentiert ist). Bis dahin läuft Phase 1 mit einer **Kopie
+des Omarchy-Golden-Sets** — die Hashes aus der Tabelle müssen stimmen.
+Lizenz/Notice der Artefakte (NVIDIA
 Parakeet, CC-BY-4.0) in README und `LICENSES/`.
 
 Installationsort:
@@ -335,13 +359,30 @@ Nur Unicode-Plaintext ist der v1-Vertrag.
 6. `restore_clipboard_delay_ms` ist eine **Mindestwartezeit**, keine
    Erfolgserkennung. **Kein** `sleep` auf dem Thread, der die X11-
    Connection hält: `SelectionRequest` muss während der Wartezeit
-   beantwortet werden (Timer in der State-Machine). Restore erst nach
-   mindestens einem bedienten Request oder nach Timeout ohne
-   Ownership-Verlust.
+   beantwortet werden (Timer in der State-Machine).
+7. Restore **nur nach mindestens einem bedienten Read** des Transkripts
+   — X11: `SelectionRequest`; Windows: Delayed Rendering
+   (`SetClipboardData(CF_UNICODETEXT, NULL)` → `WM_RENDERFORMAT`) — und
+   frühestens nach der Mindestwartezeit. Kommt innerhalb von 5 s **kein**
+   Read (UIPI, verschluckter Chord, falscher Shortcut — am
+   API-Rückgabewert oft nicht erkennbar), unterbleibt das Restore
+   endgültig: Transkript bleibt im Clipboard, Tooltip „Einfügen nicht
+   bestätigt — Text liegt in der Zwischenablage“. Clipboard-Manager und
+   Win+V-History erzeugen ggf. False-Positive-Reads; akzeptiert. Ein zu
+   Unrecht unterbliebenes Restore ist der akzeptierte Preis — ein
+   weggewischtes Transkript nicht.
+8. Nach dem Restore bedient Diktier die restaurierte X11-Selection bis
+   zum Ownership-Verlust weiter. Bei Prozessende verschwindet sie —
+   X11-Natur, ein Clipboard-Manager wird nicht vorausgesetzt.
 
 Vor dem Paste-Shortcut: störende Modifier (`Shift`, `Alt`, `Super`/`Win`)
-per Up-Event lösen, nach dem Paste den vorherigen Zustand wiederherstellen.
-Sonst wird `Ctrl+V` bei gehaltenem Shift zu `Ctrl+Shift+V`.
+per Up-Event lösen — sonst wird `Ctrl+V` bei gehaltenem Shift zu
+`Ctrl+Shift+V`. Wiederhergestellt (synthetisches Down) wird ein Modifier
+**nur**, wenn die Taste zum Restore-Zeitpunkt physisch noch gehalten ist
+(`GetAsyncKeyState` / `XQueryKeymap`); sonst unterbleibt das Restore. Ein
+hängender synthetischer Modifier wäre schlimmer als ein einmalig
+verlorener — Nicht-Restaurieren heilt sich mit dem nächsten physischen
+Tastendruck selbst.
 
 Paste-API-Fehler oder UIPI: Transkript **im Clipboard lassen**, Tray
 `error` „Text liegt in der Zwischenablage“. Kein stilles Verwerfen.
@@ -353,8 +394,9 @@ Config: `output.paste_shortcut = "auto" | "ctrl_v" | "ctrl_shift_v" | "shift_ins
 
 `auto`:
 
-- Windows: `Ctrl+Shift+V` bei Fensterklasse/Prozess von Windows Terminal,
-  `conhost`, `WindowsTerminal.exe`; sonst `Ctrl+V`.
+- Windows: `Ctrl+Shift+V` nur bei `WindowsTerminal.exe` (bindet beide
+  Chords auf Paste). `conhost` kennt `Ctrl+Shift+V` nicht → `Ctrl+V`
+  (Console-Setting bzw. PSReadLine). Sonst `Ctrl+V`.
 - Linux X11: `Ctrl+Shift+V` bei VTE/Freedesktop-Terminals (`gnome-terminal`,
   `xfce4-terminal`, Tilix, Alacritty, Kitty, Ghostty); `Shift+Insert` bei
   `xterm`/`uxterm` und generischen X11-Terminals; sonst `Ctrl+V` in
@@ -365,20 +407,28 @@ Pflichtterminal: Override in der Config, nicht Type-Modus.
 
 ### 7.3 Fokus bei Inject
 
-Beim **Aufnahmeende** (Release oder Cap) native Vordergrund-Kennung
-speichern (`CaptureContext.target_window_id`). Das ist das **Top-Level**-
-Fenster: Windows `HWND` via `GetForegroundWindow()`, X11 `Window` via
-`_NET_ACTIVE_WINDOW`. Fokuswechsel in Child-Controls oder Tabs desselben
-Top-Level-Fensters zählt **nicht** als Verlust (sonst scheitert VS Code).
+Beim **Aufnahmestart** (Press) und beim **Aufnahmeende** (Release oder
+Cap) die native Vordergrund-Kennung speichern
+(`CaptureContext.start_window_id` / `target_window_id`). Das ist das
+**Top-Level**-Fenster: Windows `HWND` via `GetForegroundWindow()`, X11
+`Window` via `_NET_ACTIVE_WINDOW`. Fokuswechsel in Child-Controls oder
+Tabs desselben Top-Level-Fensters zählt **nicht** als Verlust (sonst
+scheitert VS Code).
 
-Vor Inject: dieselbe Kennung muss noch Vordergrund sein. Sonst **kein**
-Paste-Key, Transkript bleibt im Clipboard, Tooltip „Fokus geändert — Text
-liegt im Clipboard“.
+Inject nur, wenn Start-Kennung, Ende-Kennung und Vordergrund vor Inject
+**übereinstimmen**. Sonst **kein** Paste-Key, Transkript bleibt im
+Clipboard, Tooltip „Fokus geändert — Text liegt im Clipboard“. Eine nicht
+ermittelbare Kennung (NULL, Secure Desktop, gesperrter Bildschirm) zählt
+als Fokusverlust — das verhindert auch den Paste in den Unlock-Dialog
+eines X11-Lockers nach dem 60-s-Cap bei gesperrtem Desktop.
 
 ### 7.4 Inhalt
 
 - Modelltext unverändert (Satzzeichen, soweit Parakeet sie setzt).
 - `output.leading_space` Default `true` (Diktat in laufenden Satz).
+  Bekannter Artefakt: in leeren Feldern ein führendes Leerzeichen; in
+  Shells mit `HISTCONTROL=ignorespace` fällt der Befehl aus der History.
+  Wen das stört: `leading_space = false`.
 - Keine Spoken-Punctuation, keine Replacements in v1.
 
 ### 7.5 Optional `output.mode = "type"`
@@ -473,7 +523,10 @@ Log: stderr (im `--foreground`) plus
 - Linux: `~/.local/state/diktier/diktier.log`
 - Windows: `%LOCALAPPDATA%\diktier\diktier.log`
 
-Ein Writer besitzt die Datei. Rotation, nicht In-Place-Truncate: erreicht
+Ein Writer besitzt die Datei. CLI-Modi (`--help`, `--version`,
+`--install-autostart`, `--remove-autostart`) loggen nur nach stderr, nie
+in `diktier.log` — der Daemon kann parallel laufen (Ein-Writer-Regel).
+Rotation, nicht In-Place-Truncate: erreicht
 `diktier.log` 2 MiB, atomar nach `diktier.log.1` (eine Backup-Datei),
 neue `diktier.log`. Keine Transkripte, keine Clipboard-Inhalte, keine
 Fenstertitel.
@@ -542,6 +595,11 @@ nutzen dieselbe Zahlenschreibweise wie Parakeet (Ziffern vs. Wort).
 - Zeit: Median aus fünf **warmen** Läufen, Modellladen separat;
   10 s Audio **≤ 5 s** auf dem benannten Büro-Laptop, **≤ 20 s** auf der
   Haswell-Maschine
+- Peak-RSS zusätzlich mit einer 60-s-Datei messen (Ziel ≤ 2 GiB, §3)
+- Halluziniert die Engine auf Stille/Rauschen, darf Diktier einen
+  dokumentierten RMS-Silence-Gate vorschalten (Schwelle in
+  `docs/SPIKES.md`); das gilt **nicht** als Scheitern von `parakeet-rs`,
+  solange die Sprach-Gates bestehen
 
 `docs/SPIKES.md` hält CPU, RAM, OS, Crate-/ORT-Version, Threads,
 Artefakt-SHA256, Rohtexte, normalisierte Texte, Zeiten.
@@ -567,6 +625,10 @@ Pro Fall in `docs/SPIKES.md`:
 - absichtlicher API-Fehler → Transkript bleibt im Clipboard
 - Fokuswechsel während Transkription → kein Paste, Text im Clipboard
 - fremder Copy während Restore-Fenster → fremder Inhalt bleibt
+- Paste ohne Clipboard-Read (Ziel liest nicht, z. B. erhöhtes Notepad)
+  → kein Restore, Transkript bleibt im Clipboard
+- PTT-Key erreicht die App nicht: F9 halten in VS Code → kein
+  Breakpoint-Toggle, kein Zeichen
 - kein `^V`
 - 44,1- und 48-kHz-Capture bzw. Fixture, Stereo-Downmix
 - PTT Press/Release, 60-s-Cap, Auto-Repeat, Registrierungsfehler
@@ -601,7 +663,9 @@ Automatisch, mit Fake-Backends:
   Hashfehler, Injectfehler, Fokusverlust.
 - Download: lokaler Fake-Transport — Abbruch, falsche Größe, falscher
   Hash, atomarer Abschluss, Parallelstart.
-- Clipboard-Fake: Generationen/Ownership, Fremdänderung, Nicht-Text.
+- Clipboard-Fake: Generationen/Ownership, Reads, Fremdänderung,
+  Nicht-Text; kein Read → kein Restore.
+- State zusätzlich: Transcribing-Watchdog, TrayClick → `copy_only`.
 - Engine: Stille → leer, soweit ohne ORT mockbar.
 
 `stt-smoke` mit echtem Modell: `#[ignore]` im normalen `cargo test`,
@@ -662,3 +726,18 @@ Kein Code-Import.
 | 17 | Audio-Callback | Nur Ringpuffer; `rubato` auf Worker (Agy H5). |
 | 18 | Log | Rotation `diktier.log` / `.1`, kein In-Place-Truncate (Agy M1). |
 | 19 | WER-Puffer | +0,05 gestrichen; gleiche Artefakte, gleicher oder besserer WER (Agy). |
+
+## 18. Entscheidungen zum Claude-Review
+
+| # | Frage | Entscheidung |
+|---|---|---|
+| 1 | Restore-Regel | Kein Restore ohne bedienten Read; Windows Delayed Rendering; 5-s-Fenster (Claude H1). |
+| 2 | PTT-Key | Erreicht die fokussierte App nie; LL-Hook schluckt (Claude H2). |
+| 3 | Modifier-Restore | Nur bei physisch gehaltener Taste (Claude M1). |
+| 4 | Fokus | Start- = Ende-Kennung = Vordergrund; nicht ermittelbar = Verlust (Claude M2). |
+| 5 | Watchdog | max(30 s, 5× Audiolänge) → error; RSS-Gate auch 60 s (Claude M3). |
+| 6 | conhost | `Ctrl+V`, nicht `Ctrl+Shift+V` (Claude M4). |
+| 7 | TrayClick | Immer `copy_only`, kein Paste-Key (Claude M5). |
+| 8 | Stille | RMS-Gate in Diktier erlaubt, kein Engine-Fail (Claude N1). |
+| 9 | Phase-1-Artefakte | Omarchy-Kopie zulässig bis zur HF-URL (Claude N2). |
+| 10 | Linux-Build | Verbindlich Mint-22-Basis (Claude N3). |
