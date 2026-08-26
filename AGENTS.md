@@ -1,7 +1,9 @@
 # Diktier — Agent-Hinweise
 
 Lokales Push-to-Talk-Diktiertool in Rust. Die verbindliche Quelle ist
-[docs/SPEC.md](docs/SPEC.md). Abweichungen von der Spec nur nach Rückfrage.
+[docs/SPEC.md](docs/SPEC.md) (aktuell v1.2). Abweichungen nur nach Rückfrage.
+Reviews: [docs/reviews/spec-codex.md](docs/reviews/spec-codex.md),
+[docs/reviews/spec-agy.md](docs/reviews/spec-agy.md).
 
 ## Nicht tun
 

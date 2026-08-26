@@ -1,280 +1,416 @@
-# Diktier — Spec v1
+# Diktier — Spec v1.2
 
 Stand: 2026-08-26. Verbindlich für die Implementierung. Änderungen nur über
 diesen Text.
 
+v1.1: Codex-Review (`docs/reviews/spec-codex.md`). v1.2: Agy-Kreuz-Review
+(`docs/reviews/spec-agy.md`). Entscheidungen in §17.
+
 ## 1. Ziel
 
-Ein lokales Push-to-Talk-Diktiertool für **Windows 10+** und **Linux Mint
-(Cinnamon)**. Der Nutzer hält eine Taste, spricht, lässt los. Nach der
-Transkription steht der Text im gerade fokussierten Eingabefeld.
+Ein lokales Push-to-Talk-Diktiertool für **Windows 10 22H2+ x64** und
+**Linux Mint 22.x, Cinnamon, X11, x86_64**. Der Nutzer hält eine Taste,
+spricht, lässt los. Nach der Transkription steht der Text im gerade
+fokussierten Eingabefeld — aber nur, wenn dasselbe Fenster noch vorn ist
+(§7.3).
 
-Qualitätziel: dieselbe Erkennungsliga wie Voxtype auf Omarchy
-(`parakeet-tdt-0.6b-v3-int8`). Diktier ersetzt WhisperDictate auf den
-Nicht-Omarchy-Rechnern. WhisperDictate bleibt unangetastet.
+Qualitätziel: dieselbe Erkennung wie Voxtype auf Omarchy mit den
+byte-identischen Artefakten `parakeet-tdt-0.6b-v3-int8` (§6.3, Gate §12).
+Diktier ersetzt WhisperDictate auf den Nicht-Omarchy-Rechnern.
+WhisperDictate bleibt unangetastet.
 
-v1 ist bewusst schmal: Daemon, PTT, Parakeet, Einfügen am Cursor, Tray,
-Config, Autostart. Kein Preview-Dialog.
+v1 ist bewusst schmal: Daemon, PTT, ein Parakeet-Modell, Einfügen am
+Cursor, Tray, Config, Autostart. Kein Preview-Dialog.
 
 ## 2. Nicht-Ziele (v1)
 
-- Preview-/Korrektur-Dialog (kommt ggf. als v2, zweiter Hotkey)
+- Preview-/Korrektur-Dialog (v2, zweiter Hotkey)
 - Whisper / faster-whisper
 - Streaming (Nemotron)
-- HTTP-API / Anbindung Local-AI Cockpit
-- macOS, Omarchy/Hyprland als Zielplattform
+- HTTP-API / Local-AI Cockpit
+- macOS
+- Omarchy/Hyprland als Zielplattform (dort bleibt Voxtype)
+- Cinnamon **Wayland** (Programm startet mit verständlichem Fehler, ohne
+  Hotkey; Tray darf Quit anbieten)
 - Meeting-Transkription, Diarization
-- OSD/Waveform-Overlay (Tray-Zustand reicht)
+- OSD/Waveform-Overlay
 - Cloud, Telemetrie
-- Whisper-`initial_prompt`
-- Tastensimulation als Default-Ausgabe (siehe §7)
+- Whisper-`initial_prompt`, Wortersetzungen
+- Tastensimulation als Default-Ausgabe
+- Inject in **erhöhte** Windows-Prozesse (UAC/UIPI)
+- Verlustfreies Clipboard-Restore für Nicht-Text (Bilder, HTML, Dateien)
+- Weitere Parakeet-Varianten (unquantisiert, English-only) — erst nach
+  eigenem Gate
 
 ## 3. Nutzer und Plattformen
 
-| Plattform | Session | Audio | Hotkey v1 | Ausgabe v1 |
+| Plattform | Session | Audio | Hotkey | Ausgabe |
 |---|---|---|---|---|
-| Windows 10/11 x64 | Desktop | WASAPI via cpal | nativer Low-Level-Hook | Clipboard + Paste, Restore |
-| Linux Mint, Cinnamon, X11 | typischer Alltag | PipeWire/Pulse via cpal | `global-hotkey` / X11 | Clipboard + Paste, Restore |
-| Linux Mint, Cinnamon, Wayland | Best-effort | wie X11 | evdev, falls X11-Grab versagt | `wtype`/`dotool`/`ydotool`, sonst Clipboard |
+| Windows 10 22H2 x64, Windows 11 x64 | Desktop, nicht erhöht | WASAPI via cpal | `WH_KEYBOARD_LL` auf **eigenem** Message-Pump-Thread (§5) | Clipboard + Paste |
+| Linux Mint 22.x Cinnamon **X11** x86_64 | typischer Alltag | Pulse/PipeWire via gepinnte cpal-Features | zuerst `global-hotkey`; Fallback `x11rb` + `XGrabKey` | Clipboard + Paste |
 
-Kein Admin/root für den Normalbetrieb. Auf Linux darf evdev die Gruppe
-`input` brauchen — das ist der einzige erwartbare Extra-Schritt, und nur
-falls der X11-Hotkey nicht greift.
+Kein Admin/root für den Normalbetrieb. Kein evdev, keine Gruppe `input`
+in v1 (das wäre der Wayland/uinput-Pfad).
 
-Kein CUDA-Zwang. v1 läuft auf CPU (INT8). Die GT 750M / Kepler-Klasse und
-typische Büro-PCs ohne nutzbare GPU sind der Designpunkt.
+Kein CUDA. v1 ist CPU/INT8. Designpunkt für Tempo: Haswell-Klasse
+(i7-4500U, AVX2) als langsames Gate; ein aktueller 4+-Kern-Laptop als
+schnelles Gate. Beide Rechner in `docs/SPIKES.md` namentlich eintragen.
+Peak-RSS-Ziel: **≤ 2 GiB** mit geladenem Default-Modell.
+
+Release in der ältesten Zielumgebung bauen oder dort testen. Linux-glibc-
+Baseline: Mint 22 (Ubuntu 24.04, glibc 2.39). Windows: MSVC x64.
 
 ## 4. UX
 
 ### 4.1 Push-to-Talk
 
-1. Hotkey **drücken und halten** → Aufnahme startet. Tray wechselt auf
-   „recording“. Kein Fenster, kein Fokuswechsel.
+1. Hotkey **drücken und halten** (nur aus `idle`) → Aufnahme startet.
+   Tray „recording“. Kein Fenster, kein Fokuswechsel.
 2. Sprechen.
-3. Hotkey **loslassen** → Aufnahme stoppt, Transkription läuft. Tray
-   „transcribing“.
-4. Fertig: Text wird in das **weiterhin fokussierte** Fenster eingefügt.
-   Tray zurück auf „idle“.
-
-Leere Aufnahme, nur Stille oder Transkript, das nach Normalisierung leer
-ist: nichts einfügen, kein Fehlerdialog. Tray kurz „idle“.
-
-Maximale Aufnahmedauer: 60 s, danach hart stoppen und transkribieren wie
-beim Loslassen. Optionaler Hinweis im Tray-Tooltip.
+3. Hotkey **loslassen** oder 60-s-Cap → Aufnahme stoppt, Transkription
+   läuft. Tray „transcribing“.
+4. Fertig und Fenster unverändert: Text einfügen. Tray „idle“.
+5. Leer / nur Stille / Transkript nach Normalisierung leer: nichts
+   einfügen, kein Fehlerdialog, Tray „idle“.
 
 ### 4.2 Fokusregel (nicht verhandelbar)
 
-Der PTT-Pfad darf **kein** Fenster öffnen, das den Fokus nimmt. Kein
-Tk/GTK-Dialog, keine unsichtbare Top-Level-Window, die den Input stehlt.
-Feedback nur über Tray-Icon, Tray-Tooltip und optional eine
-Desktop-Notification bei Fehlern (Modell fehlt, Mic tot, Paste
-fehlgeschlagen).
+Der PTT-Pfad darf **kein** Fenster öffnen, das den Fokus nimmt. Feedback
+nur über Tray-Icon, Tooltip und optionale Desktop-Notification bei
+Fehlern.
+
+Diktier aktiviert niemals selbst ein Fenster. Zweiter-Instanz-Start
+ebenfalls nicht.
 
 ### 4.3 Tray
 
-Crate: `betrayer` (Windows nativ, Linux StatusNotifierItem). Nicht
-`tray-icon`, weil das auf Linux GTK3+AppIndicator nachzieht.
-
-Zustände am Icon (Farbe oder Badge, ein Satz Icons reicht):
+Crate: `betrayer`, Version in `Cargo.lock` pinnen. Fallback hinter
+`TrayBackend`: Windows `Shell_NotifyIconW`, Linux `ksni`. `tray-icon`
+nur, wenn SNI unter Cinnamon nachweislich scheitert und GTK-Abhängigkeit
+bewusst akzeptiert wird.
 
 | Zustand | Bedeutung |
 |---|---|
-| idle | geladen, bereit |
-| recording | PTT gehalten |
-| transcribing | Modell arbeitet |
-| error | Mic/Modell/Inject kaputt; Tooltip erklärt |
+| starting | Prozess hoch, noch nicht bereit |
+| downloading | Modellartefakte fehlen, Download läuft |
+| loading | ORT + Modell werden geladen |
+| idle | geladen, Hotkey scharf (außer Pause) |
+| recording | PTT gehalten oder Tray-Toggle-Aufnahme |
+| transcribing | Inferenz |
+| error | fatal oder bedienbar, siehe §10 |
+| paused | Hotkey aus; Tray-Click bleibt aktiv |
 
 Menü (Rechtsklick):
 
-- Statuszeile (nicht klickbar): Zustand + Modellname
+- Statuszeile (nicht klickbar): Zustand + Modellschlüssel
 - Hotkey pausieren / wieder aktivieren
 - Config-Ordner öffnen
 - Beenden
 
-Linksklick: Toggle-Aufnahme (Start/Stop), als Fallback wenn der Hotkey
-nicht greift. Das ist **kein** PTT — einmal klicken startet, nochmal
-stoppt und transkribiert. Während PTT gehalten wird, ignoriert der
-Linksklick.
+Linksklick: Toggle-Aufnahme, Fallback wenn der Hotkey nicht greift.
+Ein Klick startet, nochmal stoppt und transkribiert. `recording` merkt
+die Quelle (`Hotkey` vs. `TrayClick`):
+
+- `recording(Hotkey)`: Linksklick ignorieren.
+- `recording(TrayClick)`: F9 Press/Release ignorieren (Log). Stop nur
+  durch zweiten Klick oder 60-s-Cap.
+
+Während `transcribing`/`downloading`/`loading`: beide Eingaben ignorieren
+(Log-Warnung).
 
 ### 4.4 Default-Hotkey
 
-`F9`, ohne Modifier, Push-to-Talk. Konfigurierbar. Begründung: auf
-Omarchy bereits als PTT belegt, auf Mint/Windows selten vergeben.
+`F9`, ohne Modifier, Push-to-Talk. Nur über Config änderbar in v1.
+Registrierungsfehler → Zustand `error` (Hotkey tot), Tray-Click bleibt
+aktiv. Tooltip nennt den Konflikt.
 
-Konflikt: wenn F9 in einer App belegt ist, gewinnt die App nicht — der
-globale Hook schon. Deshalb muss der Hotkey wechselbar sein, bevor jemand
-täglich damit arbeitet. Wechsel nur über Config-Datei in v1 (kein
-Settings-GUI).
+Auto-Repeat der Haltetaste wird entprellt: ein logisches Press, ein
+logisches Release.
+
+Verlorenes Release (z. B. Desktop gesperrt): nach dem 60-s-Cap genau
+einmal transkribieren; ein späteres Release ignorieren.
 
 ## 5. Architektur
 
-Ein Prozess, ein Binary `diktier`. Kein Python, kein Sidecar-Server.
+Ein Anwendungsprozess, ausführbare Datei `diktier` **plus** gebündelte
+ONNX-Runtime-Library (§11) **plus** heruntergeladenes Modell. Kein
+Python, kein Sidecar.
 
 ```
-diktier (Daemon)
-  ├── tray        betrayer, UI-Thread / Event-Loop
-  ├── hotkey      Plattform-Hook, PTT press/release
-  ├── audio       cpal, 16 kHz mono f32, resample falls nötig
-  ├── engine      parakeet-rs, Modell resident
-  ├── inject      Plattform: Clipboard+Paste (Default)
-  └── config      TOML, einmal laden, bei Pause/Resume nicht heiß neu
+diktier
+  ├── tray        betrayer, UI-/Event-Thread
+  ├── hotkey      HotkeyBackend: press/release
+  ├── audio       AudioSource: native Rate → f32 → 16 kHz
+  ├── engine      Trait Transcriber (parakeet-rs)
+  ├── inject      OutputSink: paste | copy_only
+  └── config      TOML, kein Hot-Reload in v1
 ```
 
-Modell bleibt im RAM (`on_demand_loading = false`). INT8 v3 ist ~640 MB
-auf Disk, Inferenz auf CPU. Kaltstart darf einige Sekunden brauchen;
-danach muss PTT ohne Ladeverzögerung aufnehmen (Aufnahme startet sofort,
-auch wenn das Modell noch lädt — Transkription wartet).
+Modell resident (`on_demand_loading = false`). Kaltstart darf Sekunden
+brauchen. **Audio-Callback darf niemals auf Modellladen oder Inferenz
+warten.** Aufnahme aus `idle` startet sofort. Aus `loading`/`downloading`
+startet keine Aufnahme (Press ignorieren, Log).
 
-Single-Instance: zweiter Start bringt den laufenden Prozess in den
-Vordergrund (Tray-Balloon / Log) und beendet sich. Lock-Datei unter
-`$XDG_RUNTIME_DIR/diktier.lock` bzw. `%LOCALAPPDATA%\diktier\diktier.lock`.
+Worker-Thread für Inferenz, cpal-Callback, Tray-Eventloop. Inferenz darf
+den Tray-Thread nicht blockieren. Keine Pflicht-Runtime; `tokio` ist
+erlaubt.
 
-### 5.1 Module (vorgeschlagen)
+Windows-Hotkey: eigener Thread mit minimaler `GetMessageW`-Loop, der
+**nur** den `WH_KEYBOARD_LL`-Hook hält, Down/Up entprellt und Events über
+einen Channel an die State-Machine schickt. Nicht auf dem `betrayer`-
+Thread — sonst hängt Windows den Hook bei offenem Tray-Menü aus
+(`LowLevelHooksTimeout`).
+
+### 5.1 Module
 
 ```
 src/main.rs
 src/config.rs
-src/state.rs          idle | recording | transcribing | error
+src/state.rs
 src/audio.rs
-src/engine.rs         Trait Transcriber, parakeet-rs dahinter
+src/engine.rs         Transcriber
 src/hotkey.rs         cfg(windows) / cfg(unix)
-src/inject.rs         cfg(windows) / cfg(unix)
+src/inject.rs         OutputSink
 src/tray.rs
-src/download.rs       Modell-Dateien beim ersten Start
+src/download.rs
+src/models.toml       Artefakt-Manifest, im Repo
 ```
 
-`engine` kennt keine GUI. `inject` kennt kein Audio. Tray und Hotkey
-senden Kommandos in eine zentrale State-Machine (ein Thread oder
-async-Runtime, eine Queue).
+Verträge, die v2 nicht umwerfen (ohne v2-Code):
 
-Runtime: `tokio` ist ok, muss aber nicht sein. Ein Worker-Thread für
-Inferenz plus cpal-Callback plus Tray-Eventloop reichen. Keine
-Anforderung an eine bestimmte Runtime, solange der Inferenz-Thread den
-Tray-Thread nicht blockiert.
+```text
+Transcription { text, language?, timing? }
+CaptureContext { target_window_id, ended_at }
+OutputSink: paste | copy_only   // v2 ergänzt review
+```
+
+v1 verdrahtet nur `paste` und bei Fokusverlust `copy_only`. Engine kennt
+kein Inject, Inject kein Audio.
+
+### 5.2 State-Machine
+
+Orthogonales Flag `paused` (Hotkey aus). Sonst:
+
+```
+starting → downloading? → loading → idle
+idle + Press                → recording(Hotkey)
+idle + ClickStart           → recording(TrayClick)
+recording(Hotkey) + Release|Cap     → transcribing
+recording(TrayClick) + ClickStop|Cap → transcribing
+transcribing + Text + Fokus gleich → inject → idle
+transcribing + leer                → idle
+transcribing + Fokus ungleich      → copy_only → idle
+jeder Zustand + fatal              → error
+error + Retry/Neustart             → starting
+```
+
+Regeln:
+
+- Press außerhalb `idle` (und nicht `paused`): ignorieren, Log.
+- Pause während `recording`: Aufnahme verwerfen, **keine** Transkription,
+  zurück nach `idle` mit `paused=true`.
+- Beenden während Inferenz: Prozess darf nach Inferenz-Timeout (5 s)
+  hart enden; kein Inject mehr.
+- 60-s-Cap: genau einmal nach `transcribing`; folgendes Release ignorieren.
+- `idle` heißt: Modell geladen, bereit. Das widerspricht nicht dem
+  Audio-Callback-Verbot — Aufnahme gibt es erst ab `idle`.
+
+### 5.3 Single-Instance
+
+Kein PID-File.
+
+- Windows: per-user Named Mutex.
+- Linux: gehaltener advisory `flock` unter `$XDG_RUNTIME_DIR/diktier.lock`,
+  Fallback `$XDG_STATE_HOME/diktier/diktier.lock`. Liegengebliebene Datei
+  ist egal, allein der Lock zählt.
+
+Zweiter **Daemon**-Start: optionale lokale Notify-Nachricht an den ersten
+Prozess (Tray-Tooltip „läuft bereits“), **kein** Fensterfokus, Exitcode 0,
+kurze stderr-Meldung. Kein fremder Prozess wird beendet.
+
+`--help`, `--version`, `--install-autostart`, `--remove-autostart` laufen
+**vor** der Sperre und fordern weder Mutex noch `flock`. Nur
+`diktier` / `diktier --foreground` (Daemon) nimmt die Sperre.
 
 ## 6. Engine und Modelle
 
 ### 6.1 Runtime
 
-Erste Wahl: [`parakeet-rs`](https://github.com/altunenes/parakeet-rs) über
-ONNX Runtime (CPU).
+Erste Wahl: `parakeet-rs` + ONNX Runtime CPU, Feature `load-dynamic`.
+Vor jeder ORT-Nutzung: `ort::init_from(<absolute path relativ zu current_exe()>)`.
+`parakeet-rs`, `ort`/`ort-sys` und das ORT-Binary in Phase 1 **exakt**
+pinnen (`Cargo.lock` + Manifest).
 
-Grund: dieselben Dateien wie Voxtype auf Omarchy:
+Den TDT-Decode-Loop nicht selbst schreiben.
 
-```
-encoder-model.int8.onnx
-decoder_joint-model.int8.onnx
-vocab.txt
-```
+`parakeet-rs` gilt als gescheitert, wenn auf einer Pflichtplattform
+Laden, Qualitätsfälle, Stille oder Zeitlimit fehlschlagen. Dann darf
+**eine** gepinnte `transcribe-rs`-Version durch **dasselbe** Gate — aber
+erst nachdem `nemo128.onnx` (URL, Bytes, SHA-256) in `models.toml`
+nachgetragen ist. Das Golden Set in §6.3 bleibt Voxtype-identisch und
+enthält diese Datei bewusst **nicht**. Nur wenn auch `transcribe-rs`
+scheitert: `sherpa-onnx` mit eigenem Artefaktsatz und identischem
+Qualitätsgate. Phase 1 startet nur mit `parakeet-rs`.
 
-Damit ist der Qualitätsvergleich mit Omarchy ehrlich. Den TDT-Decode-Loop
-nicht selbst schreiben.
+### 6.2 Freigegebenes Modell (v1)
 
-Fallback, falls der STT-Spike mit `parakeet-rs` scheitert (leere
-Ergebnisse, Windows-ORT-Link, falsches Feature-Frontend):
+Nur ein Schlüssel:
 
-1. `transcribe-rs` (ebenfalls Joint-Decoder-ONNX, extra `nemo128.onnx`)
-2. `sherpa-onnx` Rust-API — **letzter** Ausweg, weil das Modell *anders*
-   exportiert ist (`encoder` / `decoder` / `joiner` + `tokens.txt`).
-   Spike muss dann Voxtype-Qualität neu belegen, nicht Datei-Identität.
+| Schlüssel | Rolle |
+|---|---|
+| `parakeet-tdt-0.6b-v3-int8` | Default und einziges v1-Modell, 25 Sprachen, Auto-Detect |
 
-### 6.2 Konfigurierbare Modelle
+Unbekannter Schlüssel: fataler Configfehler, Tray `error`, kein
+Default-Fallback, kein Hotkey.
 
-| Schlüssel | Dateien | Rolle |
-|---|---|---|
-| `parakeet-tdt-0.6b-v3-int8` | Joint-INT8, ~640 MB | **Default**, 25 Sprachen inkl. Deutsch |
-| `parakeet-tdt-0.6b-v3` | unquantisiert | Qualität gegen RAM/Tempo |
-| `parakeet-unified-en-0.6b` | English-only | falls jemand nur Englisch will |
+`language` gibt es in v1 **nicht** in der Config. TDT läuft immer auf
+Auto-Detect. (Eine spätere `language = "de"`-Option braucht nachgewiesen
+wirksames API.)
 
-Unbekannter Schlüssel: nicht starten, Tray `error`, Log mit den gültigen
-Namen.
+### 6.3 Artefakte — Golden Set
 
-Sprache: Default `auto`. Optional `language = "de"` in der Config, wenn
-die Runtime das durchreicht. Nicht erzwingen — v3 erkennt Deutsch.
+Byte-identisch zu Voxtype auf dem Omarchy-Rechner, Stand 2026-08-26,
+Verzeichnis `~/.local/share/voxtype/models/parakeet-tdt-0.6b-v3-int8/`.
 
-Kein Whisper in v1, auch nicht als Fallback.
+| Datei | Bytes | SHA-256 |
+|---|---:|---|
+| `encoder-model.int8.onnx` | 652183999 | `6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09` |
+| `decoder_joint-model.int8.onnx` | 18202004 | `eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70` |
+| `vocab.txt` | 93939 | `d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d` |
+| `config.json` | 97 | `666903c76b9798caf2c210afd4f6cd60b08a8dbf9800ec8d7a3bc0d2148ac466` |
 
-### 6.3 Download
+`models.toml` im Repo hält dieselben Werte plus **immutable** Download-URLs
+(`resolve/<git-commit>/…` auf Hugging Face, sobald die Herkunfts-Revision
+im STT-Spike dokumentiert ist). Lizenz/Notice der Artefakte (NVIDIA
+Parakeet, CC-BY-4.0) in README und `LICENSES/`.
 
-Beim ersten Start, wenn das gewählte Modell fehlt: Download nach
+Installationsort:
 
-- Linux: `~/.local/share/diktier/models/<schlüssel>/`
-- Windows: `%LOCALAPPDATA%\diktier\models\<schlüssel>\`
+- Linux: `~/.local/share/diktier/models/parakeet-tdt-0.6b-v3-int8/`
+- Windows: `%LOCALAPPDATA%\diktier\models\parakeet-tdt-0.6b-v3-int8\`
 
-Quelle: dieselben Hugging-Face-/Voxtype-Artefakte, die Omarchy nutzt.
-Checksum (SHA256) in der Binary oder einer `models.toml` im Repo
-festhalten. Fehlschlag → Tray `error`, Retry beim nächsten Start.
+Download je Datei nach `<name>.part`, Größe + SHA-256 prüfen, dann atomar
+umbenennen. Zuletzt Marker `COMPLETE` schreiben. Per-user Download-Lock
+gegen parallele Starts. Hashfehler: nur `.part` löschen, Tray `error`,
+Retry erst nach explizitem Neustart/Retry. Tooltip währenddessen
+„Lade Modell …“.
 
-Kein stiller Download ohne sichtbares Signal: Tooltip „Lade Modell …“.
+### 6.4 Audio
 
-### 6.4 Audioformat fürs Modell
+`audio.sample_rate` ist die **Engine-Zielrate**, in v1 nur `16000`.
+Das Gerät wird in einer nativ unterstützten Rate/Sampledarstellung
+geöffnet (typisch 44,1/48 kHz, intern Stereo möglich).
 
-16 kHz, mono, f32, Peak grob in [-1, 1]. cpal-Device darf 44.1/48 kHz
-liefern; resample im Audio-Pfad (z. B. `rubato` oder Linear für v1, wenn
-die Qualität im Spike hält).
+Der `cpal`-Callback ist lock-free und allokationsfrei: er schiebt nur
+rohe Frames in einen SPSC-Ringpuffer. Kanal-Mittelung, f32-Skalierung
+und `rubato`-Resample (16 kHz, Flush beim Stop) laufen **ausschließlich**
+auf dem Audio-/Transkriptions-Worker. Linear-Resampler ist kein Fallback.
+
+Gerät verloren: beim nächsten Aufnahmeversuch einmal neu öffnen; bleibt
+es tot → `error` Mic, Retry beim nächsten Press.
 
 Zu kurze Buffer (`< 250 ms`) nicht transkribieren.
 
+Phase-1-STT-Spike mit fertiger WAV prüft **nicht** den Capture-Pfad;
+das ist Pflicht in Phase 2 (echte 44,1- und 48-kHz-Geräte bzw. Fixtures,
+Stereo, Device-lost).
+
 ## 7. Text am Cursor
 
-Härtester Teil. Default ist **nicht** Zeichen-für-Zeichen-Tippen.
+Default ist **nicht** Zeichen-für-Zeichen-Tippen.
 
 ### 7.1 Default: Clipboard + Paste
 
-1. Aktuellen Clipboard-Inhalt merken.
-2. Transkript setzen.
-3. Paste: Windows `Ctrl+V`; in bekannten Terminals `Ctrl+Shift+V`.
-   Linux X11 analog (`xclip`/`xsel` + `xdotool key`).
-4. Nach kurzem Delay (Default 200 ms, konfigurierbar) Clipboard
-   wiederherstellen.
+Nur Unicode-Plaintext ist der v1-Vertrag.
 
-Wenn Paste scheitert: Transkript **im Clipboard lassen**, Tray `error`
-„Text liegt in der Zwischenablage“, nicht still verwerfen.
+1. Wenn der aktuelle Clipboard-Inhalt als Unicode-Text snapshotbar ist:
+   merken (Text + Windows-Sequenznummer bzw. X11-Ownership).
+2. Sonst: kein Restore-Versprechen; nach Paste bleibt das Transkript im
+   Clipboard, Tooltip „Nicht-Text-Clipboard konnte nicht restauriert
+   werden“.
+3. Transkript setzen. Diktier merkt die **eigene** Generation/Ownership.
+4. Paste-Shortcut senden (§7.2).
+5. Restore **nur**, wenn Diktier noch Owner ist bzw. die Windows-
+   Sequenznummer unverändert blieb. Fremde Änderung: niemals restaurieren.
+6. `restore_clipboard_delay_ms` ist eine **Mindestwartezeit**, keine
+   Erfolgserkennung. **Kein** `sleep` auf dem Thread, der die X11-
+   Connection hält: `SelectionRequest` muss während der Wartezeit
+   beantwortet werden (Timer in der State-Machine). Restore erst nach
+   mindestens einem bedienten Request oder nach Timeout ohne
+   Ownership-Verlust.
 
-### 7.2 Optional: `output.mode = "type"`
+Vor dem Paste-Shortcut: störende Modifier (`Shift`, `Alt`, `Super`/`Win`)
+per Up-Event lösen, nach dem Paste den vorherigen Zustand wiederherstellen.
+Sonst wird `Ctrl+V` bei gehaltenem Shift zu `Ctrl+Shift+V`.
 
-Echtes Tippen (`enigo` oder Plattform-API) nur als Config-Option. Unter
-deutschem Layout (Umlaute, ß, tote Tasten) ist das der bekannte
-Fehlerpfad. v1 muss das nicht perfekt können; der Spike darf es
-versuchen und verwerfen.
+Paste-API-Fehler oder UIPI: Transkript **im Clipboard lassen**, Tray
+`error` „Text liegt in der Zwischenablage“. Kein stilles Verwerfen.
+Diktier fordert keine Elevation an.
 
-### 7.3 Inhalt
+### 7.2 Paste-Shortcut
 
-- Transkript so einfügen, wie das Modell es liefert (Satzzeichen, soweit
-  Parakeet sie setzt).
-- Kein automatisches Anhängen eines Leerzeichens vor dem Text in v1 —
-  lieber ein führendes Leerzeichen als Config (`output.leading_space`,
-  Default `true`), weil man meist in laufenden Satz diktiert.
-- Keine Spoken-Punctuation-Engine in v1.
-- Keine Wort-Ersetzungstabelle in v1 (v2; Ersatz für Whisper-Prompt).
+Config: `output.paste_shortcut = "auto" | "ctrl_v" | "ctrl_shift_v" | "shift_insert"`.
+
+`auto`:
+
+- Windows: `Ctrl+Shift+V` bei Fensterklasse/Prozess von Windows Terminal,
+  `conhost`, `WindowsTerminal.exe`; sonst `Ctrl+V`.
+- Linux X11: `Ctrl+Shift+V` bei VTE/Freedesktop-Terminals (`gnome-terminal`,
+  `xfce4-terminal`, Tilix, Alacritty, Kitty, Ghostty); `Shift+Insert` bei
+  `xterm`/`uxterm` und generischen X11-Terminals; sonst `Ctrl+V` in
+  normalen GUI-Fenstern.
+
+Unbekanntes Ziel: `Ctrl+V`. Scheitert Auto-Erkennung im Spike auf dem
+Pflichtterminal: Override in der Config, nicht Type-Modus.
+
+### 7.3 Fokus bei Inject
+
+Beim **Aufnahmeende** (Release oder Cap) native Vordergrund-Kennung
+speichern (`CaptureContext.target_window_id`). Das ist das **Top-Level**-
+Fenster: Windows `HWND` via `GetForegroundWindow()`, X11 `Window` via
+`_NET_ACTIVE_WINDOW`. Fokuswechsel in Child-Controls oder Tabs desselben
+Top-Level-Fensters zählt **nicht** als Verlust (sonst scheitert VS Code).
+
+Vor Inject: dieselbe Kennung muss noch Vordergrund sein. Sonst **kein**
+Paste-Key, Transkript bleibt im Clipboard, Tooltip „Fokus geändert — Text
+liegt im Clipboard“.
+
+### 7.4 Inhalt
+
+- Modelltext unverändert (Satzzeichen, soweit Parakeet sie setzt).
+- `output.leading_space` Default `true` (Diktat in laufenden Satz).
+- Keine Spoken-Punctuation, keine Replacements in v1.
+
+### 7.5 Optional `output.mode = "type"`
+
+Nur Config-Option, ohne v1-Garantie. Spike darf es versuchen. Scheitert
+es, bleibt Paste der Release-Pfad.
 
 ## 8. Config
-
-Pfad:
 
 - Linux: `~/.config/diktier/config.toml`
 - Windows: `%APPDATA%\diktier\config.toml`
 
-Fehlt die Datei: Defaults schreiben und mit denen starten.
+Fehlt die Datei: Defaults **atomar** schreiben (Temp + Rename) und starten.
 
 ```toml
 [hotkey]
 key = "F9"
-modifiers = []          # z. B. ["ctrl", "alt"]
+modifiers = []
 mode = "push_to_talk"   # v1 nur dieser Wert
 
 [audio]
 device = "default"
-sample_rate = 16000
+sample_rate = 16000     # Engine-Zielrate, nur 16000
 max_duration_secs = 60
 
 [engine]
 model = "parakeet-tdt-0.6b-v3-int8"
-language = "auto"       # oder "de"
 threads = 0             # 0 = Runtime-Default
 
 [output]
 mode = "paste"          # "paste" | "type"
+paste_shortcut = "auto"
 leading_space = true
 restore_clipboard = true
 restore_clipboard_delay_ms = 200
@@ -283,137 +419,203 @@ restore_clipboard_delay_ms = 200
 show_notifications_on_error = true
 ```
 
-Ungültige Werte: Default + Log-Warnung, nicht abstürzen.
+Validierung:
 
-Hot-Reload in v1 nicht nötig. Änderung greift nach Neustart. Tray-Menü
-„Config-Ordner öffnen“ reicht.
+| Klasse | Beispiele | Wirkung |
+|---|---|---|
+| Fatal | TOML-Syntax, ungültiges `hotkey.key`, `output.mode`, `engine.model` | kein Hotkey, keine Aufnahme, Tray `error` |
+| Unbekannte Keys | Tippfehler in Schlüsselnamen | ignorieren + Warnung |
+| Clamped | Zahlen außerhalb | Warnung + Grenze |
 
-## 9. Autostart
+Grenzen: `max_duration_secs` 1..=60, `restore_clipboard_delay_ms` 0..=5000,
+`threads` 0..=(logische CPUs).
 
-Opt-in per CLI, analog WhisperDictate:
+Kein Hot-Reload. Tray „Config-Ordner öffnen“.
+
+## 9. Autostart und CLI
 
 ```
+diktier                     # Daemon
+diktier --foreground        # Logs auf stderr, auch mit Konsole
 diktier --install-autostart
 diktier --remove-autostart
 ```
 
-- Windows: Verknüpfung im Startup-Ordner des Users (kein Admin).
+Install/Remove **idempotent**. Pfad = gequotetes `current_exe()`. Eigenen
+Eintrag aktualisieren, fremde Einträge nie löschen.
+
+- Windows: Startup-Ordner des Users. Build: Windows-Subsystem (kein
+  Konsolenfenster beim Doppelklick); `--foreground` hängt eine Konsole an
+  bzw. schreibt trotzdem stderr, wenn eine da ist.
 - Linux: `~/.config/autostart/diktier.desktop`.
 
-Ohne Flag startet `diktier` den Daemon im Vordergrund (Terminal) bzw.
-als Session-App ohne Konsole, wenn vom .desktop/Autostart gestartet.
-`--foreground` erzwingt Log auf stderr.
+Exitcodes: `0` ok (auch zweiter Start), `1` fataler Laufzeitfehler,
+`2` Bedien-/Configfehler.
 
-## 10. Fehler und Logs
+Phase 4: Pfad mit Leerzeichen, zweimal Install/Remove, verschobene
+portable Binary (erneutes `--install-autostart` aktualisiert).
 
-Log nach stderr und zusätzlich:
+## 10. Fehler, Recovery, Logs
+
+| Klasse | Hotkey | Retry | Text/Audio |
+|---|---|---|---|
+| Download/ORT/Modell fatal | aus | Neustart oder expliziter Retry | kein Inject |
+| Hotkey-Registrierung | aus | Config ändern + Neustart | Tray-Click aktiv |
+| Mic tot | an | nächster Press öffnet Device neu, einmal | Aufnahme startet nicht |
+| Inject/UIPI/Fokus | an | nächstes Diktat | Transkript bleibt im Clipboard |
+| Tray-Aufbau gescheitert | — | — | Prozessende, stderr+Log, Exit 1 |
+
+Desktop-Notification nur Zusatz. Wenn der Tray nicht startet, gibt es
+keinen zweiten GUI-Kanal.
+
+Log: stderr (im `--foreground`) plus
 
 - Linux: `~/.local/state/diktier/diktier.log`
 - Windows: `%LOCALAPPDATA%\diktier\diktier.log`
 
-Rotation: eine Datei, kappen bei 2 MB (einfaches Truncate, kein Log-Stack
-in v1).
+Ein Writer besitzt die Datei. Rotation, nicht In-Place-Truncate: erreicht
+`diktier.log` 2 MiB, atomar nach `diktier.log.1` (eine Backup-Datei),
+neue `diktier.log`. Keine Transkripte, keine Clipboard-Inhalte, keine
+Fenstertitel.
 
-Keine personenbezogenen Transkripte loggen. Audio nie auf Disk, außer
-explizitem Debug-Flag (`DIKTIER_DEBUG_WAV=1` schreibt eine WAV nach
-Temp, Dokumentation in der Spec reicht, kein GUI).
+`DIKTIER_DEBUG_WAV=1`: schreibt `$TMPDIR/diktier-$USER/last_recording.wav`
+bzw. `%TEMP%\diktier\last_recording.wav`, Rechte `0600`. Jede neue Debug-
+Aufnahme überschreibt diese Datei atomar — genau ein Dump. Pfad eine
+Logzeile. Nie hochladen.
 
 ## 11. Verteilung
 
-- Ein Binary. Cargo-Lock committen (Anwendung, nicht Library).
-- Windows: ZIP mit `diktier.exe` + `onnxruntime.dll` (Version pinnen).
-  ORT darf nicht „irgendwo im PATH“ erwartet werden.
-- Linux Mint: Binary; `onnxruntime` entweder statisch oder `.so` neben
-  der Binary / über Paket. Spike entscheidet, was auf Mint 22 ohne
-  Handstand läuft.
-- Kein Installer-Zwang. Portable Start aus Ordner muss gehen.
-- `cargo build --release` ist der Dev-Weg.
+Bundle, nicht „eine Datei“:
+
+```
+diktier[.exe]
+lib/onnxruntime.dll          # Windows, fester Name
+lib/libonnxruntime.so        # Linux, fester Name, kein Symlink-Zwang
+LICENSES/
+versions.toml                # App, ORT-ABI, Crate-Lock-Hinweis
+```
+
+Release-Skript kopiert die ORT-Library unter genau diesen Dateinamen.
+Kein `PATH`, kein `LD_LIBRARY_PATH`, kein System-ORT. Laden ausschließlich
+über `ort::init_from` relativ zu `current_exe()`.
+
+Release-Gate: Archiv in ein **leeres** Verzeichnis einer sauberen Win10-,
+Win11- und Mint-22-VM entpacken, ORT-Umgebungsvariablen entfernen, STT
+laden.
+
+Portable Start aus Ordner muss gehen. `cargo build --release` ist der
+Dev-Weg. `Cargo.lock` committen.
+
+ORT-CPU-Instruktionen: die gepinnte ORT-Build-Variante dokumentieren.
+Haswell hat AVX2; wenn ORT AVX2 verlangt, ist das die Mindest-CPU.
 
 ## 12. Implementierungsreihenfolge
 
-Nicht GUI zuerst. Jede Phase hat ein Gate. Nächste Phase erst, wenn das
-Gate hält.
+Nicht GUI zuerst. Nächste Phase erst, wenn das Gate in `docs/SPIKES.md`
+abgehakt ist.
 
-### Phase 0 — Repo-Gerüst
+### Phase 0 — Gerüst
 
-`Cargo.toml`, Module-Stubs, Config-Defaults, CLI `--help`. Kein Mic, kein
-Tray. Gate: `cargo test` und `cargo build` grün auf Linux.
+`Cargo.toml`, Module-Stubs, Config-Defaults, CLI `--help`, `models.toml`
+mit den Hashes aus §6.3. Gate: `cargo test` und `cargo build` auf Linux.
 
-### Phase 1 — STT-Spike (entscheidend)
+### Phase 1 — STT-Spike
 
-Eine feste deutsche WAV (Alltagssatz + ein paar Fachwörter, 5–15 s), ins
-Repo unter `testdata/` (kurz, lizenzfrei, selbst gesprochen).
+`testdata/stt/` (selbst gesprochen, lizenzfrei):
 
-Dieselbe Datei:
+- mindestens **drei** deutsche Äußerungen: Alltag, Fachwörter, Zahlen/Umlaute
+- jeweils wortgetreuer Referenztext
+- eine echte Stille-Datei
+- eine Raumrausch-Datei
 
-1. hier auf Omarchy durch Voxtype/Parakeet
-2. durch Diktier-Engine (`parakeet-rs`) auf Linux
-3. durch Diktier-Engine auf Windows
+Voxtype und Diktier verwenden die Artefakte aus §6.3. Normalisierung für
+den Vergleich (ein kleines Script in `testdata/`): Kleinbuchstaben,
+Interpunktion `[.,!?;:\-–—"']` weg, Whitespace kollabieren. Referenztexte
+nutzen dieselbe Zahlenschreibweise wie Parakeet (Ziffern vs. Wort).
 
-Gate:
+- nach Normalisierung: Diktier-Text = Voxtype-Text, oder
+  `WER(Diktier, Referenz) ≤ WER(Voxtype, Referenz)` (kein +0,05-Puffer —
+  dieselben INT8-Artefakte)
+- kein Diktier-Ergebnis darf einen nicht gesprochenen Satz enthalten
+- markierte Fachwörter mindestens so oft korrekt wie Voxtype
+- Stille, Raumrauschen, `< 250 ms` → leer
+- Zeit: Median aus fünf **warmen** Läufen, Modellladen separat;
+  10 s Audio **≤ 5 s** auf dem benannten Büro-Laptop, **≤ 20 s** auf der
+  Haswell-Maschine
 
-- Text in derselben Liga wie Voxtype (keine erfundenen Sätze, keine
-  Prompt-Halluzination, Fachwörter nicht schlechter als Voxtype).
-- Stille-WAV → leeres Transkript.
-- Laufzeit auf CPU akzeptabel: für 10 s Audio deutlich unter 10 s Wall
-  auf einem aktuellen Büro-Laptop; auf schwächerer CPU (Haswell-Klasse)
-  unter ~realtime × 2.
-- Windows-ORT lädt ohne Entwickler-Maschine-PATH-Hack.
+`docs/SPIKES.md` hält CPU, RAM, OS, Crate-/ORT-Version, Threads,
+Artefakt-SHA256, Rohtexte, normalisierte Texte, Zeiten.
 
-Scheitert `parakeet-rs`: Fallback-Crate, nicht an der App weiterbauen.
+Windows-ORT lädt aus dem Bundlepfad ohne PATH-Hack.
 
-### Phase 2 — Inject-Spike
+### Phase 2 — Inject- und Capture-Spike
 
-PTT auf **beiden** Zielplattformen, ohne Tray:
+Pflichtmatrix:
 
-- Fokus bleibt im Editor (Notepad / xed / VS Code / ein Terminal).
-- Satz mit Umlauten und ß landet korrekt.
-- Neue Zeile im Transkript wird zur echten Zeile.
-- Clipboard ist nach 1 s wieder der alte Inhalt (wenn Restore an).
-- Terminal: Paste kommt an, nicht als Literal `^V`.
+| OS | Editor | Terminal |
+|---|---|---|
+| Windows 10 x64 | Notepad, VS Code | Windows Terminal / PowerShell |
+| Windows 11 x64 | Notepad, VS Code | Windows Terminal / PowerShell |
+| Mint 22 Cinnamon X11 | xed, VS Code | Standard-VTE-Terminal (`gnome-terminal` / Mint-Terminal). Nicht xterm — das wäre `Shift+Insert`. |
 
-Gate: manuell, aber als Checkliste in `docs/SPIKES.md` abhaken. Scheitert
-Tippen, bleibt Paste — und Paste **muss** halten, sonst ist v1 tot.
+Pro Fall in `docs/SPIKES.md`:
 
-### Phase 3 — Daemon + Tray + Config + Autostart
+- Fensterkennung vor/nach Paste identisch
+- exakter Text `Grüße, Öl, Spaß — Zeile 1\nZeile 2`
+- vorhandener Unicode-Clipboard-Wert nach Restore-Regel wieder da, oder
+  dokumentiert nicht restaurierbar (Nicht-Text)
+- absichtlicher API-Fehler → Transkript bleibt im Clipboard
+- Fokuswechsel während Transkription → kein Paste, Text im Clipboard
+- fremder Copy während Restore-Fenster → fremder Inhalt bleibt
+- kein `^V`
+- 44,1- und 48-kHz-Capture bzw. Fixture, Stereo-Downmix
+- PTT Press/Release, 60-s-Cap, Auto-Repeat, Registrierungsfehler
+- Windows: erhöhtes Notepad — kein Paste, kein Fokuswechsel, Text im Clipboard
 
-State-Machine, Icon-Zustände, Single-Instance, Modell-Download, Autostart
-CLI. Gate: kalter Start, F9 PTT, Text im Editor, Beenden über Tray, zweiter
-Start wird abgewiesen.
+Bestehen = exakte Zeichen- und Zeilengleichheit in jedem Editor-Pflichtfall.
+
+### Phase 2b — Tray-Smoke (vor Phase 3)
+
+Gepinnte `betrayer`-Version, Windows 10/11 und Mint Cinnamon: Links-/
+Rechtsklick getrennt, Tooltip/Icon-Update, Pause/Resume, Panel-Neustart,
+Quit, kein Fokuswechsel.
+
+### Phase 3 — Daemon
+
+State-Machine, Single-Instance, Download, Autostart-CLI. Gate: kalter
+Start, F9 PTT, Text im Editor, Beenden über Tray, Parallelstart Exit 0,
+Neustart nach Kill des ersten Prozesses.
 
 ### Phase 4 — Politur
 
-Autostart getestet, ZIP/Binary-Layout, README-Install, Log-Kappen,
-`--install-autostart` auf beiden OS.
+Autostart, Bundle-Layout, README-Install, Log-Kappen, saubere VM ohne ORT
+im PATH.
 
 ## 13. Tests
 
-Automatisch:
+Automatisch, mit Fake-Backends:
 
-- Config parsen: Defaults, Overlay, unbekannter Key, ungültiges Modell.
-- State-Machine: idle→recording→transcribing→idle; Release ohne Press
-  ignorieren; 60 s Cap; leeres Transkript fügt nichts ein.
-- Engine: Stille → leer ( testdata). Wo CI kein ORT hat, Test
-  `#[ignore]` und lokal/Spike-Pflicht.
-- Inject: Unit-Tests nur für Clipboard-Restore-Logik mit Fake, nicht für
-  echte SendInput.
+- Config: die drei Klassen aus §8; atomare Defaults-Datei.
+- State: alle Übergänge in §5.2 inklusive Press während transcribing,
+  Auto-Repeat, Pause während recording, Cap + spätes Release, Download-/
+  Hashfehler, Injectfehler, Fokusverlust.
+- Download: lokaler Fake-Transport — Abbruch, falsche Größe, falscher
+  Hash, atomarer Abschluss, Parallelstart.
+- Clipboard-Fake: Generationen/Ownership, Fremdänderung, Nicht-Text.
+- Engine: Stille → leer, soweit ohne ORT mockbar.
 
-Manuell (Gate von Phase 2 und 3): Checkliste Windows + Mint.
+`stt-smoke` mit echtem Modell: `#[ignore]` im normalen `cargo test`,
+Pflicht in Phase 1 auf beiden OS.
 
-Kein GUI-Snapshot, kein Benchmark-Zwang über das Spike-Gate hinaus.
+Kein GUI-Snapshot.
 
-## 14. v2 (nicht bauen, nur nicht verbauen)
+## 14. v2 (nicht bauen, nicht verbauen)
 
-- Zweiter Hotkey öffnet einen Review-Dialog (editieren, dann einfügen
-  oder kopieren). Darf Fokus nehmen. PTT-Pfad bleibt fokusfrei.
-- Wort-Ersetzungen (`replacements` in der Config).
-- Optional OSD.
-- Optional `language = "de"`-Feintuning / `parakeet-primeline`.
-- HTTP `/transcribe` fürs Cockpit, falls VRAM-Sharing je wieder Thema
-  wird — bei CPU-INT8 unwahrscheinlich.
-
-Die Module `engine` / `inject` / `hotkey` müssen das zulassen, ohne
-umgeworfen zu werden. Kein Preview-Code in v1 hinter Feature-Flags.
+- Zweiter Hotkey → Review-Dialog (darf Fokus nehmen). PTT bleibt fokusfrei.
+- `OutputSink::review`.
+- Wortersetzungen.
+- Optional OSD, `parakeet-primeline`, weitere Modelle nach eigenem Gate.
+- HTTP ist Nicht-Ziel und wird nicht vorbereitet.
 
 ## 15. Abgrenzung WhisperDictate
 
@@ -422,16 +624,41 @@ umgeworfen zu werden. Kein Preview-Code in v1 hinter Feature-Flags.
 | Sprache | Python | Rust |
 | Engine | faster-whisper medium | Parakeet TDT v3 INT8 |
 | UX | Toggle, Dialog, Clipboard | PTT, Tray, Paste am Cursor |
-| Plattform | Win + Linux, GUI-first | Win + Mint, Daemon-first |
+| Plattform | Win + Linux, GUI-first | Win + Mint X11, Daemon-first |
 | Repo | `Whisper-dictate` | `diktier` |
 
-Kein Code-Import. Höchstens die Idee des Autostart-Flags und der
-Config-Pfade.
+Kein Code-Import.
 
-## 16. Offene Punkte, die die Spec bewusst festlegt
+## 16. Offene Punkte, die die Spec festlegt
 
-- Name `diktier` ist Arbeitstitel; Rename bleibt möglich.
-- Paste statt Type als Default: ja.
-- `F9` als Default-PTT: ja.
-- Preview-Dialog: nicht in v1.
-- Omarchy bleibt bei Voxtype; Diktier wird dort nicht der Default.
+- Name `diktier` ist Arbeitstitel.
+- Paste statt Type als Default.
+- `F9` als Default-PTT.
+- Preview-Dialog nicht in v1.
+- Wayland nicht in v1.
+- Nur ein Modell in v1.
+- Omarchy bleibt bei Voxtype.
+
+## 17. Entscheidungen zum Codex-Review
+
+| # | Frage | Entscheidung |
+|---|---|---|
+| 1 | Golden Set | Die vier Hashes in §6.3, von diesem Omarchy-Voxtype-Stand. HF-Revision im Spike nachtragen, sobald die URL feststeht. |
+| 2 | Rechner / RAM | Haswell = i7-4500U (dieses Omarchy-Gerät) als langsames Zeit-Gate. Büro-Laptop in SPIKES.md namentlich. Peak-RSS ≤ 2 GiB. |
+| 3 | WAV-Menge | Mindestens drei Sprach-WAVs plus Stille und Rauschen. |
+| 4 | `language` | In v1 aus der Config entfernen. |
+| 5 | Weitere Modelle | Aus v1-Liste. |
+| 6 | Wayland | Außerhalb des Supportvertrags. |
+| 7 | Fokuswechsel | Abbruch des Paste, Text bleibt im Clipboard. |
+| 8 | Clipboard-Restore | Nur Unicode-Plaintext. |
+| 9 | Terminal-Shortcut | `paste_shortcut` mit `auto` + Override. |
+| 10 | Elevated Windows | Nicht unterstützt. |
+| 11 | ORT | Immer private Library neben der Binary, nie Systempaket. |
+| 12 | Toolchain | Windows MSVC x64; Linux glibc 2.39 (Mint 22). |
+| 13 | CLI vs. Lock | Autostart/help/version **vor** Single-Instance (Agy B1). |
+| 14 | `nemo128.onnx` | Erst spezifizieren, wenn `parakeet-rs` in Phase 1 fällt (Agy B2). |
+| 15 | Win-Hook-Thread | Eigene Message-Pump, nicht Tray-Thread (Agy H1). |
+| 16 | X11-Clipboard | Kein Sleep auf der X11-Connection (Agy H2). |
+| 17 | Audio-Callback | Nur Ringpuffer; `rubato` auf Worker (Agy H5). |
+| 18 | Log | Rotation `diktier.log` / `.1`, kein In-Place-Truncate (Agy M1). |
+| 19 | WER-Puffer | +0,05 gestrichen; gleiche Artefakte, gleicher oder besserer WER (Agy). |
