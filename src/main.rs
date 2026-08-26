@@ -1,10 +1,13 @@
 mod audio;
+mod autostart;
 mod config;
 mod daemon;
 mod download;
 mod engine;
 mod hotkey;
 mod inject;
+mod paths;
+mod single_instance;
 mod state;
 mod tray;
 
@@ -106,13 +109,13 @@ where
         }
     };
 
+    // §5.3: Die CLI-Modi laufen **vor** der Single-Instance-Sperre und fordern
+    // sie nie an; §10: sie loggen nur nach stderr, nie in `diktier.log`.
     if cli.install_autostart {
-        eprintln!("diktier: --install-autostart ist noch nicht implementiert");
-        return 1;
+        return install_autostart();
     }
     if cli.remove_autostart {
-        eprintln!("diktier: --remove-autostart ist noch nicht implementiert");
-        return 1;
+        return remove_autostart();
     }
     if cli.runs != 1 && cli.transcribe_wav.is_none() {
         eprintln!("diktier: --runs gilt nur zusammen mit --transcribe-wav");
@@ -151,6 +154,34 @@ where
     }
 
     run_daemon(cli.foreground)
+}
+
+/// §9: Autostart-Eintrag anlegen bzw. aktualisieren, idempotent.
+fn install_autostart() -> u8 {
+    match autostart::install() {
+        Ok((outcome, path)) => {
+            eprintln!("Autostart {}: {}", outcome.as_str(), path.display());
+            0
+        }
+        Err(err) => {
+            eprintln!("diktier: {err}");
+            err.exit_code()
+        }
+    }
+}
+
+/// §9: Eigenen Eintrag entfernen. Kein Eintrag da heißt trotzdem Exit 0.
+fn remove_autostart() -> u8 {
+    match autostart::remove() {
+        Ok((outcome, path)) => {
+            eprintln!("Autostart {}: {}", outcome.as_str(), path.display());
+            0
+        }
+        Err(err) => {
+            eprintln!("diktier: {err}");
+            err.exit_code()
+        }
+    }
 }
 
 fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
@@ -596,14 +627,20 @@ mod tests {
         assert_eq!(cli_main(["diktier", "--nope"]), 2);
     }
 
-    #[test]
-    fn install_autostart_is_stub_exit_1() {
-        assert_eq!(cli_main(["diktier", "--install-autostart"]), 1);
-    }
+    // Die Wirkung von `--install-autostart` / `--remove-autostart` prüft
+    // `autostart::tests` gegen ein Temp-`HOME`: hier aufgerufen würden sie im
+    // echten `~/.config/autostart` schreiben.
 
     #[test]
-    fn remove_autostart_is_stub_exit_1() {
-        assert_eq!(cli_main(["diktier", "--remove-autostart"]), 1);
+    fn autostart_and_foreground_conflict_exit_2() {
+        assert_eq!(
+            cli_main(["diktier", "--foreground", "--install-autostart"]),
+            2
+        );
+        assert_eq!(
+            cli_main(["diktier", "--foreground", "--remove-autostart"]),
+            2
+        );
     }
 
     #[test]

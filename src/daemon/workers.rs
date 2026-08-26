@@ -15,11 +15,13 @@ use std::time::{Duration, Instant};
 
 use crate::audio::{AudioSource, CpalAudioSource};
 use crate::config::{AudioConfig, OutputConfig};
+use crate::download::{self, ArtifactManifest, DownloadError, HttpTransport, Progress};
 use crate::engine::{ParakeetTranscriber, transcribe_pcm};
 use crate::hotkey::{HotkeyBackend, HotkeyEvent, new_backend};
 use crate::inject::{
     self, CaptureContext, ClipboardSave, CopyOnlyReason, InjectOutcome, OutputSink, WindowId,
 };
+use crate::single_instance;
 use crate::state::{AppState, CopyReason, Event, InjectReport, RunId, Runtime};
 use crate::tray::{self, TrayBackend, TrayError, TrayEvent};
 
@@ -43,6 +45,12 @@ pub enum Msg {
 
 /// §4.3: Tray-Ereignisse, die den Kern erreichen. „Config-Ordner öffnen" ist
 /// reine Wiring-Aktion und hat deshalb kein Kern-Event.
+///
+/// **Offen für v2** (Owner-Entscheidung Phase 3d): Der Kern kennt
+/// `Event::RetryRequested`, aber niemand erzeugt es — §4.3 legt das Tray-Menü
+/// abschließend fest, und ein „Erneut versuchen"-Eintrag stünde nicht darin.
+/// Der explizite Retry aus §6.3/§10 ist in v1 deshalb der Neustart des
+/// Prozesses; ein Menüeintrag wäre eine Spec-Änderung.
 pub fn tray_event_to_core(event: TrayEvent) -> Option<Event> {
     match event {
         TrayEvent::LeftClick => Some(Event::TrayClickToggle),
@@ -197,6 +205,145 @@ fn engine_loop(rx: Receiver<EngineCmd>, out: Sender<Msg>, model: &str, threads: 
             }
             EngineCmd::Shutdown => break,
         }
+    }
+}
+
+// -------------------------------------------------------------- Download
+
+/// §6.3: Der Download läuft auf einem eigenen Thread — 650 MB dürfen die
+/// Event-Loop nicht anhalten, sonst wäre der Tray während des Ladens tot.
+pub struct DownloadWorker {
+    cancel: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl DownloadWorker {
+    pub fn spawn(
+        run: RunId,
+        manifest: ArtifactManifest,
+        out: Sender<Msg>,
+        log: Arc<Logger>,
+    ) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let join = thread::Builder::new()
+            .name("diktier-download".into())
+            .spawn(move || download_loop(run, &manifest, &out, &log, &flag))
+            .ok();
+        Self { cancel, join }
+    }
+
+    /// Bricht zwischen zwei Blöcken ab (Quit-Pfad, §5.2).
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    pub fn shutdown(&mut self, timeout: Duration) -> bool {
+        self.cancel();
+        match self.join.take() {
+            Some(join) => join_with_timeout(join, timeout),
+            None => true,
+        }
+    }
+}
+
+fn download_loop(
+    run: RunId,
+    manifest: &ArtifactManifest,
+    out: &Sender<Msg>,
+    log: &Logger,
+    cancel: &AtomicBool,
+) {
+    let fail = |message: String| {
+        log.error(&message);
+        let _ = out.send(Msg::Event(Event::DownloadFailed { run, message }));
+    };
+
+    let dir = match download::model_dir(&manifest.key) {
+        Ok(dir) => dir,
+        Err(err) => return fail(err.to_string()),
+    };
+    let lock_path = match single_instance::download_lock_path() {
+        Ok(path) => path,
+        Err(err) => return fail(err.to_string()),
+    };
+
+    let total: u64 = manifest.files.iter().map(|f| f.bytes).sum();
+    log.info(format!(
+        "Modell wird geladen: {} Dateien, {} nach {}",
+        manifest.files.len(),
+        human_bytes(total),
+        dir.display()
+    ));
+
+    let transport = HttpTransport::new();
+    let t0 = Instant::now();
+    let result = download::download_model_locked(
+        &lock_path,
+        &dir,
+        manifest,
+        &transport,
+        cancel,
+        &mut |progress| log_progress(log, progress),
+    );
+
+    match result {
+        Ok(()) => {
+            log.info(format!(
+                "Modellartefakte vollständig und geprüft ({:.1} s)",
+                t0.elapsed().as_secs_f64()
+            ));
+            let _ = out.send(Msg::Event(Event::DownloadFinished { run }));
+        }
+        // Beim Beenden ist der Abbruch gewollt: kein Fehlerzustand, keine
+        // Fehlerzeile — der Quit-Pfad läuft ohnehin schon.
+        Err(DownloadError::Cancelled) => log.info("Download abgebrochen (Beenden)"),
+        Err(err) => fail(err.to_string()),
+    }
+}
+
+/// §6.3: „Fortschritt als Logzeilen (keine UI)."
+fn log_progress(log: &Logger, progress: Progress<'_>) {
+    match progress {
+        Progress::Skipped { name, index, total } => {
+            log.info(format!("[{index}/{total}] {name}: bereits vorhanden"));
+        }
+        Progress::Started {
+            name,
+            index,
+            total,
+            bytes,
+        } => log.info(format!(
+            "[{index}/{total}] {name}: lade {} …",
+            human_bytes(bytes)
+        )),
+        Progress::Bytes { name, done, bytes } => log.info(format!(
+            "    {name}: {} / {} ({} %)",
+            human_bytes(done),
+            human_bytes(bytes),
+            percent(done, bytes)
+        )),
+        Progress::Verified { name, index, total } => {
+            log.info(format!(
+                "[{index}/{total}] {name}: Größe und SHA-256 geprüft"
+            ));
+        }
+    }
+}
+
+fn percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 100;
+    }
+    (done.saturating_mul(100)) / total
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

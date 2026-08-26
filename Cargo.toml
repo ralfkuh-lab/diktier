@@ -34,6 +34,15 @@ cpal = { version = "=0.18.2", features = ["pulseaudio"] }
 # Nicht 1.x/4.x (AudioAdapter-Umbruch). FFT, kein Linear-Resampler (§6.4).
 rubato = { version = "=0.16.2", default-features = true }
 
+# Phase 3d Modell-Download (§6.3): exakt pinnen.
+# ureq 3.4.0 ist blockierend und braucht keine Runtime — der Download läuft in
+# einem eigenen Worker-Thread, nicht in der Event-Loop. `rustls` (ring +
+# webpki-roots) statt native-tls: kein OpenSSL-Systemzwang, damit bleibt das
+# Bundle aus §11 portabel. `gzip` bewusst AUS — die Artefakte sind bereits
+# komprimiert, und ohne Content-Encoding stimmt die gelieferte Bytezahl direkt
+# mit der Manifestgröße überein.
+ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
+
 # Phase 2a Linux/X11: exakt pinnen.
 # x11rb 0.13.2 ist die aktuelle 0.13-Patchversion (0.13.1 ist im Index nicht
 # mehr wählbar). global-hotkey 0.8.0 verlangt ^0.13.1 — Cargo unifiziert auf
@@ -52,6 +61,10 @@ global-hotkey = { version = "=0.8.0", default-features = false }
 # Thread; Phase 2b ist Linux-Smoke, Windows bleibt cfg-Stub. Fallback später:
 # ksni (Linux) / Shell_NotifyIconW (Windows) hinter TrayBackend.
 betrayer = "=0.4.1"
+# Phase 3d Single-Instance (§5.3): `flock` für den gehaltenen advisory Lock.
+# 0.2.189 steht ohnehin schon transitiv im Lock (cpal/x11rb) — kein zusätzlicher
+# Baum, dafür die richtigen Konstanten statt einer handgeschriebenen ABI.
+libc = "=0.2.189"
 
 [dev-dependencies]
 tempfile = "3"

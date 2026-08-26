@@ -13,8 +13,11 @@
 //! Kanal-Kommando. Damit greift `QuitRequested` auch während einer laufenden
 //! Inferenz oder eines Restore-Wartens (codex H4 zu §7.1 P6).
 //!
-//! Nicht in Phase 3c (kommt in 3d): Single-Instance-Lock (§5.3),
-//! Modell-Download (§6.3), Autostart (§9), Datei-Log samt Rotation (§10).
+//! Phase 3d ergänzt: Single-Instance-Lock (§5.3), Modell-Download in einem
+//! eigenen Worker (§6.3) und das Datei-Log samt Rotation (§10). Die Reihenfolge
+//! beim Start ist dabei nicht beliebig: **erst** die Sperre, **dann** der
+//! Datei-Sink — sonst schrieben zwei Prozesse in `diktier.log` (§10:
+//! „Ein Writer besitzt die Datei.").
 
 mod debug_wav;
 mod dispatch;
@@ -30,6 +33,8 @@ use std::time::{Duration, Instant};
 use crate::config::{self, ConfigError};
 use crate::download::{self, ArtifactManifest, load_manifest};
 use crate::inject::ClipboardSave;
+use crate::paths;
+use crate::single_instance::{self, InstanceAcquire};
 use crate::state::{
     AppState, AudioInfo, CopyReason, ErrorKind, Event, LogEvent, RunId, Runtime, transition,
 };
@@ -37,7 +42,9 @@ use crate::tray;
 
 use dispatch::{Actors, Timers, dispatch};
 use logging::Logger;
-use workers::{AudioWorker, EngineWorker, HotkeyWorker, InjectWorker, Msg, TrayWorker};
+use workers::{
+    AudioWorker, DownloadWorker, EngineWorker, HotkeyWorker, InjectWorker, Msg, TrayWorker,
+};
 
 /// Takt der Kern-Uhr (`Event::Tick`). Kurz genug, dass Tray-Klicks und
 /// Fristen ohne spürbare Verzögerung greifen, lang genug für ~50 Ticks/s.
@@ -54,6 +61,51 @@ const SAVE_TARGETS_TIMEOUT: Duration = Duration::from_secs(2);
 pub fn run(foreground: bool) -> u8 {
     let log = Arc::new(Logger::new(foreground));
 
+    // §5.3: Nur der Daemon nimmt die Sperre, und er nimmt sie als Erstes —
+    // an allen nutzbaren Orten zugleich, sonst liefen zwei Prozesse mit
+    // unterschiedlichem `XDG_RUNTIME_DIR` aneinander vorbei.
+    let lock = match single_instance::acquire_instance_lock(&mut |problem| log.warn(problem)) {
+        Ok(InstanceAcquire::Held(lock)) => lock,
+        Ok(InstanceAcquire::Busy) => {
+            // Kurze stderr-Meldung, Exit 0, kein Fensterfokus, kein fremder
+            // Prozess wird angefasst.
+            eprintln!("diktier läuft bereits — dieser Start endet ohne Wirkung.");
+            return 0;
+        }
+        Err(err) => {
+            log.error(format!("Single-Instance-Sperre: {err}"));
+            return 1;
+        }
+    };
+    // §10: ab hier — und nur hier — gehört `diktier.log` diesem Prozess.
+    attach_file_log(&log, foreground);
+    log.info(format!("Sperre gehalten: {}", lock.describe()));
+
+    let exit = run_locked(foreground, &log);
+    drop(lock);
+    exit
+}
+
+/// §10: Datei-Log anhängen. Scheitert das, bleibt stderr — ein unbeschreibbares
+/// `~/.local/state` ist kein Grund, das Diktieren zu verweigern.
+fn attach_file_log(log: &Logger, foreground: bool) {
+    match paths::log_path() {
+        Ok(path) => match log.attach_file(&path, paths::LOG_LIMIT_BYTES) {
+            Ok(()) => log.info(format!("Log: {}", path.display())),
+            Err(err) => log.warn(format!("Datei-Log {}: {err}", path.display())),
+        },
+        Err(err) => log.warn(format!("Datei-Log: {err}")),
+    }
+    if !log.has_file() && !foreground {
+        // Ohne Datei und ohne Konsole bliebe von diesem Lauf nichts übrig.
+        log.warn(
+            "Kein Datei-Log und kein --foreground — Warnungen und Fehler gehen nur nach stderr",
+        );
+    }
+}
+
+fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
+    let log = log.clone();
     let loaded = match config::load() {
         Ok(loaded) => loaded,
         Err(err) => {
@@ -140,6 +192,7 @@ pub fn run(foreground: bool) -> u8 {
         inject,
         tray: tray_worker,
         hotkey,
+        download: None,
         pending_audio: None,
         emitted: Vec::new(),
         quit: false,
@@ -163,6 +216,8 @@ struct Daemon {
     inject: InjectWorker,
     tray: TrayWorker,
     hotkey: HotkeyWorker,
+    /// Läuft nur, solange der Kern in `downloading` steht (§6.3).
+    download: Option<DownloadWorker>,
     /// Samples der letzten Aufnahme; der Kern kennt nur ihre Länge.
     pending_audio: Option<(RunId, Vec<f32>)>,
     /// Events, die ein Effekt synchron erzeugt hat (Artefaktprüfung, Fehler).
@@ -193,6 +248,12 @@ impl Daemon {
     fn shutdown(mut self, exit: u8) -> u8 {
         let deadline = Instant::now() + QUIT_HARD_LIMIT;
         self.log.info("Beenden …");
+
+        // Zuerst das Abbruchsignal, noch vor `save_targets`: der Download-Thread
+        // hat damit die ganze Restzeit, um den laufenden Block zu Ende zu lesen.
+        if let Some(download) = &self.download {
+            download.cancel();
+        }
 
         // Phase-2-Erkenntnis (`csd-clipboard`): ohne SAVE_TARGETS verliert
         // Cinnamon beim Owner-Exit den Clipboard-Inhalt.
@@ -232,6 +293,13 @@ impl Daemon {
             .shutdown(remaining(deadline).min(Duration::from_secs(2)))
         {
             stuck.push("inject");
+        }
+        if let Some(mut download) = self.download.take()
+            && !download.shutdown(remaining(deadline).min(Duration::from_secs(2)))
+        {
+            // Ein blockierender `read` auf dem Socket lässt sich nicht
+            // abbrechen — dann endet der Prozess hart (§5.2).
+            stuck.push("download");
         }
         if let Some(mut engine) = self.engine.take()
             && !engine.shutdown(remaining(deadline))
@@ -275,15 +343,21 @@ impl Actors for Daemon {
     }
 
     fn start_download(&mut self, run: RunId) {
-        // Phase 3c lädt nichts nach (§12 Phase 3 ist auf 3d aufgeteilt) —
-        // stattdessen ein Fehler, der sagt, was zu tun ist.
-        let message = format!(
-            "Modellartefakte fehlen in {}. Der automatische Download folgt; \
-             bis dahin die vier Dateien aus src/models.toml dorthin legen.",
-            self.model_dir_hint()
+        // §6.3: eigener Thread. Ein alter Worker kann hier nicht mehr laufen —
+        // der Kern verlässt `downloading` nur über `DownloadFinished`/`Failed`.
+        if let Some(mut old) = self.download.take() {
+            old.shutdown(Duration::from_millis(100));
+        }
+        self.log.run(
+            run,
+            format!("Modellartefakte fehlen in {}", self.model_dir_hint()),
         );
-        self.log.error(&message);
-        self.emitted.push(Event::DownloadFailed { run, message });
+        self.download = Some(DownloadWorker::spawn(
+            run,
+            self.manifest.clone(),
+            self.tx.clone(),
+            self.log.clone(),
+        ));
     }
 
     fn load_model(&mut self, run: RunId) {
