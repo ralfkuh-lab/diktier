@@ -147,17 +147,20 @@ pub fn new_backend(_runtime: &Runtime, _model_key: &str) -> Result<AnyTray, Tray
     Ok(AnyTray::Stub(StubTray))
 }
 
+/// §4.3-Tabelle. Aktive Arbeit hat Vorrang vor `paused`: eine per Tray-Click
+/// gestartete Aufnahme läuft auch bei ausgeschaltetem Hotkey und muss sichtbar
+/// sein. `paused` zeigt sich deshalb nur in den Ruhezuständen.
 pub fn tray_status(runtime: &Runtime) -> TrayStatus {
-    if runtime.paused {
-        return TrayStatus::Paused;
-    }
     match runtime.state {
+        AppState::Recording { .. } => TrayStatus::Recording,
+        // §4.3 kennt keinen sichtbaren Zustand „injecting" — der Ausgabepfad
+        // gehört für den Nutzer noch zur Transkription.
+        AppState::Transcribing { .. } | AppState::Injecting { .. } => TrayStatus::Transcribing,
+        _ if runtime.paused => TrayStatus::Paused,
         AppState::Starting => TrayStatus::Starting,
         AppState::Downloading => TrayStatus::Downloading,
         AppState::Loading => TrayStatus::Loading,
         AppState::Idle => TrayStatus::Idle,
-        AppState::Recording { .. } => TrayStatus::Recording,
-        AppState::Transcribing { .. } => TrayStatus::Transcribing,
         AppState::Error => TrayStatus::Error,
     }
 }
@@ -399,7 +402,11 @@ mod tests {
     }
 
     fn runtime(state: AppState, paused: bool) -> Runtime {
-        Runtime { state, paused }
+        Runtime {
+            state,
+            paused,
+            ..Runtime::default()
+        }
     }
 
     #[test]
@@ -444,17 +451,56 @@ mod tests {
         }
     }
 
+    /// §4.3: Eine laufende Tray-Click-Aufnahme muss sichtbar bleiben, auch wenn
+    /// der Hotkey pausiert ist — `recording`/`transcribing` schlagen `paused`.
     #[test]
-    fn paused_flag_overrides_app_state_for_tooltip() {
-        let rt = runtime(
+    fn active_states_outrank_the_paused_flag() {
+        let rec = runtime(
             AppState::Recording {
                 source: RecordingSource::TrayClick,
             },
             true,
         );
-        assert_eq!(tray_status(&rt), TrayStatus::Paused);
+        assert_eq!(tray_status(&rec), TrayStatus::Recording);
         assert_eq!(
-            tooltip_text(&rt, DEFAULT_MODEL),
+            tooltip_text(&rec, DEFAULT_MODEL),
+            format!("recording — {DEFAULT_MODEL}")
+        );
+
+        for state in [
+            AppState::Transcribing {
+                source: RecordingSource::TrayClick,
+            },
+            AppState::Injecting {
+                source: RecordingSource::Hotkey,
+            },
+        ] {
+            assert_eq!(
+                tray_status(&runtime(state, true)),
+                TrayStatus::Transcribing,
+                "{state:?}"
+            );
+        }
+    }
+
+    /// `paused` zeigt sich nur in den Ruhezuständen (§4.3-Tabelle).
+    #[test]
+    fn paused_flag_shows_in_resting_states() {
+        for state in [
+            AppState::Starting,
+            AppState::Downloading,
+            AppState::Loading,
+            AppState::Idle,
+            AppState::Error,
+        ] {
+            assert_eq!(
+                tray_status(&runtime(state, true)),
+                TrayStatus::Paused,
+                "{state:?}"
+            );
+        }
+        assert_eq!(
+            tooltip_text(&runtime(AppState::Idle, true), DEFAULT_MODEL),
             format!("paused — {DEFAULT_MODEL}")
         );
     }

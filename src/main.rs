@@ -546,43 +546,30 @@ fn tray_test(secs: u32) -> u8 {
 }
 
 fn tray_cycle() -> [Runtime; 8] {
+    let state = |state: AppState, paused: bool| Runtime {
+        state,
+        paused,
+        ..Runtime::default()
+    };
     [
-        Runtime {
-            state: AppState::Starting,
-            paused: false,
-        },
-        Runtime {
-            state: AppState::Downloading,
-            paused: false,
-        },
-        Runtime {
-            state: AppState::Loading,
-            paused: false,
-        },
-        Runtime {
-            state: AppState::Idle,
-            paused: false,
-        },
-        Runtime {
-            state: AppState::Recording {
+        state(AppState::Starting, false),
+        state(AppState::Downloading, false),
+        state(AppState::Loading, false),
+        state(AppState::Idle, false),
+        state(
+            AppState::Recording {
                 source: RecordingSource::TrayClick,
             },
-            paused: false,
-        },
-        Runtime {
-            state: AppState::Transcribing {
+            false,
+        ),
+        state(
+            AppState::Transcribing {
                 source: RecordingSource::TrayClick,
             },
-            paused: false,
-        },
-        Runtime {
-            state: AppState::Error,
-            paused: false,
-        },
-        Runtime {
-            state: AppState::Idle,
-            paused: true,
-        },
+            false,
+        ),
+        state(AppState::Error, false),
+        state(AppState::Idle, true),
     ]
 }
 
