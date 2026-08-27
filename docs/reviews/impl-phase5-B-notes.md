@@ -330,3 +330,43 @@ dasselbe Ersatzargument: der gesamte neue Code liegt in einer Datei hinter
 `mod.rs`, der additive `windows_process_shortcut`-Zweig samt Tests in
 `protocol.rs` (die Linux-Tabelle und ihre Tests sind unverändert grün) und
 zwei zusätzliche Enum-Varianten im Test-Fake berührt.
+
+## ✅ Fix nach Gesamt-Review (Blocker 1–3)
+
+Nur `src/inject/windows.rs`; Punkt 4 des Reviews (`CTRL_CLOSE_EVENT`) bleibt offen.
+
+- **Blocker 1:** `snapshot_clipboard` merkt jetzt zusätzlich
+  `GetClipboardSequenceNumber()` (`ClipboardState::snapshot_seq`, im noch
+  offenen Clipboard gelesen). `become_owner` konsumiert die Sequenz per
+  `take()` und vergleicht sie nach `OpenClipboard`, **vor** `EmptyClipboard`;
+  bei Abweichung wird ohne jede Mutation geschlossen und
+  `InjectError::Failed("Clipboard zwischenzeitlich fremd geändert")` gemeldet.
+  Das landet über `inject_paste` → `InjectReport::Failed` im Tray-Fehler; der
+  fremde Inhalt bleibt stehen, das Transkript geht dann eben nicht ins
+  Clipboard (bewusst akzeptiert). `copy_only`/Fokusverlust übernehmen weiter
+  ungeprüft — dort gibt es kein Restore-Versprechen.
+- **Blocker 2:** `take_clipboard` bekommt einen `expect`-Parameter und prüft im
+  geöffneten Clipboard erneut Sequenz (immer) und Owner (sofern wir nach
+  eigener Buchführung halten). Bei Abweichung: `CloseClipboard` ohne
+  `EmptyClipboard`, **kein** Guard, `forget_ownership()` + `lost = true`, damit
+  ein folgendes `WM_DESTROYCLIPBOARD` als fremd zählt und `still_owner()`
+  false meldet. Der neue `TakeFailure::Foreign` trennt „fremd" von Win32-Fehler:
+  `set_serve_text`/`release_ownership` geben `Ok`/„nicht restauriert" (→
+  `RestoreDecision::ForeignOwner`), `save_to_clipboard_manager` gibt
+  `ClipboardSave::NotOwner`. Restore- und Quit-Fehler werden nicht mehr still
+  verschluckt (`eprintln!` in `set_serve_text`, `release_ownership`, `Drop`).
+  `WM_RENDERALLFORMATS` prüft zusätzlich zur Owner- jetzt auch die Sequenz.
+- **Blocker 3:** `fill_open_clipboard` alloziert vor `EmptyClipboard`; scheitert
+  `EmptyClipboard` oder `SetClipboardData`, wird das Handle freigegeben und der
+  Fehler gemeldet. Im Delayed-Pfad wird nach `SetClipboardData(_, NULL)` noch im
+  offenen Clipboard per `IsClipboardFormatAvailable(CF_UNICODETEXT)` geprüft,
+  dass das Versprechen wirklich registriert ist.
+
+Gates: `cargo build --release`, `cargo test` (297 passed, 0 failed),
+`cargo fmt --check` grün. Smoke (Clipboard vorher „VORHER"): Paste-Pfad
+`SPIKE selection_requests(data)=1` / `SPIKE restored=true (restored)`, danach
+`Get-Clipboard` = „VORHER"; copy_only-Pfad `SPIKE grund=Fokus geändert — Text
+liegt im Clipboard`, danach `Get-Clipboard` = „Fix-Test äöü". Hinweis: ein
+Daemon aus `target/release/diktier.exe` lief noch (PID 20536) und blockierte den
+Link; die Smoke-Binary wurde deshalb über `CARGO_TARGET_DIR` separat gebaut, der
+Daemon nicht angefasst — `target/release/diktier.exe` ist noch der alte Stand.

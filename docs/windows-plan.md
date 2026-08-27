@@ -305,6 +305,13 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   verbreiteter Clipboard-Manager.
 - Erst danach darf eine Windows-Version als Release gelten.
 
+## Plattform-Entscheidung 2026-08-27
+
+Windows ist ab jetzt die **Primärplattform** (Ralf). Linux wird nicht mehr
+berücksichtigt — kein Mint-Gate, kein Linux-`cargo check`, keine Linux-Pendants
+für neue Features; die Linux-Teile werden ggf. später entfernt. WP7-Gates
+gelten entsprechend nur noch für Win10/Win11.
+
 ## Nicht in dieser Phase (bewusst, kein Feinschliff-Etikett)
 
 - Mikrofon-Pegel/Gerätewahl (RMS lag im Test bei 0,0007; Schwelle 0,0075 —
@@ -315,6 +322,14 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   Modifier-Chord braucht ein eigenes Hook-Zustandsmodell (Halten beginnt beim
   zweiten Down, endet beim ersten Up, Einzeltasten müssen durchgehen) auf
   beiden Plattformen. Folgepaket nach dem Dev-Milestone.
+- 🔍 **Aufnahme-Indikator** (Wunsch Ralf 2026-08-27): Tray-Icons lassen sich
+  unter Win11 nicht programmatisch sichtbar erzwingen (einmal manuell
+  anheften, pfadgebunden). Alternative: kleines randloses Overlay
+  (`WS_EX_NOACTIVATE|WS_EX_TOPMOST|WS_EX_TOOLWINDOW`) nur während
+  `recording`, kein Fokuswechsel — SPEC §4.2-konform. Folgepaket.
+- 🔍 Sol-Gesamtreview offen: `CTRL_CLOSE_EVENT` ohne Cleanup-Ack (nur
+  `--foreground`-Konsole), `WM_ENDSESSION` nur über Poll-Queue, Tray-Retry
+  nach fehlgeschlagenem `NIM_ADD`, Pfad-Kanonisierung Download-Mutex.
 - 🔍 Watchdog gegen still entfernten LL-Hook (`LowLevelHooksTimeout`), Sol-
   Blocker 5 zu Paket A; Restrisiko akzeptiert.
 

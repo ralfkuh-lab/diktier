@@ -100,6 +100,28 @@ enum Fill {
     Empty,
 }
 
+/// Warum eine Übernahme unterblieb. Die Unterscheidung ist nötig, weil die
+/// Aufrufer verschieden reagieren: ein fremder Copy ist kein Fehler, sondern
+/// §7.1 Punkt 5 („niemals restaurieren“), ein Win32-Fehler dagegen schon.
+enum TakeFailure {
+    /// Fremde Änderung zwischen Prüfung/Snapshot und `EmptyClipboard`. Das
+    /// Clipboard wurde **nicht** angefasst.
+    Foreign,
+    /// Win32-Fehler beim eigenen Übergang.
+    Failed(InjectError),
+}
+
+impl TakeFailure {
+    fn into_error(self) -> InjectError {
+        match self {
+            Self::Foreign => {
+                InjectError::Failed("Clipboard zwischenzeitlich fremd geändert".into())
+            }
+            Self::Failed(err) => err,
+        }
+    }
+}
+
 /// Der Zustand, den `WndProc` und die Sink-Methoden teilen. Beide laufen auf
 /// **demselben** Thread (dem Inject-Worker), deshalb reicht `RefCell`: der
 /// `WndProc` wird nur aus `PeekMessageW`/`DispatchMessageW`/`SendMessage`
@@ -110,6 +132,13 @@ struct ClipboardState {
     /// Sequenznummer nach der letzten **eigenen** Mutation
     /// (Leitentscheidung 4).
     expected_seq: u32,
+    /// Sequenznummer zum Zeitpunkt des letzten Snapshots (§7.1 Punkt 5). Die
+    /// folgende Übernahme prüft sie im geöffneten Clipboard erneut, sonst
+    /// überschreibt sie einen fremden Copy, der zwischen Snapshot und
+    /// `EmptyClipboard` liegt (Sol-Review Blocker 1). Wird bei der Übernahme
+    /// konsumiert: ein `become_owner` ohne eigenen Snapshot (`copy_only`,
+    /// Fokusverlust-Pfad) darf nicht gegen eine veraltete Sequenz prüfen.
+    snapshot_seq: Option<u32>,
     /// Wir halten (nach eigener Buchführung) das Clipboard.
     owned: bool,
     /// Ein Delayed-Rendering-Versprechen ist offen, der Text liegt also noch
@@ -130,6 +159,7 @@ impl ClipboardState {
         Self {
             serve: String::new(),
             expected_seq: 0,
+            snapshot_seq: None,
             owned: false,
             delayed: false,
             reads: 0,
@@ -190,8 +220,11 @@ fn on_render_all_formats(cell: &RefCell<ClipboardState>, hwnd: HWND) {
     if unsafe { OpenClipboard(hwnd) } == 0 {
         return;
     }
-    // SAFETY: parameterlos.
+    // SAFETY: beide parameterlos. Owner **und** Sequenz müssen im geöffneten
+    // Clipboard noch die unseren sein — sonst hat zwischen Nachricht und
+    // `OpenClipboard` jemand anderes kopiert (Sol-Review Blocker 2).
     if unsafe { GetClipboardOwner() } == hwnd
+        && unsafe { GetClipboardSequenceNumber() } == state.expected_seq
         && let Some(handle) = alloc_utf16(&state.serve)
     {
         // SAFETY: wie in `on_render_format`; kein `EmptyClipboard`, das würde
@@ -464,12 +497,45 @@ impl Win32OutputSink {
     /// Eigener Übergang: `EmptyClipboard` (macht uns zum Owner) und je nach
     /// [`Fill`] das Versprechen, die Daten oder gar nichts. Aktualisiert
     /// anschließend `expected_seq`.
-    fn take_clipboard(&mut self, text: String, fill: Fill) -> Result<(), InjectError> {
+    ///
+    /// `expect` schließt das Check-then-act-Fenster (Sol-Review Blocker 1/2):
+    /// Zwischen Snapshot bzw. `is_still_owner` und diesem Punkt kann ein
+    /// fremder Copy liegen. Innerhalb des geöffneten Clipboards ist der
+    /// Zustand stabil, deshalb wird dort direkt vor `EmptyClipboard` erneut
+    /// verglichen — Sequenz immer, Owner zusätzlich, wenn wir das Clipboard
+    /// nach eigener Buchführung halten.
+    fn take_clipboard(
+        &mut self,
+        text: String,
+        fill: Fill,
+        expect: Option<u32>,
+    ) -> Result<(), TakeFailure> {
         // Vor dem Guard öffnen: `open_clipboard` pumpt, und ein fremdes
         // `WM_DESTROYCLIPBOARD` in dieser Zeit soll noch gewertet werden.
         // Scheitert das Öffnen, bleibt der bisherige Serve-Text stehen — ein
         // noch offenes altes Versprechen wird sonst mit dem neuen Text bedient.
-        self.open_clipboard()?;
+        self.open_clipboard().map_err(TakeFailure::Failed)?;
+
+        if let Some(expected) = expect {
+            // SAFETY: beide parameterlos; das Clipboard ist offen und damit
+            // gegen fremde Mutation gesperrt.
+            let seq = unsafe { GetClipboardSequenceNumber() };
+            let owner = unsafe { GetClipboardOwner() };
+            let owned = self.state.borrow().owned;
+            if seq != expected || (owned && owner != self.hwnd) {
+                // Kein `EmptyClipboard`, kein Guard: das folgende
+                // `WM_DESTROYCLIPBOARD` (falls es kommt) stammt dann wirklich
+                // von fremd und darf als Ownership-Verlust zählen.
+                // SAFETY: genau das oben geöffnete Clipboard wird geschlossen.
+                unsafe { CloseClipboard() };
+                let mut state = self.state.borrow_mut();
+                if owned {
+                    state.forget_ownership();
+                    state.lost = true;
+                }
+                return Err(TakeFailure::Foreign);
+            }
+        }
 
         self.state.borrow_mut().guard += 1;
         let result = fill_open_clipboard(&text, fill);
@@ -494,28 +560,43 @@ impl Win32OutputSink {
             }
             Ok(()) => {
                 state.forget_ownership();
-                Err(InjectError::Failed(
+                Err(TakeFailure::Failed(InjectError::Failed(
                     "Clipboard-Ownership nicht übernommen".into(),
-                ))
+                )))
             }
             Err(err) => {
                 state.forget_ownership();
-                Err(err)
+                Err(TakeFailure::Failed(err))
             }
         }
+    }
+
+    /// Die Sequenz, gegen die eine Übernahme bei **bestehendem** Eigentum
+    /// geprüft wird (nach `is_still_owner`).
+    fn owned_seq(&self) -> Option<u32> {
+        Some(self.state.borrow().expected_seq)
     }
 
     /// Quit-Pfad: ein offenes Delayed-Rendering-Versprechen stirbt mit dem
     /// Prozess. Der Text wird deshalb eager hinterlegt, damit er das
     /// Prozessende überlebt (§7.1 Punkt 8).
-    fn materialize(&mut self) -> Result<(), InjectError> {
+    fn materialize(&mut self) -> Result<(), TakeFailure> {
         let text = self.state.borrow().serve.clone();
-        self.take_clipboard(text, Fill::Eager)
+        let expect = self.owned_seq();
+        self.take_clipboard(text, Fill::Eager, expect)
     }
 }
 
 /// Der Teil, der ein **offenes** Clipboard voraussetzt.
 fn fill_open_clipboard(text: &str, fill: Fill) -> Result<(), InjectError> {
+    // Speicher **vor** `EmptyClipboard` besorgen (Sol-Review Blocker 3):
+    // scheitert `GlobalAlloc`, sind bisheriger Inhalt und Transkript noch da.
+    let handle = match fill {
+        Fill::Empty | Fill::Delayed => ptr::null_mut(),
+        Fill::Eager => alloc_utf16(text).ok_or_else(|| {
+            InjectError::Failed("Clipboard-Speicher (GlobalAlloc) fehlgeschlagen".into())
+        })?,
+    };
     // SAFETY: Das Clipboard ist von unserem Fenster geöffnet. `EmptyClipboard`
     // macht es zu unserem und schickt `WM_DESTROYCLIPBOARD` an den bisherigen
     // Owner — sind das wir selbst, hält der Guard des Aufrufers die Nachricht
@@ -523,17 +604,17 @@ fn fill_open_clipboard(text: &str, fill: Fill) -> Result<(), InjectError> {
     if unsafe { EmptyClipboard() } == 0 {
         // SAFETY: parameterlos.
         let err = unsafe { GetLastError() };
+        if !handle.is_null() {
+            // SAFETY: noch nicht übergeben, das Handle gehört uns.
+            unsafe { GlobalFree(handle) };
+        }
         return Err(InjectError::Failed(format!(
             "EmptyClipboard: Win32-Fehler {err}"
         )));
     }
-    let handle = match fill {
-        Fill::Empty => return Ok(()),
-        Fill::Delayed => ptr::null_mut(),
-        Fill::Eager => alloc_utf16(text).ok_or_else(|| {
-            InjectError::Failed("Clipboard-Speicher (GlobalAlloc) fehlgeschlagen".into())
-        })?,
-    };
+    if fill == Fill::Empty {
+        return Ok(());
+    }
     // SAFETY: `NULL` ist die dokumentierte Form für Delayed Rendering; sonst
     // ist `handle` ein gültiges `GMEM_MOVEABLE`-Handle, dessen Eigentum bei
     // Erfolg an das System übergeht.
@@ -547,9 +628,20 @@ fn fill_open_clipboard(text: &str, fill: Fill) -> Result<(), InjectError> {
             "SetClipboardData: Win32-Fehler {err}"
         )));
     }
-    // Für `Fill::Delayed` sagt der Rückgabewert nichts: `SetClipboardData(_,
-    // NULL)` liefert auch bei Erfolg `NULL`. Der Erfolg wird deshalb vom
-    // Aufrufer am beobachtbaren Zustand geprüft (`GetClipboardOwner`).
+    if fill == Fill::Delayed {
+        // `SetClipboardData(_, NULL)` liefert auch bei Erfolg `NULL`, und
+        // `GetClipboardOwner() == hwnd` beweist nur das `EmptyClipboard`.
+        // Ob das Versprechen wirklich steht, sagt allein die
+        // Formatverfügbarkeit — noch im offenen Clipboard geprüft.
+        // SAFETY: parameterlos bis auf das Format, Clipboard ist offen.
+        if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
+            // SAFETY: parameterlos.
+            let err = unsafe { GetLastError() };
+            return Err(InjectError::Failed(format!(
+                "Delayed Rendering für CF_UNICODETEXT nicht registriert: Win32-Fehler {err}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -582,18 +674,32 @@ impl ClipboardHost for Win32OutputSink {
         let _ = self.take_events();
 
         if self.is_still_owner() {
-            return Ok(ClipboardSnapshot::Text(self.state.borrow().serve.clone()));
+            let mut state = self.state.borrow_mut();
+            let seq = state.expected_seq;
+            state.snapshot_seq = Some(seq);
+            return Ok(ClipboardSnapshot::Text(state.serve.clone()));
         }
 
         self.open_clipboard()?;
         let snapshot = read_open_clipboard();
+        // §7.1 Punkt 1: zum Snapshot gehört auf Windows die Sequenznummer.
+        // Noch im offenen Clipboard gelesen, damit sie wirklich zu dem gerade
+        // gelesenen Inhalt gehört.
+        // SAFETY: parameterlos.
+        let seq = unsafe { GetClipboardSequenceNumber() };
         // SAFETY: genau das oben geöffnete Clipboard wird einmal geschlossen.
         unsafe { CloseClipboard() };
+        self.state.borrow_mut().snapshot_seq = Some(seq);
         Ok(snapshot)
     }
 
     fn become_owner(&mut self, text: String) -> Result<(), InjectError> {
-        self.take_clipboard(text, Fill::Delayed)
+        // `take()`: nur die Übernahme direkt nach einem Snapshot prüft gegen
+        // dessen Sequenz. `copy_only` und der Fokusverlust-Pfad übernehmen
+        // ohne Restore-Versprechen und ohne vorherigen Snapshot.
+        let expect = self.state.borrow_mut().snapshot_seq.take();
+        self.take_clipboard(text, Fill::Delayed, expect)
+            .map_err(TakeFailure::into_error)
     }
 
     fn still_owner(&mut self) -> Result<bool, InjectError> {
@@ -610,11 +716,20 @@ impl ClipboardHost for Win32OutputSink {
             return;
         }
         // Das Trait hat hier keinen Fehlerkanal. Schlägt die Materialisierung
-        // fehl, gilt der Zustand als unbekannt (`take_clipboard` setzt
-        // `owned = false`); `still_owner()` meldet dann false und
-        // `inject_paste` bucht `ForeignOwner` statt eines Restores, das nicht
-        // stattgefunden hat.
-        let _ = self.take_clipboard(text, Fill::Eager);
+        // fehl oder war der Copy fremd, gilt der Zustand als unbekannt
+        // (`take_clipboard` setzt `owned = false`); `still_owner()` meldet dann
+        // false und `inject_paste` bucht `ForeignOwner` statt eines Restores,
+        // das nicht stattgefunden hat. Still verschluckt wird der Grund nicht.
+        let expect = self.owned_seq();
+        match self.take_clipboard(text, Fill::Eager, expect) {
+            Ok(()) => {}
+            Err(TakeFailure::Foreign) => {
+                eprintln!("Clipboard-Restore unterblieben: fremde Änderung seit der Übernahme");
+            }
+            Err(TakeFailure::Failed(err)) => {
+                eprintln!("Clipboard-Restore fehlgeschlagen: {err}");
+            }
+        }
     }
 
     /// Restore eines **leeren** Snapshots. Windows kennt kein Ablegen der
@@ -624,7 +739,18 @@ impl ClipboardHost for Win32OutputSink {
         if !self.is_still_owner() {
             return Ok(());
         }
-        self.take_clipboard(String::new(), Fill::Empty)
+        let expect = self.owned_seq();
+        match self.take_clipboard(String::new(), Fill::Empty, expect) {
+            Ok(()) => Ok(()),
+            // Fremder Copy zwischen Prüfung und `EmptyClipboard`: §7.1 Punkt 5
+            // verlangt genau das Nichtstun. Kein Inject-Fehler — `still_owner()`
+            // meldet jetzt false, `inject_paste` bucht `ForeignOwner`.
+            Err(TakeFailure::Foreign) => {
+                eprintln!("Clipboard-Restore unterblieben: fremde Änderung seit der Übernahme");
+                Ok(())
+            }
+            Err(TakeFailure::Failed(err)) => Err(err),
+        }
     }
 
     fn query_modifiers(&self) -> Result<ModifierState, InjectError> {
@@ -689,8 +815,16 @@ impl OutputSink for Win32OutputSink {
             // Schon eager im Clipboard (Restore oder früherer Render).
             return Ok(ClipboardSave::Saved);
         }
-        self.materialize()?;
-        Ok(ClipboardSave::Saved)
+        match self.materialize() {
+            Ok(()) => Ok(ClipboardSave::Saved),
+            // Zwischen Prüfung und `EmptyClipboard` hat jemand anderes kopiert:
+            // dessen Inhalt bleibt stehen, gesichert wurde nichts.
+            Err(TakeFailure::Foreign) => {
+                eprintln!("Clipboard-Sicherung unterblieben: fremde Änderung seit der Übernahme");
+                Ok(ClipboardSave::NotOwner)
+            }
+            Err(TakeFailure::Failed(err)) => Err(err),
+        }
     }
 }
 
@@ -699,7 +833,17 @@ impl Drop for Win32OutputSink {
         // Ohne das wäre der Text nach dem Prozessende weg — der Spike
         // `--inject-test` ruft `save_to_clipboard_manager` gar nicht auf.
         if self.is_still_owner() && self.state.borrow().delayed {
-            let _ = self.materialize();
+            match self.materialize() {
+                Ok(()) => {}
+                Err(TakeFailure::Foreign) => {
+                    eprintln!(
+                        "Clipboard-Sicherung unterblieben: fremde Änderung seit der Übernahme"
+                    );
+                }
+                Err(TakeFailure::Failed(err)) => {
+                    eprintln!("Clipboard-Sicherung fehlgeschlagen: {err}");
+                }
+            }
         }
         if !self.hwnd.is_null() {
             // SAFETY: Das Fenster gehört diesem Thread und existiert noch;
