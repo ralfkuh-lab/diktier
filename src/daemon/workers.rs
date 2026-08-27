@@ -47,6 +47,13 @@ pub enum Msg {
     TrayLost(String),
     /// §4.3-Menü „Config-Ordner öffnen" — kein Kern-Event.
     OpenConfigDir,
+    /// §4.3-Menü „Hotkey ändern…" — kein Kern-Event, der Daemon öffnet den
+    /// Dialog (Windows) bzw. meldet, dass es ihn nicht gibt (Linux).
+    ChangeHotkey,
+    /// Der Hotkey-Dialog ist zu. `Ok(None)` = abgebrochen, `Ok(Some(spec))` =
+    /// übernommen, `Err` = das Fenster kam gar nicht erst hoch.
+    #[cfg(windows)]
+    HotkeyChanged(Result<Option<HotkeySpec>, String>),
 }
 
 /// Welcher Worker ausgefallen ist — und in welche Fehlerklasse aus §10 das fällt.
@@ -110,7 +117,7 @@ pub fn tray_event_to_core(event: TrayEvent) -> Option<Event> {
         TrayEvent::LeftClick => Some(Event::TrayClickToggle),
         TrayEvent::TogglePause => Some(Event::PauseToggle),
         TrayEvent::Quit => Some(Event::QuitRequested),
-        TrayEvent::OpenConfigDir => None,
+        TrayEvent::OpenConfigDir | TrayEvent::ChangeHotkey => None,
     }
 }
 
@@ -903,6 +910,10 @@ pub enum HotkeyCmd {
     Grab,
     /// Pausiert — Taste freigeben, damit die fokussierte App sie bekommt.
     Ungrab,
+    /// §4.4 + „Hotkey ändern…": andere Taste, **sofort** und ohne Neustart.
+    /// Nur der Windows-Dialog erzeugt das.
+    #[cfg(windows)]
+    Rebind(HotkeySpec),
     Shutdown,
 }
 
@@ -920,7 +931,7 @@ impl HotkeyWorker {
         let (tx, rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("diktier-hotkey".into())
-            .spawn(move || hotkey_loop(&spec, &flag, &rx, &out, &log))
+            .spawn(move || hotkey_loop(spec, &flag, &rx, &out, &log))
             .map_err(|e| format!("Hotkey-Thread: {e}"))?;
         Ok(Self {
             tx,
@@ -938,6 +949,13 @@ impl HotkeyWorker {
         });
     }
 
+    /// §4.4: Neue Taste ab sofort greifen. Der Pausezustand bleibt, wie er
+    /// ist — der Aufrufer gleicht ihn danach mit [`Self::set_grabbed`] ab.
+    #[cfg(windows)]
+    pub fn rebind(&self, spec: HotkeySpec) {
+        let _ = self.tx.send(HotkeyCmd::Rebind(spec));
+    }
+
     pub fn shutdown(&mut self, timeout: Duration) -> bool {
         self.stop.store(true, Ordering::Release);
         let _ = self.tx.send(HotkeyCmd::Shutdown);
@@ -949,13 +967,13 @@ impl HotkeyWorker {
 }
 
 fn hotkey_loop(
-    spec: &HotkeySpec,
+    mut spec: HotkeySpec,
     stop: &AtomicBool,
     cmd_rx: &Receiver<HotkeyCmd>,
     out: &Sender<Msg>,
     log: &Logger,
 ) {
-    let mut backend = match new_backend(spec) {
+    let mut backend = match new_backend(&spec) {
         Ok(backend) => backend,
         Err(err) => {
             // §4.4/§10: kein Hotkey heißt Fehlerzustand — der Tray-Click
@@ -979,9 +997,14 @@ fn hotkey_loop(
         spec.describe()
     ));
 
+    // Was der Daemon zuletzt wollte — ein Rebind darf den Pausezustand nicht
+    // umkehren (der frische Hook installiert sich beim Aufbau selbst).
+    let mut grabbed = true;
+
     while !stop.load(Ordering::Acquire) {
         match cmd_rx.try_recv() {
             Ok(HotkeyCmd::Grab) => {
+                grabbed = true;
                 if let Err(err) = backend.register() {
                     // §4.4/§10: Beim Resume gilt derselbe Maßstab wie beim
                     // Start — ohne Grab ist der Hotkey tot. Nur zu warnen
@@ -998,12 +1021,45 @@ fn hotkey_loop(
                 }
             }
             Ok(HotkeyCmd::Ungrab) => {
+                grabbed = false;
                 if let Err(err) = backend.unregister() {
                     log.warn(format!("Hotkey freigeben: {err}"));
                 } else {
                     log.info(format!("Hotkey {} freigegeben (pausiert)", spec.describe()));
                 }
             }
+            // Erst das neue Backend bauen, dann das alte hergeben: scheitert
+            // der Aufbau, greift weiter die **alte** Taste, statt gar keine.
+            #[cfg(windows)]
+            Ok(HotkeyCmd::Rebind(next)) => match new_backend(&next) {
+                Ok(mut fresh) => {
+                    let ok = if grabbed {
+                        fresh.register()
+                    } else {
+                        fresh.unregister()
+                    };
+                    match ok {
+                        Ok(()) => {
+                            let _ = backend.unregister();
+                            backend = fresh;
+                            spec = next;
+                            log.info(format!(
+                                "Hotkey jetzt: {} ({})",
+                                spec.describe(),
+                                if grabbed { "scharf" } else { "pausiert" }
+                            ));
+                        }
+                        Err(err) => {
+                            log.error(format!("Hotkey {}: {err}", next.describe()));
+                            let _ = out.send(Msg::HotkeyUnavailable(err.to_string()));
+                        }
+                    }
+                }
+                Err(err) => {
+                    log.error(format!("Hotkey {}: {err}", next.describe()));
+                    let _ = out.send(Msg::HotkeyUnavailable(err.to_string()));
+                }
+            },
             Ok(HotkeyCmd::Shutdown) | Err(TryRecvError::Disconnected) => break,
             Err(TryRecvError::Empty) => {}
         }
@@ -1144,6 +1200,7 @@ fn tray_loop(
                 log.info(format!("Tray-Ereignis: {}", event.as_str()));
                 let msg = match tray_event_to_core(event) {
                     Some(core) => Msg::Event(core),
+                    None if event == TrayEvent::ChangeHotkey => Msg::ChangeHotkey,
                     None => Msg::OpenConfigDir,
                 };
                 if out.send(msg).is_err() {

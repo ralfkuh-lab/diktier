@@ -12,6 +12,10 @@ pub enum TrayEvent {
     /// Linksklick: Toggle-Aufnahme folgt in Phase 3 — hier nur Durchreichung.
     LeftClick,
     TogglePause,
+    /// §4.4 + Phase 5: „Hotkey ändern…" — nur Windows bietet den Dialog an,
+    /// das Ereignis selbst bleibt plattformneutral (der Wiring-Code darf es
+    /// auf beiden Seiten kennen).
+    ChangeHotkey,
     OpenConfigDir,
     Quit,
 }
@@ -21,6 +25,7 @@ impl TrayEvent {
         match self {
             Self::LeftClick => "left-click",
             Self::TogglePause => "toggle-pause",
+            Self::ChangeHotkey => "change-hotkey",
             Self::OpenConfigDir => "open-config-dir",
             Self::Quit => "quit",
         }
@@ -68,6 +73,9 @@ pub enum TrayClick {
 pub enum MenuAction {
     Status,
     TogglePause,
+    /// Nur im Windows-Menü (§4.4-Dialog); Linux hat keinen Dialog und
+    /// deshalb auch keinen Eintrag.
+    ChangeHotkey,
     OpenConfigDir,
     Quit,
 }
@@ -211,6 +219,7 @@ pub fn route_menu(action: MenuAction) -> Option<TrayEvent> {
     match action {
         MenuAction::Status => None,
         MenuAction::TogglePause => Some(TrayEvent::TogglePause),
+        MenuAction::ChangeHotkey => Some(TrayEvent::ChangeHotkey),
         MenuAction::OpenConfigDir => Some(TrayEvent::OpenConfigDir),
         MenuAction::Quit => Some(TrayEvent::Quit),
     }
@@ -493,6 +502,7 @@ mod windows {
     const MENU_TOGGLE_PAUSE: u32 = 1001;
     const MENU_OPEN_CONFIG: u32 = 1002;
     const MENU_QUIT: u32 = 1003;
+    const MENU_CHANGE_HOTKEY: u32 = 1004;
 
     /// Geschlossenes Mapping der Menü-IDs (§4.3). Unbekannte IDs — auch die `0`
     /// für „Menü ohne Auswahl geschlossen" — ergeben keine Aktion.
@@ -502,6 +512,7 @@ mod windows {
             MENU_TOGGLE_PAUSE => Some(MenuAction::TogglePause),
             MENU_OPEN_CONFIG => Some(MenuAction::OpenConfigDir),
             MENU_QUIT => Some(MenuAction::Quit),
+            MENU_CHANGE_HOTKEY => Some(MenuAction::ChangeHotkey),
             _ => None,
         }
     }
@@ -929,6 +940,7 @@ mod windows {
 
         let status = wide(&status_line);
         let pause = wide(pause_menu_label(paused));
+        let change_hotkey = wide("Hotkey ändern…");
         let config = wide("Konfiguration bearbeiten");
         let quit = wide("Beenden");
         // SAFETY: `menu` ist gültig, alle Textzeiger sind NUL-terminiert und
@@ -941,6 +953,12 @@ mod windows {
                 status.as_ptr(),
             );
             AppendMenuW(menu, MF_STRING, MENU_TOGGLE_PAUSE as usize, pause.as_ptr());
+            AppendMenuW(
+                menu,
+                MF_STRING,
+                MENU_CHANGE_HOTKEY as usize,
+                change_hotkey.as_ptr(),
+            );
             AppendMenuW(menu, MF_STRING, MENU_OPEN_CONFIG as usize, config.as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
             AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr());
@@ -1399,6 +1417,10 @@ mod tests {
             Some(TrayEvent::TogglePause)
         );
         assert_eq!(
+            route_menu(MenuAction::ChangeHotkey),
+            Some(TrayEvent::ChangeHotkey)
+        );
+        assert_eq!(
             route_menu(MenuAction::OpenConfigDir),
             Some(TrayEvent::OpenConfigDir)
         );
@@ -1451,13 +1473,14 @@ mod tests {
             assert_eq!(menu_action(1001), Some(MenuAction::TogglePause));
             assert_eq!(menu_action(1002), Some(MenuAction::OpenConfigDir));
             assert_eq!(menu_action(1003), Some(MenuAction::Quit));
+            assert_eq!(menu_action(1004), Some(MenuAction::ChangeHotkey));
         }
 
         /// `TrackPopupMenu` liefert `0`, wenn der Nutzer daneben klickt — das
         /// darf keine Aktion auslösen, ebenso wenig eine fremde ID.
         #[test]
         fn unknown_menu_ids_do_nothing() {
-            for id in [0, 1, 999, 1004, u32::MAX] {
+            for id in [0, 1, 999, 1005, u32::MAX] {
                 assert_eq!(menu_action(id), None, "{id}");
             }
         }
@@ -1471,6 +1494,7 @@ mod tests {
             assert_eq!(event(1001), Some(TrayEvent::TogglePause));
             assert_eq!(event(1002), Some(TrayEvent::OpenConfigDir));
             assert_eq!(event(1003), Some(TrayEvent::Quit));
+            assert_eq!(event(1004), Some(TrayEvent::ChangeHotkey));
         }
 
         #[test]

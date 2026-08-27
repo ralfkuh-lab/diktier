@@ -13,6 +13,11 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"
+# Phase 5 „Hotkey ändern…": Der Dialog schreibt nur die zwei `[hotkey]`-Zeilen
+# zurück und muss die Kommentare der handgeschriebenen config.toml erhalten —
+# `toml::to_string_pretty` würde sie verlieren. 0.22.27 steht ohnehin schon im
+# Lock (transitiv über `toml` 0.8), der direkte Eintrag kostet keinen zweiten Baum.
+toml_edit = "0.22"
 
 # Phase 1: exakt pinnen. parakeet-rs 0.3.7 ist die aktuelle Release (crates.io)
 # und zieht ort 2.0.0-rc.13 (Wrapper für ONNX Runtime 1.28).

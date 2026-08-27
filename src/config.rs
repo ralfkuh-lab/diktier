@@ -562,6 +562,77 @@ fn canonical_key(raw: &str) -> Option<String> {
     None
 }
 
+/// Schreibweise der Modifier in `config.toml` — das, was [`parse_modifier`]
+/// wieder annimmt.
+#[cfg(windows)]
+pub fn modifier_config_name(modifier: Modifier) -> &'static str {
+    match modifier {
+        Modifier::Ctrl => "ctrl",
+        Modifier::Shift => "shift",
+        Modifier::Alt => "alt",
+        Modifier::Super => "super",
+    }
+}
+
+/// §4.4 + „Hotkey ändern…": `hotkey.key` und `hotkey.modifiers` ersetzen und
+/// **sonst nichts** anfassen.
+///
+/// Deshalb `toml_edit` statt `toml::to_string_pretty`: Die Datei ist zum
+/// Selbstschreiben gedacht und trägt die Kommentare aus [`DEFAULT_TOML`] —
+/// ein Roundtrip über `toml::Value` würde sie alle verlieren. Die Dekoration
+/// der beiden geänderten Werte (der Kommentar hinter `key = "F9"`) wird
+/// mitgenommen, alles andere bleibt Zeichen für Zeichen stehen.
+///
+/// Fehlt die Datei, entsteht sie aus [`DEFAULT_TOML`] — derselbe Weg wie in
+/// [`load_from`], nur mit gesetztem Hotkey.
+#[cfg(windows)]
+pub fn save_hotkey(path: &Path, key: &str, modifiers: &[Modifier]) -> Result<(), ConfigError> {
+    use toml_edit::{DocumentMut, Item, Table, Value, value};
+
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => DEFAULT_TOML.to_string(),
+        Err(err) => return Err(ConfigError::Io(err)),
+    };
+    let mut doc = text
+        .parse::<DocumentMut>()
+        .map_err(|e| ConfigError::Syntax(e.to_string()))?;
+
+    let hotkey = doc.entry("hotkey").or_insert(Item::Table(Table::new()));
+    let hotkey = hotkey
+        .as_table_like_mut()
+        .ok_or_else(|| ConfigError::Fatal("[hotkey] ist keine Tabelle".into()))?;
+
+    // Wert tauschen, Dekoration (Whitespace + Zeilenkommentar) behalten.
+    let mut set = |name: &str, new: Value| {
+        let decor = hotkey
+            .get(name)
+            .and_then(Item::as_value)
+            .map(|old| old.decor().clone());
+        hotkey.insert(name, value(new));
+        if let Some(decor) = decor
+            && let Some(slot) = hotkey.get_mut(name).and_then(Item::as_value_mut)
+        {
+            *slot.decor_mut() = decor;
+        }
+    };
+
+    set("key", Value::from(key));
+    set(
+        "modifiers",
+        Value::Array(
+            modifiers
+                .iter()
+                .copied()
+                .map(modifier_config_name)
+                .collect(),
+        ),
+    );
+
+    write_atomic(path, &doc.to_string())?;
+    Ok(())
+}
+
 fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -796,6 +867,60 @@ max_duration_secs = 15
         assert_eq!(loaded.config.audio.max_duration_secs, 15);
         let on_disk = fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("max_duration_secs = 15"));
+    }
+
+    /// „Hotkey ändern…" darf die Datei nicht umschreiben: Kommentare,
+    /// Reihenfolge und alle übrigen Abschnitte bleiben stehen, und das
+    /// Ergebnis lädt ohne Warnung wieder.
+    #[cfg(windows)]
+    #[test]
+    fn saving_a_hotkey_keeps_comments_and_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, DEFAULT_TOML).unwrap();
+
+        save_hotkey(&path, "F12", &[Modifier::Ctrl, Modifier::Alt]).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(r#"# z. B. "F9", "ScrollLock", "Pause""#),
+            "Kommentar der geänderten Zeile verloren:
+{text}"
+        );
+        assert!(text.contains("# v1 nur dieser Wert"), "{text}");
+        assert!(
+            text.contains("show_notifications_on_error = true"),
+            "{text}"
+        );
+        assert!(!path.with_file_name("config.toml.tmp").exists());
+
+        let loaded = parse_toml(&text).unwrap();
+        assert_eq!(loaded.config.hotkey.key, "F12");
+        assert_eq!(
+            loaded.config.hotkey.modifiers,
+            vec![Modifier::Ctrl, Modifier::Alt]
+        );
+        assert_eq!(loaded.config.hotkey.mode, HotkeyMode::PushToTalk);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        // Alles außerhalb von [hotkey] ist unverändert.
+        assert_eq!(loaded.config.audio, AudioConfig::default());
+        assert_eq!(loaded.config.output, OutputConfig::default());
+    }
+
+    /// Fehlt die Datei, entsteht sie mit den Defaults **und** dem neuen
+    /// Hotkey — derselbe Weg wie in `load_from`.
+    #[cfg(windows)]
+    #[test]
+    fn saving_a_hotkey_creates_the_file_from_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        save_hotkey(&path, "ScrollLock", &[]).unwrap();
+
+        let loaded = load_from(&path).unwrap();
+        assert!(!loaded.created);
+        assert_eq!(loaded.config.hotkey.key, "ScrollLock");
+        assert!(loaded.config.hotkey.modifiers.is_empty());
+        assert_eq!(loaded.config.engine.model, DEFAULT_MODEL);
     }
 
     #[test]

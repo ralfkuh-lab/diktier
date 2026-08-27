@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 use crate::config::{self, ConfigError};
 use crate::download::{self, ArtifactManifest, load_manifest};
 use crate::hotkey::HotkeySpec;
+#[cfg(windows)]
+use crate::hotkey_dialog::{self, DialogOutcome};
 use crate::inject::ClipboardSave;
 use crate::paths;
 use crate::single_instance::{self, InstanceAcquire};
@@ -153,6 +155,9 @@ fn config_error_mode(message: String, log: &Arc<Logger>) -> u8 {
             Ok(Msg::TrayLost(err)) => {
                 log.error(format!("Tray verloren: {err}"));
                 break;
+            }
+            Ok(Msg::ChangeHotkey) => {
+                log.warn("Hotkey ändern: erst die Config reparieren, dann neu starten")
             }
             // Pause/Tray-Click haben ohne Engine keine Wirkung.
             Ok(_) => {}
@@ -281,6 +286,10 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
         tray: tray_worker,
         hotkey,
         hotkey_grabbed: true,
+        #[cfg(windows)]
+        hotkey_spec: spec,
+        #[cfg(windows)]
+        hotkey_dialog_open: false,
         download: None,
         pending_audio: None,
         emitted: Vec::new(),
@@ -309,6 +318,13 @@ struct Daemon {
     hotkey: HotkeyWorker,
     /// §4.4: Hält der Hotkey-Worker die Taste gerade gegriffen?
     hotkey_grabbed: bool,
+    /// Der zuletzt gültige Hotkey — Startwert für den „Hotkey ändern…"-Dialog.
+    #[cfg(windows)]
+    hotkey_spec: HotkeySpec,
+    /// Läuft gerade ein Dialogfenster? Der Tray bleibt währenddessen
+    /// bedienbar, ein zweiter Klick darf aber kein zweites Fenster öffnen.
+    #[cfg(windows)]
+    hotkey_dialog_open: bool,
     /// Läuft nur, solange der Kern in `downloading` steht (§6.3).
     download: Option<DownloadWorker>,
     /// Samples der letzten Aufnahme; der Kern kennt nur ihre Länge.
@@ -388,6 +404,118 @@ impl Daemon {
             }
             self.audio_intent = Some(intent);
         }
+    }
+
+    /// §4.3-Menü „Hotkey ändern…". Der Dialog nimmt den Fokus — die
+    /// §4.2-Ausnahme gilt ausschließlich für diesen ausdrücklich
+    /// angeforderten Weg, nie für den PTT-Pfad.
+    ///
+    /// Er läuft auf einem **eigenen** Thread, nicht auf dem Tray-Thread: der
+    /// hält das Notify-Icon, und ein blockierter Tray-Thread liefe beim
+    /// Beenden in den 2-s-Join-Timeout des `TrayWorker` — das Icon bliebe
+    /// stehen. So bleibt der Daemon währenddessen vollständig bedienbar
+    /// (Tray-Update, Beenden, Signale).
+    ///
+    /// Solange das Fenster offen ist, gibt der Hotkey-Worker die Taste frei
+    /// (`Ungrab`); sonst schluckte der LL-Hook genau den Tastendruck, den der
+    /// Nutzer im Dialog vorführen will.
+    #[cfg(windows)]
+    fn open_hotkey_dialog(&mut self) {
+        if self.hotkey_dialog_open {
+            self.log.info("Hotkey ändern: Dialog ist schon offen");
+            return;
+        }
+        let current = self.hotkey_spec.clone();
+        let tx = self.tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("diktier-hotkey-dialog".into())
+            .spawn(move || {
+                let result = match hotkey_dialog::ask(&current) {
+                    Ok(DialogOutcome::Applied(spec)) => Ok(Some(spec)),
+                    Ok(DialogOutcome::Cancelled) => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                };
+                let _ = tx.send(Msg::HotkeyChanged(result));
+            });
+        match spawned {
+            Ok(_) => {
+                self.hotkey.set_grabbed(false);
+                self.hotkey_dialog_open = true;
+                self.log.info(format!(
+                    "Hotkey ändern: Dialog offen (aktuell {})",
+                    self.hotkey_spec.describe()
+                ));
+            }
+            Err(err) => self
+                .log
+                .error(format!("Hotkey-Dialog nicht startbar: {err}")),
+        }
+    }
+
+    /// Linux hat keinen Dialog (§4.4: „Nur über Config änderbar") — der
+    /// Menüpunkt taucht dort gar nicht erst auf, die Meldung fängt nur den
+    /// theoretischen Fall ab.
+    #[cfg(not(windows))]
+    fn open_hotkey_dialog(&mut self) {
+        self.log.warn(
+            "Hotkey ändern: Dialog gibt es nur unter Windows — hotkey.key in config.toml setzen",
+        );
+    }
+
+    /// Ergebnis des Dialogs: speichern, sofort scharf schalten, Pausezustand
+    /// wiederherstellen.
+    #[cfg(windows)]
+    fn finish_hotkey_dialog(&mut self, result: Result<Option<HotkeySpec>, String>) {
+        self.hotkey_dialog_open = false;
+        match result {
+            Err(err) => self.log.error(format!("Hotkey ändern: {err}")),
+            Ok(None) => self.log.info("Hotkey ändern: abgebrochen"),
+            Ok(Some(spec)) => {
+                let saved = config::config_path()
+                    .map_err(|e| e.to_string())
+                    .and_then(|path| {
+                        config::save_hotkey(&path, &spec.key, &spec.modifiers)
+                            .map_err(|e| e.to_string())
+                    });
+                match saved {
+                    Ok(()) => self
+                        .log
+                        .info(format!("Hotkey jetzt: {} (gespeichert)", spec.describe())),
+                    Err(err) => self.report_hotkey_not_saved(&spec, &err),
+                }
+                self.hotkey.rebind(spec.clone());
+                self.hotkey_spec = spec;
+            }
+        }
+        // Der Dialog hat die Taste freigegeben — zurück auf den Pausezustand.
+        self.hotkey.set_grabbed(self.hotkey_grabbed);
+    }
+
+    /// §4.3 kennt neben dem Tooltip keinen Warnkanal, und der Tooltip nennt
+    /// Gründe nur im Zustand `error`. Ein fehlgeschlagenes Schreiben ist aber
+    /// **kein** Fehlerzustand nach §10 — der neue Hotkey greift sofort, nur
+    /// der nächste Start fiele auf den alten zurück.
+    ///
+    /// Deshalb genau ein direktes Tray-Update mit `error`, **ohne** `shown`
+    /// anzufassen: Der Hinweis bleibt sichtbar, bis der Kern das nächste Mal
+    /// wirklich den Zustand wechselt — dann malt `flush_presentation` von
+    /// selbst wieder das Richtige. `paused = false` ist Absicht: mit `true`
+    /// zeigte die §4.3-Tabelle `paused` statt `error` und schluckte den Grund.
+    #[cfg(windows)]
+    fn report_hotkey_not_saved(&mut self, spec: &HotkeySpec, err: &str) {
+        let message = format!(
+            "{} gilt, ließ sich aber nicht in config.toml speichern: {err}",
+            spec.describe()
+        );
+        self.log.error(&message);
+        self.tray.update(
+            AppState::Error,
+            false,
+            Some(ErrorInfo {
+                kind: ErrorKind::Config,
+                message,
+            }),
+        );
     }
 
     /// codex M2: Ein ausgefallener Worker wird vergessen, damit der nächste
@@ -788,6 +916,9 @@ fn handle_msg(
                 .info("Konfiguration geöffnet — Änderungen gelten nach Neustart"),
             Err(err) => daemon.log.warn(format!("Konfiguration öffnen: {err}")),
         },
+        Msg::ChangeHotkey => daemon.open_hotkey_dialog(),
+        #[cfg(windows)]
+        Msg::HotkeyChanged(result) => daemon.finish_hotkey_dialog(result),
     }
     Flow::Continue
 }

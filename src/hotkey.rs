@@ -907,7 +907,7 @@ mod linux {
 /// würde den Hook in `LowLevelHooksTimeout` laufen lassen und Windows
 /// entfernte ihn stillschweigend.
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use std::cell::RefCell;
     use std::panic::{self, AssertUnwindSafe};
     use std::ptr;
@@ -954,6 +954,34 @@ mod windows {
 
     // ------------------------------------------------------------ VK-Mapping
 
+    /// VK_F1 = 0x70, danach fortlaufend bis VK_F24 = 0x87.
+    const VK_F1: u16 = 0x70;
+    const VK_F24: u16 = 0x87;
+
+    /// Die benannten Tasten aus §8 — **eine** Tabelle für beide Richtungen
+    /// ([`virtual_key`] und [`vk_name`]). Die Namen sind exakt die
+    /// kanonischen Config-Schlüssel aus `config::NAMED_KEYS`; ein Test hält
+    /// beide Listen deckungsgleich.
+    const NAMED_KEYS: &[(&str, u16)] = &[
+        ("Space", 0x20),      // VK_SPACE
+        ("Tab", 0x09),        // VK_TAB
+        ("Enter", 0x0d),      // VK_RETURN
+        ("Escape", 0x1b),     // VK_ESCAPE
+        ("Backspace", 0x08),  // VK_BACK
+        ("Insert", 0x2d),     // VK_INSERT
+        ("Delete", 0x2e),     // VK_DELETE
+        ("Home", 0x24),       // VK_HOME
+        ("End", 0x23),        // VK_END
+        ("PageUp", 0x21),     // VK_PRIOR
+        ("PageDown", 0x22),   // VK_NEXT
+        ("Left", 0x25),       // VK_LEFT
+        ("Up", 0x26),         // VK_UP
+        ("Right", 0x27),      // VK_RIGHT
+        ("Down", 0x28),       // VK_DOWN
+        ("ScrollLock", 0x91), // VK_SCROLL
+        ("Pause", 0x13),      // VK_PAUSE
+    ];
+
     /// Config-Schlüssel → Windows-Virtual-Key (§8-Tabelle), das Gegenstück zu
     /// [`super::x11_keysym`].
     ///
@@ -966,7 +994,7 @@ mod windows {
             && (1..=24).contains(&n)
         {
             // VK_F1 = 0x70, danach fortlaufend bis VK_F24 = 0x87.
-            return Some(0x70 + u16::from(n) - 1);
+            return Some(VK_F1 + u16::from(n) - 1);
         }
         if key.len() == 1 {
             let c = key.chars().next()?;
@@ -978,26 +1006,37 @@ mod windows {
                 return u16::try_from(u32::from(c)).ok();
             }
         }
-        Some(match key {
-            "Space" => 0x20,      // VK_SPACE
-            "Tab" => 0x09,        // VK_TAB
-            "Enter" => 0x0d,      // VK_RETURN
-            "Escape" => 0x1b,     // VK_ESCAPE
-            "Backspace" => 0x08,  // VK_BACK
-            "Insert" => 0x2d,     // VK_INSERT
-            "Delete" => 0x2e,     // VK_DELETE
-            "Home" => 0x24,       // VK_HOME
-            "End" => 0x23,        // VK_END
-            "PageUp" => 0x21,     // VK_PRIOR
-            "PageDown" => 0x22,   // VK_NEXT
-            "Left" => 0x25,       // VK_LEFT
-            "Up" => 0x26,         // VK_UP
-            "Right" => 0x27,      // VK_RIGHT
-            "Down" => 0x28,       // VK_DOWN
-            "ScrollLock" => 0x91, // VK_SCROLL
-            "Pause" => 0x13,      // VK_PAUSE
-            _ => return None,
-        })
+        NAMED_KEYS
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, vk)| *vk)
+    }
+
+    /// Rückrichtung zu [`virtual_key`]: Virtual-Key → kanonischer Config-Name.
+    ///
+    /// Der „Hotkey ändern…"-Dialog braucht genau das — er sieht in
+    /// `WM_KEYDOWN` nur den VK und muss daraus schreiben, was in
+    /// `config.toml` stehen soll. Beide Richtungen kommen aus **einer**
+    /// Quelle: die benannten Tasten aus [`NAMED_KEYS`], F-Tasten, Buchstaben
+    /// und Ziffern aus derselben Rechnung wie in `virtual_key` (rückwärts).
+    ///
+    /// Rückgabe ist `String` statt `&'static str`: `F1`..`F24`, `A`..`Z` und
+    /// `0`..`9` sind gerechnet, nicht gelistet — für sie gäbe es keinen
+    /// statischen Namen, ohne eine zweite Liste zu pflegen.
+    pub fn vk_name(vk: u16) -> Option<String> {
+        if (VK_F1..=VK_F24).contains(&vk) {
+            return Some(format!("F{}", vk - VK_F1 + 1));
+        }
+        // VK_A..VK_Z bzw. VK_0..VK_9 sind die ASCII-Codes.
+        if let Ok(byte) = u8::try_from(vk)
+            && (byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return Some((byte as char).to_string());
+        }
+        NAMED_KEYS
+            .iter()
+            .find(|(_, code)| *code == vk)
+            .map(|(name, _)| (*name).to_string())
     }
 
     // -------------------------------------------------------------- Modifier
@@ -1964,7 +2003,9 @@ mod tests {
     /// Zustandsmaschine des Hooks — alles reine Funktionen, kein Win32-Aufruf.
     #[cfg(windows)]
     mod win {
-        use super::super::windows::{Decision, HookState, KeyEvent, ModifierState, virtual_key};
+        use super::super::windows::{
+            Decision, HookState, KeyEvent, ModifierState, virtual_key, vk_name,
+        };
         use super::super::{HotkeyEvent, Modifier, x11_keysym};
 
         const VK_F9: u16 = 0x78;
@@ -2003,6 +2044,64 @@ mod tests {
             assert_eq!(virtual_key("F0"), None);
             assert_eq!(virtual_key("F25"), None);
             assert_eq!(virtual_key("Grüße"), None);
+        }
+
+        /// Rückrichtung für den „Hotkey ändern…"-Dialog: Der Dialog sieht in
+        /// `WM_KEYDOWN` nur den Virtual-Key und schreibt daraus den
+        /// Config-Schlüssel. Was `virtual_key` erzeugt, muss `vk_name` wieder
+        /// als **denselben** kanonischen Namen liefern — sonst schriebe der
+        /// Dialog eine `config.toml`, die der nächste Start ablehnt.
+        #[test]
+        fn vk_name_is_the_inverse_of_virtual_key() {
+            for key in [
+                "F1",
+                "F9",
+                "F12",
+                "F24",
+                "A",
+                "Z",
+                "0",
+                "7",
+                "Space",
+                "Tab",
+                "Enter",
+                "Escape",
+                "Backspace",
+                "Insert",
+                "Delete",
+                "Home",
+                "End",
+                "PageUp",
+                "PageDown",
+                "Left",
+                "Up",
+                "Right",
+                "Down",
+                "ScrollLock",
+                "Pause",
+            ] {
+                let vk = virtual_key(key).unwrap_or_else(|| panic!("{key}: kein VK"));
+                assert_eq!(vk_name(vk).as_deref(), Some(key), "{key} (VK {vk:#04x})");
+            }
+            // Kleingeschriebenes kommt kanonisch zurück — genau das braucht
+            // die Config.
+            assert_eq!(vk_name(virtual_key("a").unwrap()).as_deref(), Some("A"));
+        }
+
+        /// Alles, was der Dialog nicht in eine gültige Config schreiben kann,
+        /// muss als „nicht unterstützt" erkennbar sein: Modifier-VKs,
+        /// Lock-Tasten, Maustasten, Lücken im VK-Raum.
+        #[test]
+        fn unknown_virtual_keys_have_no_config_name() {
+            for vk in [
+                0x00, 0x01, // kein VK / VK_LBUTTON
+                0x10, 0x11, 0x12, // VK_SHIFT/CONTROL/MENU
+                0x14, 0x90, // VK_CAPITAL, VK_NUMLOCK
+                0x5b, 0x5c, // VK_LWIN/VK_RWIN
+                0x88, 0xff,
+            ] {
+                assert_eq!(vk_name(vk), None, "VK {vk:#04x}");
+            }
         }
 
         /// Jeder Config-Schlüssel, den X11 kennt, muss auch einen VK haben —

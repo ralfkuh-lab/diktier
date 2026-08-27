@@ -11,6 +11,8 @@ mod daemon;
 mod download;
 mod engine;
 mod hotkey;
+#[cfg(windows)]
+mod hotkey_dialog;
 mod inject;
 mod paths;
 mod single_instance;
@@ -87,6 +89,16 @@ struct Cli {
         conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test", "tray_test"]
     )]
     record_test: Option<u32>,
+
+    /// SPIKE: „Hotkey ändern…"-Dialog öffnen; SECS > 0 schließt ihn von selbst (nur mit --foreground).
+    #[arg(
+        long,
+        value_name = "AUTOCLOSE_SECS",
+        num_args = 0..=1,
+        default_missing_value = "0",
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test", "record_test", "tray_test"]
+    )]
+    hotkey_dialog_test: Option<u32>,
 
     /// SPIKE: Tray SECS Sekunden anzeigen, Zustände rotieren (nur mit --foreground).
     #[arg(
@@ -219,6 +231,10 @@ where
         eprintln!("diktier: --tray-test nur mit --foreground (SPIKE)");
         return 2;
     }
+    if cli.hotkey_dialog_test.is_some() && !cli.foreground {
+        eprintln!("diktier: --hotkey-dialog-test nur mit --foreground (SPIKE)");
+        return 2;
+    }
     if let Some(text) = cli.inject_test {
         return inject_test(&text);
     }
@@ -230,6 +246,9 @@ where
     }
     if let Some(secs) = cli.tray_test {
         return tray_test(secs);
+    }
+    if let Some(autoclose) = cli.hotkey_dialog_test {
+        return hotkey_dialog_test(autoclose);
     }
 
     run_daemon(cli.foreground)
@@ -580,6 +599,68 @@ fn record_test(secs: u32) -> u8 {
     0
 }
 
+/// SPIKE (§4.3-Menü „Hotkey ändern…"): Dialog einmal öffnen und das Ergebnis
+/// melden — ohne Daemon, ohne Tray, ohne Modell.
+///
+/// `autoclose_secs > 0` schließt das Fenster nach der Zeit von außen (das ist
+/// ein Abbruch). Damit lässt sich der Dialog automatisiert prüfen; ohne den
+/// Wert bleibt er offen, bis jemand ihn bedient.
+#[cfg(windows)]
+fn hotkey_dialog_test(autoclose_secs: u32) -> u8 {
+    use hotkey_dialog::DialogOutcome;
+
+    eprintln!("SPIKE --hotkey-dialog-test (kein Produktionspfad)");
+    let spec = match config::load() {
+        Ok(loaded) => HotkeySpec::from_config(&loaded.config.hotkey),
+        Err(err) => {
+            eprintln!("SPIKE hotkey-dialog: Config nicht lesbar ({err}) — Default");
+            HotkeySpec::default()
+        }
+    };
+    eprintln!("SPIKE hotkey-dialog: aktuell {}", spec.describe());
+
+    if autoclose_secs > 0 {
+        eprintln!("SPIKE hotkey-dialog: schließt nach {autoclose_secs}s von selbst");
+        let delay = std::time::Duration::from_secs(u64::from(autoclose_secs));
+        if let Err(err) = std::thread::Builder::new()
+            .name("diktier-dialog-autoclose".into())
+            .spawn(move || {
+                std::thread::sleep(delay);
+                let closed = hotkey_dialog::close_open_dialog();
+                eprintln!("SPIKE hotkey-dialog: autoclose gefunden={closed}");
+            })
+        {
+            eprintln!("SPIKE hotkey-dialog: Autoclose-Thread nicht startbar: {err}");
+        }
+    }
+
+    match hotkey_dialog::ask(&spec) {
+        Ok(DialogOutcome::Applied(next)) => {
+            eprintln!("SPIKE hotkey-dialog: übernommen {}", next.describe());
+            eprintln!(
+                "SPIKE hotkey-dialog: key={:?} modifiers={:?}",
+                next.key, next.modifiers
+            );
+            0
+        }
+        Ok(DialogOutcome::Cancelled) => {
+            eprintln!("SPIKE hotkey-dialog: abgebrochen");
+            0
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            1
+        }
+    }
+}
+
+/// Linux kennt den Dialog nicht (§4.4: „Nur über Config änderbar").
+#[cfg(not(windows))]
+fn hotkey_dialog_test(_autoclose_secs: u32) -> u8 {
+    eprintln!("diktier: --hotkey-dialog-test gibt es nur unter Windows");
+    2
+}
+
 fn tray_test(secs: u32) -> u8 {
     eprintln!("SPIKE --tray-test (kein Produktionspfad)");
     if secs == 0 {
@@ -813,6 +894,12 @@ mod tests {
     #[test]
     fn tray_test_without_foreground_exits_2() {
         assert_eq!(cli_main(["diktier", "--tray-test", "5"]), 2);
+    }
+
+    #[test]
+    fn hotkey_dialog_test_without_foreground_exits_2() {
+        assert_eq!(cli_main(["diktier", "--hotkey-dialog-test"]), 2);
+        assert_eq!(cli_main(["diktier", "--hotkey-dialog-test", "5"]), 2);
     }
 
     #[test]
