@@ -103,6 +103,8 @@ pub fn x11_keysym(key: &str) -> Option<u32> {
         "Up" => 0xff52,
         "Right" => 0xff53,
         "Down" => 0xff54,
+        "ScrollLock" => 0xff14,
+        "Pause" => 0xff13,
         _ => return None,
     })
 }
@@ -977,21 +979,23 @@ mod windows {
             }
         }
         Some(match key {
-            "Space" => 0x20,     // VK_SPACE
-            "Tab" => 0x09,       // VK_TAB
-            "Enter" => 0x0d,     // VK_RETURN
-            "Escape" => 0x1b,    // VK_ESCAPE
-            "Backspace" => 0x08, // VK_BACK
-            "Insert" => 0x2d,    // VK_INSERT
-            "Delete" => 0x2e,    // VK_DELETE
-            "Home" => 0x24,      // VK_HOME
-            "End" => 0x23,       // VK_END
-            "PageUp" => 0x21,    // VK_PRIOR
-            "PageDown" => 0x22,  // VK_NEXT
-            "Left" => 0x25,      // VK_LEFT
-            "Up" => 0x26,        // VK_UP
-            "Right" => 0x27,     // VK_RIGHT
-            "Down" => 0x28,      // VK_DOWN
+            "Space" => 0x20,      // VK_SPACE
+            "Tab" => 0x09,        // VK_TAB
+            "Enter" => 0x0d,      // VK_RETURN
+            "Escape" => 0x1b,     // VK_ESCAPE
+            "Backspace" => 0x08,  // VK_BACK
+            "Insert" => 0x2d,     // VK_INSERT
+            "Delete" => 0x2e,     // VK_DELETE
+            "Home" => 0x24,       // VK_HOME
+            "End" => 0x23,        // VK_END
+            "PageUp" => 0x21,     // VK_PRIOR
+            "PageDown" => 0x22,   // VK_NEXT
+            "Left" => 0x25,       // VK_LEFT
+            "Up" => 0x26,         // VK_UP
+            "Right" => 0x27,      // VK_RIGHT
+            "Down" => 0x28,       // VK_DOWN
+            "ScrollLock" => 0x91, // VK_SCROLL
+            "Pause" => 0x13,      // VK_PAUSE
             _ => return None,
         })
     }
@@ -1844,6 +1848,8 @@ mod tests {
         assert_eq!(x11_keysym("Enter"), Some(0xff0d));
         assert_eq!(x11_keysym("PageDown"), Some(0xff56));
         assert_eq!(x11_keysym("Down"), Some(0xff54));
+        assert_eq!(x11_keysym("ScrollLock"), Some(0xff14));
+        assert_eq!(x11_keysym("Pause"), Some(0xff13));
         assert_eq!(x11_keysym("F99"), None);
         assert_eq!(x11_keysym("Grüße"), None);
     }
@@ -1992,6 +1998,8 @@ mod tests {
             assert_eq!(virtual_key("Up"), Some(0x26));
             assert_eq!(virtual_key("Right"), Some(0x27));
             assert_eq!(virtual_key("Down"), Some(0x28));
+            assert_eq!(virtual_key("ScrollLock"), Some(0x91));
+            assert_eq!(virtual_key("Pause"), Some(0x13));
             assert_eq!(virtual_key("F0"), None);
             assert_eq!(virtual_key("F25"), None);
             assert_eq!(virtual_key("Grüße"), None);
@@ -2024,6 +2032,8 @@ mod tests {
                 "Up",
                 "Right",
                 "Down",
+                "ScrollLock",
+                "Pause",
             ] {
                 assert!(x11_keysym(key).is_some(), "{key}: X11");
                 assert!(virtual_key(key).is_some(), "{key}: VK");

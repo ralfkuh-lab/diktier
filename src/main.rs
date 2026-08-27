@@ -641,13 +641,13 @@ fn tray_test(secs: u32) -> u8 {
             Ok(Some(event)) => {
                 eprintln!("SPIKE tray: event={}", event.as_str());
                 if event == TrayEvent::OpenConfigDir {
-                    match tray::open_config_dir() {
+                    match tray::open_config() {
                         Ok(()) => {
-                            if let Ok(dir) = tray::config_dir() {
-                                eprintln!("SPIKE tray: config-ordner={}", dir.display());
+                            if let Ok(path) = config::config_path() {
+                                eprintln!("SPIKE tray: config-datei={}", path.display());
                             }
                         }
-                        Err(err) => eprintln!("SPIKE tray: config-ordner: {err}"),
+                        Err(err) => eprintln!("SPIKE tray: config-datei: {err}"),
                     }
                 }
             }

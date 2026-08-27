@@ -1,8 +1,6 @@
 //! Tray-Backend (Spec §4.3). Linux: betrayer/SNI. Windows: `Shell_NotifyIconW`.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
-
 use thiserror::Error;
 
 use crate::config;
@@ -218,13 +216,6 @@ pub fn route_menu(action: MenuAction) -> Option<TrayEvent> {
     }
 }
 
-pub fn config_dir() -> Result<PathBuf, TrayError> {
-    let path = config::config_path().map_err(|e| TrayError::Failed(e.to_string()))?;
-    path.parent()
-        .map(PathBuf::from)
-        .ok_or_else(|| TrayError::Failed("Config-Pfad hat kein Elternverzeichnis".into()))
-}
-
 /// Kindprozess einsammeln, sonst bleibt er bis zum Prozessende ein Zombie
 /// (agy B1). Der Helferthread endet, sobald `xdg-open` fertig ist — auf den
 /// Rückgabewert wartet niemand, das Öffnen ist „fire and forget".
@@ -252,15 +243,23 @@ fn reap(child: std::process::Child) {
     }
 }
 
-/// Öffnet den Config-Ordner. Linux: `xdg-open`. Kein Fokusklau auf dem PTT-Pfad —
-/// nur nach explizitem Menüklick.
-pub fn open_config_dir() -> Result<(), TrayError> {
-    let dir = config_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| TrayError::Failed(e.to_string()))?;
+/// Öffnet `config.toml` in der Standard-Anwendung. Existiert die Datei noch
+/// nicht, legt die Config-Logik sie vorher mit den Defaults an. Kein Fokusklau
+/// auf dem PTT-Pfad — nur nach explizitem Menüklick.
+///
+/// Der Daemon liest die Config nur beim Start: Änderungen greifen erst nach
+/// einem Neustart, darauf weist die aufrufende Log-Zeile hin.
+pub fn open_config() -> Result<(), TrayError> {
+    let path = config::config_path().map_err(|e| TrayError::Failed(e.to_string()))?;
+    if !path.exists() {
+        // Schreibt die Default-Config atomar (inklusive Elternverzeichnis) —
+        // sonst öffnet der Klick ins Leere.
+        config::load_from(&path).map_err(|e| TrayError::Failed(e.to_string()))?;
+    }
     #[cfg(target_os = "linux")]
     {
         let child = std::process::Command::new("xdg-open")
-            .arg(&dir)
+            .arg(&path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -270,13 +269,14 @@ pub fn open_config_dir() -> Result<(), TrayError> {
     }
     #[cfg(windows)]
     {
-        // `explorer.exe <dir>` — kein Warten: der Explorer meldet regelmäßig
-        // Exitcode 1, obwohl das Fenster aufgeht, und Windows kennt keine
-        // Zombies, ein fallengelassenes `Child` kostet nur das Handle bis zum
-        // Prozessende. Nur nach explizitem Menüklick, nie auf dem PTT-Pfad
+        // `explorer.exe <datei>` öffnet mit der Standard-Anwendung (wie ein
+        // Doppelklick, ohne Konsolenblitzer). Kein Warten: der Explorer meldet
+        // regelmäßig Exitcode 1, obwohl das Fenster aufgeht, und Windows kennt
+        // keine Zombies, ein fallengelassenes `Child` kostet nur das Handle bis
+        // zum Prozessende. Nur nach explizitem Menüklick, nie auf dem PTT-Pfad
         // (§4.2).
         std::process::Command::new("explorer.exe")
-            .arg(&dir)
+            .arg(&path)
             .spawn()
             .map_err(|e| TrayError::Failed(format!("explorer.exe: {e}")))?;
     }
@@ -351,7 +351,7 @@ mod linux {
             MenuItem::button(tooltip_text(runtime, model_key), MenuAction::Status),
             MenuItem::separator(),
             MenuItem::button(pause_menu_label(runtime.paused), MenuAction::TogglePause),
-            MenuItem::button("Config-Ordner öffnen", MenuAction::OpenConfigDir),
+            MenuItem::button("Konfiguration bearbeiten", MenuAction::OpenConfigDir),
             MenuItem::separator(),
             MenuItem::button("Beenden", MenuAction::Quit),
         ])
@@ -929,7 +929,7 @@ mod windows {
 
         let status = wide(&status_line);
         let pause = wide(pause_menu_label(paused));
-        let config = wide("Config-Ordner öffnen");
+        let config = wide("Konfiguration bearbeiten");
         let quit = wide("Beenden");
         // SAFETY: `menu` ist gültig, alle Textzeiger sind NUL-terminiert und
         // leben bis nach `TrackPopupMenu`; `AppendMenuW` kopiert sie ohnehin.

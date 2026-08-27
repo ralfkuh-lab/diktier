@@ -1,158 +1,131 @@
 # Diktier
 
-Lokales Push-to-Talk-Diktat für Windows und Linux Mint. Halten, sprechen,
-loslassen — der Text landet am Cursor. Läuft offline mit NVIDIA Parakeet.
+Lokales Push-to-Talk-Diktat für **Windows**. Taste halten, sprechen,
+loslassen — der Text landet am Cursor. Läuft komplett offline mit NVIDIA
+Parakeet (TDT 0.6B v3), kein Cloud-Dienst, kein Konto.
 
-Status: **Linux fertig** (Daemon, Tray, Hotkey, Paste, Modell-Download,
-Autostart, Release-Bundle). **Windows in Arbeit** — der Code hat die
-Plattformschichten, aber Tray, Inject und Hotkey sind dort noch `cfg`-Stubs.
-Verbindlich ist [docs/SPEC.md](docs/SPEC.md); Messwerte und Gate-Protokolle
-stehen in [docs/SPIKES.md](docs/SPIKES.md).
+Status: **läuft auf Windows 11** (Hotkey, Tray, Einfügen am Cursor,
+Modell-Download, Autostart). Privates Werkzeug, bewusst klein gehalten. Es
+gibt noch kein fertiges Release-Paket — Bauen aus dem Quellcode, siehe unten.
 
-## Zielplattformen (v1)
+Linux (Mint/X11) war die Ausgangsplattform und ist im Code noch enthalten,
+wird aber nicht mehr weiterentwickelt.
 
-- Windows 10 22H2+ / Windows 11, x64
-- Linux Mint 22.x, Cinnamon, **X11**, x86_64
+## Voraussetzungen
 
-Cinnamon/Wayland ist in v1 kein Supportziel.
+- Windows 10 22H2 oder Windows 11, x64
+- Ein Mikrofon (Standard-Aufnahmegerät von Windows)
+- Beim ersten Start Internet für den einmaligen Modell-Download (~640 MB)
 
-Nicht das gleiche Tool wie [Voxtype](https://voxtype.io) auf Omarchy — Diktier
-soll dieselbe Erkennungsqualität auf den übrigen Rechnern liefern.
+Kein Admin nötig. Diktier fügt **nicht** in als Administrator gestartete
+Programme ein (Windows-Schutz UIPI) — der Text liegt dann in der
+Zwischenablage.
 
-## Installation (Linux)
+## Bauen und starten
 
-Das Release ist ein **Bundle**, kein Einzelprogramm: Binary, ONNX Runtime,
-Lizenzen und `versions.toml` gehören zusammen und bleiben in einem Ordner.
+Rust-Toolchain (MSVC) installieren, dann:
 
-```bash
-tar -xzf diktier-<version>-linux-x64.tar.gz
-cd diktier-<version>-linux-x64
-./diktier --install-autostart   # Eintrag in ~/.config/autostart/
-./diktier --foreground          # erster Start, Logs im Terminal
+```powershell
+scripts\fetch-ort.ps1          # lädt lib\onnxruntime.dll (ONNX Runtime 1.28.0)
+cargo build --release
+.\target\release\diktier.exe --foreground   # erster Start mit Log im Terminal
 ```
 
-Der Ordner darf liegen, wo er will (`~/opt/diktier`, ein USB-Stick, `/opt`) —
-die ONNX Runtime wird immer aus `lib/` **neben der Binary** geladen, nie aus
-dem System und nie über `PATH` oder `LD_LIBRARY_PATH`. Wird der Ordner später
-verschoben, genügt ein erneutes `./diktier --install-autostart`: der bestehende
-Eintrag wird aktualisiert, nicht verdoppelt.
+Die `onnxruntime.dll` muss in `lib\` **neben der Exe** liegen; das Skript
+legt sie auch nach `target\release\lib\`. Der Ordner mit Exe + `lib\` ist
+portabel und darf verschoben werden.
 
-Voraussetzungen: X11-Sitzung (Cinnamon), ein Tray, der StatusNotifierItem
-spricht, und `libasound2t64` — auf einem Desktop mit Audio ohnehin vorhanden.
-Alles Weitere steckt im Bundle; Details in
-[LICENSES/THIRD-PARTY.md](LICENSES/THIRD-PARTY.md).
+Beim ersten Start lädt Diktier das Sprachmodell nach
+`%LOCALAPPDATA%\diktier\models\parakeet-tdt-0.6b-v3-int8\` (vier Dateien,
+jede gegen Größe und SHA-256 geprüft; Tray zeigt „Lade Modell …").
+Danach ist der Start in etwa zwei Sekunden erledigt.
 
-### Erster Start: Modell-Download
+Autostart mit Windows:
 
-Beim ersten Start fehlt das Sprachmodell. Diktier lädt es dann selbst nach
-`~/.local/share/diktier/models/parakeet-tdt-0.6b-v3-int8/`:
+```powershell
+.\target\release\diktier.exe --install-autostart   # Eintrag im Startup-Ordner
+.\target\release\diktier.exe --remove-autostart
+```
 
-- **rund 650 MB**, vier Dateien, einmalig
-- Quelle: [`istupakov/parakeet-tdt-0.6b-v3-onnx`](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx),
-  feste Revision — die URLs stehen in `src/models.toml`
-- jede Datei wird gegen Größe **und** SHA-256 geprüft, bevor sie gültig wird
-- der Tray zeigt währenddessen „Lade Modell …", der Fortschritt steht im Log
-- Lizenz der Artefakte: CC-BY-4.0, Attribution in
-  [LICENSES/NOTICE-parakeet.md](LICENSES/NOTICE-parakeet.md)
-
-Danach startet Diktier in rund zwei Sekunden. Wer die Dateien schon hat (etwa
-von einem anderen Rechner), kopiert sie einfach in dieses Verzeichnis — der
-Download entfällt dann.
+Wird die Exe später verschoben, genügt ein erneutes `--install-autostart`.
 
 ## Das erste Diktat
 
-1. Tray-Symbol abwarten, bis der Tooltip `idle` zeigt.
-2. Cursor dorthin setzen, wo der Text hin soll (Editor, Terminal, Browser).
+1. Tray-Symbol abwarten, bis der Tooltip `idle` zeigt. Tipp: Das Symbol
+   einmal aus dem Überlauf (`^`) in die Taskleiste ziehen, damit es immer
+   sichtbar ist — Windows merkt sich das.
+2. Cursor dorthin setzen, wo der Text hin soll (Editor, Browser, Teams …).
 3. **F9 halten**, sprechen, loslassen.
-4. Der Text wird über die Zwischenablage am Cursor eingefügt; der vorherige
-   Clipboard-Inhalt wird kurz darauf wiederhergestellt.
+4. Der Text wird über die Zwischenablage eingefügt; der vorherige
+   Clipboard-Inhalt wird direkt danach wiederhergestellt.
 
-Der Fokus wandert dabei nie: Diktier öffnet auf dem Diktatpfad kein Fenster.
-Wechselst du während der Aufnahme das Fenster, wird **nicht** eingefügt — der
-Text liegt dann in der Zwischenablage und du fügst ihn selbst ein.
+Diktier öffnet beim Diktieren kein Fenster und wechselt den Fokus nie.
+Wechselst du während der Aufnahme das Fenster, wird **nicht** eingefügt —
+der Text liegt dann in der Zwischenablage (Strg+V).
 
-Ein Linksklick auf das Tray-Symbol startet und stoppt eine Aufnahme ebenfalls;
-dieser Weg fügt bewusst nichts ein, sondern legt den Text nur in die
-Zwischenablage. Das Tray-Menü kennt außerdem Pause, „Config-Ordner öffnen"
-und Beenden.
+Tray:
+- **Linksklick**: Aufnahme starten/stoppen ohne Hotkey — Text landet nur in
+  der Zwischenablage.
+- **Rechtsklick**: Status, Hotkey pausieren, Konfiguration bearbeiten,
+  Beenden.
+
+Das Mikrofon bleibt im Hintergrund geöffnet, damit die Aufnahme sofort
+startet — Windows zeigt deshalb dauerhaft „Mikrofon wird verwendet von
+diktier". Andere Programme (Teams, Zoom) können das Mikrofon trotzdem
+gleichzeitig nutzen; außerhalb einer Aufnahme wird nichts gespeichert.
 
 ## Konfiguration
 
-`~/.config/diktier/config.toml` wird beim ersten Start mit den Defaults
-angelegt. Unbekannte Schlüssel und ungültige Werte werden gemeldet, nicht
-stillschweigend übernommen.
+`%APPDATA%\diktier\config.toml` (Tray → „Konfiguration bearbeiten"). Für die
+meisten reicht der Hotkey:
 
 ```toml
 [hotkey]
-key = "F9"              # Push-to-Talk-Taste
-modifiers = []          # z. B. ["Ctrl", "Alt"]
-
-[audio]
-device = "default"
-max_duration_secs = 60  # harte Obergrenze je Aufnahme
-
-[engine]
-model = "parakeet-tdt-0.6b-v3-int8"
-threads = 0             # 0 = Runtime-Default
-
-[output]
-mode = "paste"                  # "paste" | "type"
-paste_shortcut = "auto"         # "auto" | "ctrl_v" | "ctrl_shift_v" | "shift_insert"
-leading_space = true            # führendes Leerzeichen vor dem Text
-restore_clipboard = true
-restore_clipboard_delay_ms = 200
-
-[tray]
-show_notifications_on_error = true
+key = "F9"          # z. B. "F9", "ScrollLock", "Pause", "F12"
+modifiers = []      # z. B. ["Ctrl", "Alt"] — Hotkey ist dann Ctrl+Alt+<key>
 ```
 
-Änderungen wirken nach einem Neustart des Daemons.
+Gute Push-to-Talk-Tasten sind solche, die sonst nichts tun: `ScrollLock`
+(Rollen), `Pause`, hohe F-Tasten. Der Hotkey erreicht das aktive Programm
+nie — F9 togglet also keinen Breakpoint in VS Code.
 
-## Troubleshooting
+Weitere Schlüssel (selten nötig): `[audio] device`, `max_duration_secs`
+(Obergrenze je Aufnahme, 60 s), `[output] leading_space` (führendes
+Leerzeichen, an), `paste_shortcut` (`auto` erkennt Windows Terminal und nimmt
+dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
 
-**F9 ist schon belegt.** Der Tray zeigt `error`, das Log nennt
-„Hotkey-Registrierung". Eine andere Taste in `config.toml` eintragen und
-Diktier neu starten. Der Tray-Linksklick funktioniert auch ohne Hotkey.
+Änderungen gelten nach einem Neustart von Diktier.
 
-**„Diktier v1 unterstützt nur X11" beim Start.** Die Sitzung läuft unter
-Wayland. In der Anmeldemaske eine X11-Sitzung wählen (`echo $XDG_SESSION_TYPE`
-zeigt `x11`, wenn es passt).
+## Wenn etwas nicht klappt
 
-**Der Text erscheint nicht, liegt aber in der Zwischenablage.** Das Zielfenster
-hat den Paste abgelehnt oder der Fokus hat gewechselt — Diktier verwirft in dem
-Fall nichts, sondern übergibt an die Zwischenablage.
+- **Text erscheint nicht, liegt aber in der Zwischenablage.** Fokus hat
+  gewechselt, oder das Zielprogramm läuft als Administrator. Strg+V drücken.
+- **Nichts wird erkannt.** Pegel zu leise oder Mikrofon gemutet (Headset-
+  Taste). Mit `--foreground` zeigt das Log `rms=…`; Werte unter 0,0075
+  gelten als Stille.
+- **Hotkey geht nicht.** Tray zeigt `error`, Tooltip nennt den Grund. Andere
+  Taste eintragen, neu starten. Linksklick im Tray geht immer.
+- **„läuft bereits".** Es läuft schon eine Instanz (Autostart). Der zweite
+  Start endet absichtlich mit Exit 0.
+- **Log:** `%LOCALAPPDATA%\diktier\diktier.log` (rotiert bei 2 MiB). Dort
+  stehen nie Transkripte oder Clipboard-Inhalte.
 
-**„diktier läuft bereits".** Es läuft schon eine Instanz (Autostart). Der zweite
-Start endet absichtlich wirkungslos mit Exit 0.
+## Technik in einem Absatz
 
-**Wo steht das Log?** `~/.local/state/diktier/diktier.log`, rotiert bei 2 MiB
-nach `diktier.log.1`. Transkripte, Zwischenablage-Inhalte und Fenstertitel
-stehen dort **nie** drin. Mit `--foreground` läuft dasselbe Log im Terminal mit.
-
-**Autostart wieder loswerden:** `./diktier --remove-autostart`.
-
-## Aus dem Quellcode bauen
-
-```bash
-scripts/fetch-ort.sh     # lädt lib/libonnxruntime.so (ONNX Runtime 1.28.0)
-cargo build --release
-scripts/release.sh       # baut dist/diktier-<version>-linux-x64[.tar.gz]
-```
-
-`scripts/release.sh` erzeugt das Bundle aus [docs/SPEC.md](docs/SPEC.md) §11
-samt `versions.toml` (App-, ORT-, Crate-, Modell- und Toolchain-Versionen).
+Rust, ohne GUI-Framework. Hotkey über einen `WH_KEYBOARD_LL`-Hook,
+Einfügen über Clipboard + `SendInput` (Strg+V) mit Wiederherstellung des
+alten Inhalts, Tray über `Shell_NotifyIcon`. Spracherkennung mit
+[parakeet-rs](https://crates.io/crates/parakeet-rs) auf der ONNX Runtime
+(CPU, INT8) — auf einem aktuellen Laptop rund 0,1 s pro Diktat. Details und
+Entscheidungen: [docs/SPEC.md](docs/SPEC.md), Windows-Portierung:
+[docs/windows-plan.md](docs/windows-plan.md).
 
 ## Lizenz
 
-Die Anwendung steht unter MIT. Siehe [LICENSE](LICENSE).
-
-Die mitgelieferten bzw. heruntergeladenen **Parakeet-Modellartefakte**
-(NVIDIA Parakeet TDT 0.6B v3, ONNX-INT8-Konvertierung
+Diktier: MIT ([LICENSE](LICENSE)). Modell: NVIDIA Parakeet TDT 0.6B v3,
+ONNX-INT8-Konvertierung
 [istupakov/parakeet-tdt-0.6b-v3-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx),
-Revision `8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce`) stehen unter
-[CC-BY-4.0](LICENSES/CC-BY-4.0.txt). Attribution und Herkunft:
-[LICENSES/NOTICE-parakeet.md](LICENSES/NOTICE-parakeet.md).
-
-Die mitgelieferte **ONNX Runtime** steht unter MIT
-([LICENSES/ONNXRUNTIME-LICENSE.txt](LICENSES/ONNXRUNTIME-LICENSE.txt)).
-Weitere Fremdbestandteile: [LICENSES/THIRD-PARTY.md](LICENSES/THIRD-PARTY.md).
+[CC-BY-4.0](LICENSES/CC-BY-4.0.txt), Attribution in
+[LICENSES/NOTICE-parakeet.md](LICENSES/NOTICE-parakeet.md). ONNX Runtime:
+MIT ([LICENSES/ONNXRUNTIME-LICENSE.txt](LICENSES/ONNXRUNTIME-LICENSE.txt)).
+Weitere Bestandteile: [LICENSES/THIRD-PARTY.md](LICENSES/THIRD-PARTY.md).

@@ -146,9 +146,9 @@ fn config_error_mode(message: String, log: &Arc<Logger>) -> u8 {
         }
         match rx.recv_timeout(TICK) {
             Ok(Msg::Event(Event::QuitRequested)) => break,
-            Ok(Msg::OpenConfigDir) => match tray::open_config_dir() {
-                Ok(()) => log.info("Config-Ordner geöffnet"),
-                Err(err) => log.warn(format!("Config-Ordner: {err}")),
+            Ok(Msg::OpenConfigDir) => match tray::open_config() {
+                Ok(()) => log.info("Konfiguration geöffnet — Änderungen gelten nach Neustart"),
+                Err(err) => log.warn(format!("Konfiguration öffnen: {err}")),
             },
             Ok(Msg::TrayLost(err)) => {
                 log.error(format!("Tray verloren: {err}"));
@@ -782,9 +782,11 @@ fn handle_msg(
             daemon.log.error(format!("Tray verloren: {message}"));
             return Flow::Stop(1);
         }
-        Msg::OpenConfigDir => match tray::open_config_dir() {
-            Ok(()) => daemon.log.info("Config-Ordner geöffnet"),
-            Err(err) => daemon.log.warn(format!("Config-Ordner: {err}")),
+        Msg::OpenConfigDir => match tray::open_config() {
+            Ok(()) => daemon
+                .log
+                .info("Konfiguration geöffnet — Änderungen gelten nach Neustart"),
+            Err(err) => daemon.log.warn(format!("Konfiguration öffnen: {err}")),
         },
     }
     Flow::Continue

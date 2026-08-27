@@ -10,7 +10,7 @@ pub const DEFAULT_MODEL: &str = "parakeet-tdt-0.6b-v3-int8";
 
 /// Inhalt der Default-Datei, kommentiert wie in Spec §8.
 pub const DEFAULT_TOML: &str = r#"[hotkey]
-key = "F9"
+key = "F9"              # z. B. "F9", "ScrollLock", "Pause"
 modifiers = []
 mode = "push_to_talk"   # v1 nur dieser Wert
 
@@ -62,6 +62,8 @@ const NAMED_KEYS: &[&str] = &[
     "Right",
     "Up",
     "Down",
+    "ScrollLock",
+    "Pause",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -548,6 +550,10 @@ fn canonical_key(raw: &str) -> Option<String> {
             return Some(upper);
         }
     }
+    // Deutsche Tastaturbeschriftung: „Rollen" ist ScrollLock.
+    if trimmed.eq_ignore_ascii_case("Rollen") {
+        return Some("ScrollLock".to_string());
+    }
     for name in NAMED_KEYS {
         if name.eq_ignore_ascii_case(trimmed) {
             return Some((*name).to_string());
@@ -605,6 +611,22 @@ mod tests {
     fn fatal_toml_syntax() {
         let err = parse_toml("[[[not toml").unwrap_err();
         assert!(matches!(err, ConfigError::Syntax(_)), "got {err:?}");
+    }
+
+    /// Die „tut sonst nichts"-Tasten sind gültige Hotkeys; „Rollen" ist die
+    /// deutsche Beschriftung von ScrollLock.
+    #[test]
+    fn lock_keys_are_valid_hotkeys() {
+        for (raw, expected) in [
+            ("ScrollLock", "ScrollLock"),
+            ("scrolllock", "ScrollLock"),
+            ("Rollen", "ScrollLock"),
+            ("pause", "Pause"),
+        ] {
+            let loaded = parse_toml(&format!("[hotkey]\nkey = \"{raw}\"\n")).unwrap();
+            assert_eq!(loaded.config.hotkey.key, expected, "{raw}");
+            assert!(loaded.warnings.is_empty(), "{raw}: {:?}", loaded.warnings);
+        }
     }
 
     #[test]
