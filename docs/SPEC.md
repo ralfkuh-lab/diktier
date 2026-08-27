@@ -88,6 +88,13 @@ Fehlern.
 Diktier aktiviert niemals selbst ein Fenster. Zweiter-Instanz-Start
 ebenfalls nicht.
 
+Einzige, enge Ausnahme (Windows, Entscheidung 2026-08-27, Phase 5): Nach
+einem **expliziten Rechtsklick** des Nutzers auf das Tray-Icon darf das
+**unsichtbare** Menü-Owner-Fenster per `SetForegroundWindow` aktiviert
+werden — Win32 schließt das Popup-Menü sonst nicht. Danach `WM_NULL` an das
+Owner-Fenster und `NIM_SETFOCUS`. Der PTT-/Inject-Pfad durchläuft diesen Weg
+nie.
+
 ### 4.3 Tray
 
 Crate: `betrayer`, Version in `Cargo.lock` pinnen. Fallback hinter
@@ -241,7 +248,9 @@ Regeln:
 
 Kein PID-File.
 
-- Windows: per-user Named Mutex.
+- Windows: Named Mutex **pro interaktiver Session** (`Local\`-Namensraum;
+  präzisiert 2026-08-27 — Tray und Hotkey sind ohnehin sessiongebunden,
+  eine zweite RDP-/Fast-User-Switching-Session bekommt ihre eigene Instanz).
 - Linux: gehaltener advisory `flock` unter `$XDG_RUNTIME_DIR/diktier.lock`,
   Fallback `$XDG_STATE_HOME/diktier/diktier.lock`. Liegengebliebene Datei
   ist egal, allein der Lock zählt.
