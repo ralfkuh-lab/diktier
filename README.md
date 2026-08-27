@@ -5,8 +5,7 @@ loslassen — der Text landet am Cursor. Läuft komplett offline mit NVIDIA
 Parakeet (TDT 0.6B v3), kein Cloud-Dienst, kein Konto.
 
 Status: **läuft auf Windows 11** (Hotkey, Tray, Einfügen am Cursor,
-Modell-Download, Autostart). Privates Werkzeug, bewusst klein gehalten. Es
-gibt noch kein fertiges Release-Paket — Bauen aus dem Quellcode, siehe unten.
+Modell-Download, Autostart). Privates Werkzeug, bewusst klein gehalten.
 
 Linux (Mint/X11) war die Ausgangsplattform und ist im Code noch enthalten,
 wird aber nicht mehr weiterentwickelt.
@@ -20,6 +19,35 @@ wird aber nicht mehr weiterentwickelt.
 Kein Admin nötig. Diktier fügt **nicht** in als Administrator gestartete
 Programme ein (Windows-Schutz UIPI) — der Text liegt dann in der
 Zwischenablage.
+
+## Installation
+
+Die Setup-Exe (`Diktier_<version>_x64-setup.exe`) aus den Releases herunterladen
+und starten. Sie ist **nicht signiert** — Windows SmartScreen meldet deshalb
+„Der Computer wurde durch Windows geschützt" und „Unbekannter Herausgeber":
+
+> **Weitere Informationen** → **Trotzdem ausführen**
+
+Der Installer braucht keine Administratorrechte und macht:
+
+- Programm, `lib\onnxruntime.dll`, Lizenzen und `versions.toml` nach
+  `%LOCALAPPDATA%\Programs\Diktier`
+- eine Verknüpfung im Startmenü (optional zusätzlich auf dem Desktop)
+- auf Wunsch den Autostart-Eintrag („Mit Windows starten", vorausgewählt)
+- einen Eintrag in „Apps & Features" für die Deinstallation
+
+Ein laufendes Diktier wird vor dem Kopieren beendet; danach kann es direkt von
+der letzten Seite des Installers aus starten. Das Sprachmodell ist **nicht**
+im Setup enthalten — es wird beim ersten Start geladen (siehe unten).
+
+**Deinstallation**: Windows-Einstellungen → „Apps" → „Installierte Apps" →
+Diktier → Deinstallieren. Am Ende fragt der Uninstaller, ob auch das
+heruntergeladene Sprachmodell und die Einstellungen weg sollen (~650 MB in
+`%LOCALAPPDATA%\diktier` und `%APPDATA%\diktier`).
+
+Wer lieber nichts installiert: das Zip `diktier-<version>-win-x64.zip` aus
+denselben Releases irgendwohin entpacken und `diktier.exe` starten — der
+Ordner ist portabel, solange `lib\` daneben bleibt.
 
 ## Bauen und starten
 
@@ -49,6 +77,20 @@ Autostart mit Windows:
 
 Wird die Exe später verschoben, genügt ein erneutes `--install-autostart`.
 
+Release-Paket bauen (Bundle, Zip und Setup-Exe in `dist\`):
+
+```powershell
+scripts\release.ps1
+```
+
+Das Skript liest die Version aus `Cargo.toml`, baut mit `--locked`, legt
+`dist\diktier-<version>-win-x64\` samt `versions.toml` an, zippt es und ruft
+`makensis` mit `installer\diktier.nsi` auf (NSIS 3.x; gefunden wird
+`%LOCALAPPDATA%\tauri\NSIS\makensis.exe`, `makensis` im `PATH` oder
+`%ProgramFiles(x86)%\NSIS`). Mit `-TargetDir target-dev` baut es neben einem
+laufenden Daemon, `-SkipInstaller` lässt das Setup weg. Das Exe-Icon kommt aus
+`assets\diktier.ico` (neu erzeugen: `python scripts\make-icon.py`).
+
 ## Das erste Diktat
 
 1. Tray-Symbol abwarten, bis der Tooltip `idle` zeigt. Tipp: Das Symbol
@@ -66,8 +108,9 @@ der Text liegt dann in der Zwischenablage (Strg+V).
 Tray:
 - **Linksklick**: Aufnahme starten/stoppen ohne Hotkey — Text landet nur in
   der Zwischenablage.
-- **Rechtsklick**: Status, Hotkey pausieren, Konfiguration bearbeiten,
-  Beenden.
+- **Rechtsklick**: Status, Hotkey pausieren, **Mit Windows starten**
+  (Häkchen = Autostart-Eintrag vorhanden; Klick legt ihn an bzw. entfernt
+  ihn), Hotkey ändern…, Konfiguration bearbeiten, Beenden.
 
 Das Mikrofon bleibt im Hintergrund geöffnet, damit die Aufnahme sofort
 startet — Windows zeigt deshalb dauerhaft „Mikrofon wird verwendet von

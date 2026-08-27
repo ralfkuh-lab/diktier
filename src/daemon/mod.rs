@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use crate::autostart;
 use crate::config::{self, ConfigError};
 use crate::download::{self, ArtifactManifest, load_manifest};
 use crate::hotkey::HotkeySpec;
@@ -159,6 +160,9 @@ fn config_error_mode(message: String, log: &Arc<Logger>) -> u8 {
             Ok(Msg::ChangeHotkey) => {
                 log.warn("Hotkey ändern: erst die Config reparieren, dann neu starten")
             }
+            // §9: Der Autostart hängt nicht an der Config — der Menüpunkt
+            // bleibt auch im Fehlerzustand bedienbar.
+            Ok(Msg::ToggleAutostart) => toggle_autostart(&log),
             // Pause/Tray-Click haben ohne Engine keine Wirkung.
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {}
@@ -917,10 +921,36 @@ fn handle_msg(
             Err(err) => daemon.log.warn(format!("Konfiguration öffnen: {err}")),
         },
         Msg::ChangeHotkey => daemon.open_hotkey_dialog(),
+        Msg::ToggleAutostart => toggle_autostart(&daemon.log),
         #[cfg(windows)]
         Msg::HotkeyChanged(result) => daemon.finish_hotkey_dialog(result),
     }
     Flow::Continue
+}
+
+/// §9-Menüpunkt „Mit Windows starten": vorhandenen Eintrag entfernen, sonst
+/// anlegen. Beide Richtungen sind idempotent, den Zustand liest das Menü beim
+/// nächsten Öffnen frisch aus dem Startup-Ordner.
+fn toggle_autostart(log: &Logger) {
+    if autostart::is_installed() {
+        match autostart::remove() {
+            Ok((outcome, path)) => log.info(format!(
+                "Mit Windows starten: aus — Autostart {} ({})",
+                outcome.as_str(),
+                path.display()
+            )),
+            Err(err) => log.error(format!("Autostart entfernen: {err}")),
+        }
+    } else {
+        match autostart::install() {
+            Ok((outcome, path)) => log.info(format!(
+                "Mit Windows starten: an — Autostart {} ({})",
+                outcome.as_str(),
+                path.display()
+            )),
+            Err(err) => log.error(format!("Autostart anlegen: {err}")),
+        }
+    }
 }
 
 fn audio_duration(samples: usize) -> Duration {

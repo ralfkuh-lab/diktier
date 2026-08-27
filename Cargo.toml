@@ -178,3 +178,12 @@ windows-sys = { version = "=0.61.2", features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+# Phase 5, Paket F: Exe-Icon und Versionsressource (build.rs).
+# winresource 0.1.31 ist ein reiner Wrapper um `rc.exe` aus dem Windows SDK
+# (bzw. `llvm-rc`); vier neue Lock-Knoten (winresource, toml 1.x,
+# serde_spanned, toml_writer), kein Code zur Laufzeit. Host-cfg, weil die
+# Ressource nur beim Bauen auf Windows entsteht — Linux baut ohne diesen Zweig.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"
+

@@ -50,6 +50,9 @@ pub enum Msg {
     /// §4.3-Menü „Hotkey ändern…" — kein Kern-Event, der Daemon öffnet den
     /// Dialog (Windows) bzw. meldet, dass es ihn nicht gibt (Linux).
     ChangeHotkey,
+    /// §9-Menüpunkt „Mit Windows starten" — kein Kern-Event, der Daemon legt
+    /// den Autostart-Eintrag an bzw. entfernt ihn.
+    ToggleAutostart,
     /// Der Hotkey-Dialog ist zu. `Ok(None)` = abgebrochen, `Ok(Some(spec))` =
     /// übernommen, `Err` = das Fenster kam gar nicht erst hoch.
     #[cfg(windows)]
@@ -117,7 +120,7 @@ pub fn tray_event_to_core(event: TrayEvent) -> Option<Event> {
         TrayEvent::LeftClick => Some(Event::TrayClickToggle),
         TrayEvent::TogglePause => Some(Event::PauseToggle),
         TrayEvent::Quit => Some(Event::QuitRequested),
-        TrayEvent::OpenConfigDir | TrayEvent::ChangeHotkey => None,
+        TrayEvent::OpenConfigDir | TrayEvent::ChangeHotkey | TrayEvent::ToggleAutostart => None,
     }
 }
 
@@ -1201,6 +1204,7 @@ fn tray_loop(
                 let msg = match tray_event_to_core(event) {
                     Some(core) => Msg::Event(core),
                     None if event == TrayEvent::ChangeHotkey => Msg::ChangeHotkey,
+                    None if event == TrayEvent::ToggleAutostart => Msg::ToggleAutostart,
                     None => Msg::OpenConfigDir,
                 };
                 if out.send(msg).is_err() {
@@ -1242,6 +1246,11 @@ mod tests {
             tray_event_to_core(TrayEvent::OpenConfigDir),
             None,
             "Config-Ordner ist Wiring-Aktion, kein Kern-Event"
+        );
+        assert_eq!(
+            tray_event_to_core(TrayEvent::ToggleAutostart),
+            None,
+            "Autostart ist Wiring-Aktion, kein Kern-Event"
         );
     }
 

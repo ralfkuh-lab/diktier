@@ -98,6 +98,18 @@ pub fn remove() -> Result<(RemoveOutcome, PathBuf), AutostartError> {
     Ok((outcome, path))
 }
 
+/// Gibt es den eigenen Autostart-Eintrag? Für das Häkchen im Tray-Menü
+/// (Phase 5, Paket F).
+///
+/// Bewusst `bool` statt `Result`: Der Aufrufer ist ein Menüaufbau, der keinen
+/// Fehlerkanal hat. Ist der Pfad nicht ermittelbar, gibt es auch keinen
+/// Eintrag — und der Klick darauf meldet den Fehler dann ordentlich.
+pub fn is_installed() -> bool {
+    paths::autostart_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
 fn current_exe() -> Result<PathBuf, AutostartError> {
     std::env::current_exe().map_err(AutostartError::Exe)
 }

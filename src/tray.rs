@@ -16,6 +16,11 @@ pub enum TrayEvent {
     /// das Ereignis selbst bleibt plattformneutral (der Wiring-Code darf es
     /// auf beiden Seiten kennen).
     ChangeHotkey,
+    /// §9 + Phase 5: „Mit Windows starten" — Häkchen im Menü, Klick legt den
+    /// Autostart-Eintrag an bzw. entfernt ihn. Linux bietet den Punkt nicht an
+    /// (dort ist der Desktop-Entry Sache der Sitzung), das Ereignis bleibt aber
+    /// plattformneutral.
+    ToggleAutostart,
     OpenConfigDir,
     Quit,
 }
@@ -26,6 +31,7 @@ impl TrayEvent {
             Self::LeftClick => "left-click",
             Self::TogglePause => "toggle-pause",
             Self::ChangeHotkey => "change-hotkey",
+            Self::ToggleAutostart => "toggle-autostart",
             Self::OpenConfigDir => "open-config-dir",
             Self::Quit => "quit",
         }
@@ -76,6 +82,8 @@ pub enum MenuAction {
     /// Nur im Windows-Menü (§4.4-Dialog); Linux hat keinen Dialog und
     /// deshalb auch keinen Eintrag.
     ChangeHotkey,
+    /// Nur im Windows-Menü (§9); mit Häkchen, wenn der Eintrag existiert.
+    ToggleAutostart,
     OpenConfigDir,
     Quit,
 }
@@ -220,6 +228,7 @@ pub fn route_menu(action: MenuAction) -> Option<TrayEvent> {
         MenuAction::Status => None,
         MenuAction::TogglePause => Some(TrayEvent::TogglePause),
         MenuAction::ChangeHotkey => Some(TrayEvent::ChangeHotkey),
+        MenuAction::ToggleAutostart => Some(TrayEvent::ToggleAutostart),
         MenuAction::OpenConfigDir => Some(TrayEvent::OpenConfigDir),
         MenuAction::Quit => Some(TrayEvent::Quit),
     }
@@ -463,15 +472,16 @@ mod windows {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CREATESTRUCTW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
         DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-        GetSystemMetrics, GetWindowLongPtrW, HICON, ICONINFO, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-        MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
-        SM_CXSMICON, SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON, TrackPopupMenu, UnregisterClassW, WM_APP, WM_CONTEXTMENU, WM_ENDSESSION,
-        WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION, WNDCLASSW, WS_EX_TOOLWINDOW,
-        WS_POPUP,
+        GetSystemMetrics, GetWindowLongPtrW, HICON, ICONINFO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
+        MF_STRING, MF_UNCHECKED, MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW,
+        RegisterWindowMessageW, SM_CXSMICON, SetForegroundWindow, SetWindowLongPtrW, TPM_NONOTIFY,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, UnregisterClassW, WM_APP, WM_CONTEXTMENU,
+        WM_ENDSESSION, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_QUERYENDSESSION, WNDCLASSW,
+        WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     use super::*;
+    use crate::autostart;
 
     /// `NIN_KEYSELECT` (`WM_USER + 1`) fehlt in windows-sys 0.61, `NIN_SELECT`
     /// (`WM_USER + 0`) gibt es. Der Wert ist stabile `shellapi.h`-ABI — dieselbe
@@ -503,6 +513,7 @@ mod windows {
     const MENU_OPEN_CONFIG: u32 = 1002;
     const MENU_QUIT: u32 = 1003;
     const MENU_CHANGE_HOTKEY: u32 = 1004;
+    const MENU_TOGGLE_AUTOSTART: u32 = 1005;
 
     /// Geschlossenes Mapping der Menü-IDs (§4.3). Unbekannte IDs — auch die `0`
     /// für „Menü ohne Auswahl geschlossen" — ergeben keine Aktion.
@@ -513,6 +524,7 @@ mod windows {
             MENU_OPEN_CONFIG => Some(MenuAction::OpenConfigDir),
             MENU_QUIT => Some(MenuAction::Quit),
             MENU_CHANGE_HOTKEY => Some(MenuAction::ChangeHotkey),
+            MENU_TOGGLE_AUTOSTART => Some(MenuAction::ToggleAutostart),
             _ => None,
         }
     }
@@ -940,6 +952,15 @@ mod windows {
 
         let status = wide(&status_line);
         let pause = wide(pause_menu_label(paused));
+        let autostart_label = wide("Mit Windows starten");
+        // §9: Das Häkchen spiegelt die Datei im Startup-Ordner. Frisch beim
+        // Öffnen gelesen — der Nutzer kann sie auch außerhalb von diktier
+        // löschen.
+        let autostart_flag = if autostart::is_installed() {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
         let change_hotkey = wide("Hotkey ändern…");
         let config = wide("Konfiguration bearbeiten");
         let quit = wide("Beenden");
@@ -953,6 +974,12 @@ mod windows {
                 status.as_ptr(),
             );
             AppendMenuW(menu, MF_STRING, MENU_TOGGLE_PAUSE as usize, pause.as_ptr());
+            AppendMenuW(
+                menu,
+                MF_STRING | autostart_flag,
+                MENU_TOGGLE_AUTOSTART as usize,
+                autostart_label.as_ptr(),
+            );
             AppendMenuW(
                 menu,
                 MF_STRING,
@@ -1421,6 +1448,10 @@ mod tests {
             Some(TrayEvent::ChangeHotkey)
         );
         assert_eq!(
+            route_menu(MenuAction::ToggleAutostart),
+            Some(TrayEvent::ToggleAutostart)
+        );
+        assert_eq!(
             route_menu(MenuAction::OpenConfigDir),
             Some(TrayEvent::OpenConfigDir)
         );
@@ -1474,13 +1505,14 @@ mod tests {
             assert_eq!(menu_action(1002), Some(MenuAction::OpenConfigDir));
             assert_eq!(menu_action(1003), Some(MenuAction::Quit));
             assert_eq!(menu_action(1004), Some(MenuAction::ChangeHotkey));
+            assert_eq!(menu_action(1005), Some(MenuAction::ToggleAutostart));
         }
 
         /// `TrackPopupMenu` liefert `0`, wenn der Nutzer daneben klickt — das
         /// darf keine Aktion auslösen, ebenso wenig eine fremde ID.
         #[test]
         fn unknown_menu_ids_do_nothing() {
-            for id in [0, 1, 999, 1005, u32::MAX] {
+            for id in [0, 1, 999, 1006, u32::MAX] {
                 assert_eq!(menu_action(id), None, "{id}");
             }
         }
@@ -1495,6 +1527,7 @@ mod tests {
             assert_eq!(event(1002), Some(TrayEvent::OpenConfigDir));
             assert_eq!(event(1003), Some(TrayEvent::Quit));
             assert_eq!(event(1004), Some(TrayEvent::ChangeHotkey));
+            assert_eq!(event(1005), Some(TrayEvent::ToggleAutostart));
         }
 
         #[test]
