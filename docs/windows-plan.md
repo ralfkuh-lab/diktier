@@ -64,7 +64,7 @@ Präzisierungen vom 2026-08-27 (§4.2 Tray-Menü-Ausnahme, §5.3 per-session).
 
 ## Arbeitspakete
 
-### 🔍 WP1 — Cargo/cfg-Grundlagen
+### ✅ WP1 — Cargo/cfg-Grundlagen
 
 - `Cargo.toml`: `betrayer` nach `[target.'cfg(target_os = "linux")'.dependencies]`;
   neu `[target.'cfg(windows)'.dependencies] windows-sys = { version = "=0.61.2", features = [...] }`.
@@ -89,7 +89,7 @@ Präzisierungen vom 2026-08-27 (§4.2 Tray-Menü-Ausnahme, §5.3 per-session).
   grün (nur check, Linux-Pfad bleibt unverändert). Beide Kommandos gehören
   in jedes WP-Gate.
 
-### 🔍 WP2 — Hotkey: `WH_KEYBOARD_LL` (`src/hotkey.rs`, Modul `windows`)
+### ✅ WP2 — Hotkey: `WH_KEYBOARD_LL` (`src/hotkey.rs`, Modul `windows`)
 
 - `WinHookBackend`: **persistenter Hook-Thread** mit eigener Message-Queue.
   `register()` startet den Thread beim ersten Mal und wartet auf ein
@@ -125,7 +125,7 @@ Präzisierungen vom 2026-08-27 (§4.2 Tray-Menü-Ausnahme, §5.3 per-session).
 - Gate: `--hotkey-test` loggt F9 Press/Release; F9 erreicht Notepad nicht;
   Shift+F9 erreicht Notepad.
 
-### 🔍 WP3 — Inject: Clipboard + `SendInput` (`src/inject/windows.rs`)
+### ✅ WP3 — Inject: Clipboard + `SendInput` (`src/inject/windows.rs`)
 
 `Win32OutputSink` implementiert `ClipboardHost` + `OutputSink`; erzeugt auf
 dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
@@ -190,7 +190,7 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   laut §7.1 akzeptiert, aber im Log sichtbar); Fokuswechsel während der 3 s
   → copy_only.
 
-### 🔍 WP4 — Tray: `Shell_NotifyIconW` (`src/tray.rs`, Modul `windows`)
+### ✅ WP4 — Tray: `Shell_NotifyIconW` (`src/tray.rs`, Modul `windows`)
 
 - `Win32Tray::new`: läuft auf dem **Tray-Worker-Thread**; versteckte
   Top-Level-Fensterklasse (kein `HWND_MESSAGE` — Broadcasts wie
@@ -239,7 +239,7 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   Clipboard), Pause gibt F9 frei, Beenden räumt Icon weg, Explorer-Neustart
   (`taskkill /f /im explorer.exe && start explorer`) bringt das Icon zurück.
 
-### 🔍 WP5 — Single-Instance, Signale, Subsystem, Autostart
+### ✅ WP5 — Single-Instance, Signale, Subsystem, Autostart
 
 - **Single-Instance** (`single_instance.rs`): plattformspezifische
   Lock-Abstraktion — Linux behält `FileLock`, Windows bekommt `MutexLock`
