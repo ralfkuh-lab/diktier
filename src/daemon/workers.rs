@@ -983,8 +983,17 @@ fn hotkey_loop(
         match cmd_rx.try_recv() {
             Ok(HotkeyCmd::Grab) => {
                 if let Err(err) = backend.register() {
-                    log.warn(format!("Hotkey erneut greifen: {err}"));
-                } else if backend.is_registered() {
+                    // §4.4/§10: Beim Resume gilt derselbe Maßstab wie beim
+                    // Start — ohne Grab ist der Hotkey tot. Nur zu warnen
+                    // hinterließe eine State-Machine, die sich für „idle"
+                    // hält, während keine Taste mehr greift (Sol-Review). Auf
+                    // Windows ist das real: jeder Resume ruft erneut
+                    // `SetWindowsHookExW`.
+                    log.error(format!("Hotkey erneut greifen: {err}"));
+                    let _ = out.send(Msg::HotkeyUnavailable(err.to_string()));
+                    return;
+                }
+                if backend.is_registered() {
                     log.info(format!("Hotkey {} wieder scharf", spec.describe()));
                 }
             }

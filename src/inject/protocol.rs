@@ -200,6 +200,9 @@ pub fn auto_shortcut(wm_class: Option<(&str, &str)>) -> ResolvedShortcut {
     let Some((instance, class)) = wm_class else {
         return ResolvedShortcut::CtrlV;
     };
+    if let Some(shortcut) = windows_process_shortcut(instance, class) {
+        return shortcut;
+    }
     if matches_any(instance, class, VTE_NAMES) {
         return ResolvedShortcut::CtrlShiftV;
     }
@@ -207,6 +210,33 @@ pub fn auto_shortcut(wm_class: Option<(&str, &str)>) -> ResolvedShortcut {
         return ResolvedShortcut::ShiftInsert;
     }
     ResolvedShortcut::CtrlV
+}
+
+/// Windows-Zweig (Spec §7.2, windows-plan WP3).
+///
+/// Auf Windows gibt es keine X11-`WM_CLASS`; der Sink liefert als
+/// Trait-Platzhalter **zweimal den Prozess-Basenamen**, also z. B.
+/// `("notepad.exe", "notepad.exe")`. Genau diese Form wird hier erkannt:
+/// beide Werte gleich **und** ein `.exe`-Suffix. X11-Klassen tragen keins, die
+/// Linux-Tabelle darunter bleibt deshalb unberührt — und ein durch Wine
+/// gestartetes Fenster mit der Klasse `foo.exe` führt hier wie dort zu
+/// `CtrlV`.
+///
+/// Die Regel selbst ist kurz: `WindowsTerminal.exe` bindet beide Chords auf
+/// Paste, `conhost`/PowerShell kennen `Ctrl+Shift+V` nicht.
+fn windows_process_shortcut(instance: &str, class: &str) -> Option<ResolvedShortcut> {
+    if !instance.eq_ignore_ascii_case(class) {
+        return None;
+    }
+    let name = instance.to_ascii_lowercase();
+    if !name.ends_with(".exe") {
+        return None;
+    }
+    Some(if name == "windowsterminal.exe" {
+        ResolvedShortcut::CtrlShiftV
+    } else {
+        ResolvedShortcut::CtrlV
+    })
 }
 
 fn matches_any(instance: &str, class: &str, names: &[&str]) -> bool {
@@ -489,4 +519,84 @@ fn chord_shift_insert<H: ClipboardHost>(host: &mut H) -> Result<(), InjectError>
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §7.2: `WindowsTerminal.exe` → `Ctrl+Shift+V`, alles andere → `Ctrl+V`.
+    /// Der Vergleich ist ASCII-case-insensitiv — `QueryFullProcessImageNameW`
+    /// liefert die Schreibweise des Dateisystems, nicht die des Herstellers.
+    #[test]
+    fn windows_terminal_gets_ctrl_shift_v() {
+        for name in [
+            "WindowsTerminal.exe",
+            "windowsterminal.exe",
+            "WINDOWSTERMINAL.EXE",
+        ] {
+            assert_eq!(
+                auto_shortcut(Some((name, name))),
+                ResolvedShortcut::CtrlShiftV,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_windows_processes_get_ctrl_v() {
+        for name in [
+            "notepad.exe",
+            "Code.exe",
+            "conhost.exe",
+            "powershell.exe",
+            "WindowsTerminalPreview.exe",
+            "explorer.EXE",
+        ] {
+            assert_eq!(
+                auto_shortcut(Some((name, name))),
+                ResolvedShortcut::CtrlV,
+                "{name}"
+            );
+        }
+    }
+
+    /// Die Windows-Regel greift nur bei der Platzhalterform `(exe, exe)`. Ein
+    /// echtes X11-Paar mit abweichenden Hälften fällt weiter in die
+    /// Linux-Tabelle — auch dann, wenn eine Hälfte auf `.exe` endet.
+    #[test]
+    fn windows_rule_needs_both_halves_equal() {
+        assert_eq!(
+            auto_shortcut(Some(("gnome-terminal-server", "Gnome-terminal"))),
+            ResolvedShortcut::CtrlShiftV
+        );
+        // Ungleiche Hälften: die Windows-Regel greift nicht, die Linux-Tabelle
+        // kennt den Namen nicht → Default.
+        assert_eq!(
+            auto_shortcut(Some(("windowsterminal.exe", "Xed"))),
+            ResolvedShortcut::CtrlV
+        );
+        assert_eq!(
+            auto_shortcut(Some(("xterm", "xterm.exe"))),
+            ResolvedShortcut::ShiftInsert
+        );
+    }
+
+    /// Ohne `.exe` bleibt alles wie vor Phase 5.
+    #[test]
+    fn names_without_exe_suffix_use_the_x11_table() {
+        assert_eq!(
+            auto_shortcut(Some(("kitty", "kitty"))),
+            ResolvedShortcut::CtrlShiftV
+        );
+        assert_eq!(
+            auto_shortcut(Some(("xterm", "XTerm"))),
+            ResolvedShortcut::ShiftInsert
+        );
+        assert_eq!(
+            auto_shortcut(Some(("code", "Code"))),
+            ResolvedShortcut::CtrlV
+        );
+        assert_eq!(auto_shortcut(None), ResolvedShortcut::CtrlV);
+    }
 }

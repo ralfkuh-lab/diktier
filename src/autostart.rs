@@ -23,6 +23,14 @@ pub enum AutostartError {
     Exe(io::Error),
     #[error("Programmpfad ist nicht UTF-8: {0}")]
     ExeNotUtf8(PathBuf),
+    /// Windows: In einer `.cmd` lässt sich ein `"` im Pfad nicht verlässlich
+    /// quoten — cmd.exe kennt dafür kein Escape. NTFS erlaubt das Zeichen in
+    /// Dateinamen ohnehin nicht; der Fall kann nur über exotische Geräte- oder
+    /// Netzwerkpfade kommen und wird abgelehnt, statt eine kaputte Datei zu
+    /// schreiben (Plan WP5).
+    #[cfg(windows)]
+    #[error("Programmpfad enthält Anführungszeichen: {0}")]
+    ExeHasQuote(PathBuf),
     #[error("Autostart-Datei {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
 }
@@ -33,6 +41,8 @@ impl AutostartError {
         match self {
             Self::Path(_) => 2,
             Self::Exe(_) | Self::ExeNotUtf8(_) | Self::Io { .. } => 1,
+            #[cfg(windows)]
+            Self::ExeHasQuote(_) => 1,
         }
     }
 }
@@ -146,6 +156,11 @@ pub fn entry_contents(exe: &Path) -> Result<String, AutostartError> {
 }
 
 /// Windows: `.cmd` im Startup-Ordner (§9 nennt nur „Startup-Ordner des Users").
+///
+/// **Ohne `/min`** (Plan WP5): Das Binary läuft im Windows-Subsystem, es gibt
+/// kein Fenster, das minimiert werden könnte. Der leere Titel nach `start` ist
+/// dagegen Pflicht — sonst deutet cmd.exe den gequoteten Pfad als Fenstertitel
+/// und startet nichts.
 #[cfg(windows)]
 pub fn entry_contents(exe: &Path) -> Result<String, AutostartError> {
     let exec = quote_exec(exe)?;
@@ -187,6 +202,9 @@ pub fn quote_exec(exe: &Path) -> Result<String, AutostartError> {
     }
     #[cfg(windows)]
     {
+        if raw.contains('"') {
+            return Err(AutostartError::ExeHasQuote(exe.to_path_buf()));
+        }
         Ok(format!("\"{raw}\""))
     }
 }
@@ -215,6 +233,15 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), AutostartError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wonach genau ein eigener Eintrag in der erzeugten Datei zu suchen ist.
+    /// Der Dateiinhalt ist plattformspezifisch (Desktop Entry vs. `.cmd`), die
+    /// geprüfte Regel aus §9 — „eigenen Eintrag aktualisieren, nicht
+    /// verdoppeln" — ist es nicht.
+    #[cfg(target_os = "linux")]
+    const ENTRY_MARKER: &str = "Exec=";
+    #[cfg(windows)]
+    const ENTRY_MARKER: &str = "start \"\" ";
 
     fn temp_home() -> (tempfile::TempDir, PathBuf) {
         let home = tempfile::tempdir().unwrap();
@@ -247,7 +274,11 @@ mod tests {
             InstallOutcome::Updated
         );
         let text = fs::read_to_string(&path).unwrap();
-        assert_eq!(text.matches("Exec=").count(), 1, "genau ein Exec-Eintrag");
+        assert_eq!(
+            text.matches(ENTRY_MARKER).count(),
+            1,
+            "genau ein eigener Eintrag in:\n{text}"
+        );
         assert!(text.contains("/opt/neu/diktier"));
         assert!(!text.contains("/opt/alt/diktier"));
     }
@@ -333,6 +364,28 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    /// §9: gequoteter Pfad; kein `/min`; ein `"` im Pfad wird abgelehnt, statt
+    /// eine kaputte `.cmd` zu schreiben (Plan WP5).
+    #[cfg(windows)]
+    #[test]
+    fn windows_entry_quotes_the_path_and_stays_unminimized() {
+        let text = entry_contents(Path::new(r"C:\Program Files\a b\diktier.exe")).unwrap();
+        assert!(
+            text.contains(r#"start "" "C:\Program Files\a b\diktier.exe""#),
+            "{text}"
+        );
+        assert!(!text.contains("/min"), "{text}");
+        assert!(text.ends_with("\r\n"), "{text:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_a_path_with_a_quote() {
+        let err = quote_exec(Path::new("C:\\a\"b\\diktier.exe")).unwrap_err();
+        assert!(matches!(err, AutostartError::ExeHasQuote(_)), "{err}");
+        assert_eq!(err.exit_code(), 1);
     }
 
     #[test]

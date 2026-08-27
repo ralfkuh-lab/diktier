@@ -16,6 +16,9 @@ mod fake;
 #[cfg(target_os = "linux")]
 mod linux;
 
+#[cfg(windows)]
+mod windows;
+
 pub use protocol::{RESTORED_SERVE_GRACE, ResolvedShortcut};
 
 /// Native Vordergrund-Kennung (HWND bzw. X11-Window), als portable Zahl.
@@ -174,7 +177,7 @@ impl OutputSink for StubOutputSink {
 #[cfg(target_os = "linux")]
 pub type PlatformSink = linux::X11OutputSink;
 #[cfg(windows)]
-pub type PlatformSink = StubOutputSink;
+pub type PlatformSink = windows::Win32OutputSink;
 
 pub fn new_sink(output: OutputConfig) -> Result<PlatformSink, InjectError> {
     #[cfg(target_os = "linux")]
@@ -183,8 +186,7 @@ pub fn new_sink(output: OutputConfig) -> Result<PlatformSink, InjectError> {
     }
     #[cfg(windows)]
     {
-        let _ = output;
-        Ok(StubOutputSink)
+        windows::Win32OutputSink::new(output)
     }
 }
 
@@ -314,6 +316,118 @@ mod tests {
         }
         assert_eq!(host.clipboard_text(), Some("fremd"));
         assert!(!host.still_owner().unwrap());
+    }
+
+    /// windows-plan Leitentscheidung 4: Der **eigene** `WM_RENDERFORMAT` erhöht
+    /// `GetClipboardSequenceNumber()`. Ein „Sequenz unverändert“-Test würde
+    /// deshalb jeden legitimen Restore verwerfen; die eigene Generation wandert
+    /// mit, der Restore findet statt.
+    #[test]
+    fn own_render_bumps_the_sequence_and_keeps_ownership() {
+        let mut host = FakeHost::new()
+            .with_text("vorher")
+            .with_script(vec![(Duration::from_millis(10), ScriptEvent::OwnRender)]);
+        let outcome = inject_paste(&mut host, "transkript", &ctx(1), &output()).unwrap();
+        match outcome {
+            InjectOutcome::Pasted {
+                restored,
+                reads,
+                restore,
+                ..
+            } => {
+                assert!(restored);
+                assert_eq!(reads, 1);
+                assert_eq!(restore, RestoreDecision::Restore);
+            }
+            other => panic!("expected Pasted, got {other:?}"),
+        }
+        assert_eq!(host.clipboard_text(), Some("vorher"));
+        assert!(host.still_owner().unwrap());
+    }
+
+    /// Fremder Copy **vor** dem Render: der Render kann danach nicht mehr
+    /// greifen, es gibt keinen bedienten Read, und restauriert wird nie
+    /// (§7.1 Punkt 5).
+    #[test]
+    fn foreign_copy_before_the_render_is_foreign_owner() {
+        let mut host = FakeHost::new().with_text("vorher").with_script(vec![
+            (
+                Duration::from_millis(10),
+                ScriptEvent::ForeignTakeover(FakeContent::Text("fremd".into())),
+            ),
+            (Duration::from_millis(20), ScriptEvent::OwnRender),
+        ]);
+        let outcome = inject_paste(&mut host, "transkript", &ctx(1), &output()).unwrap();
+        match outcome {
+            InjectOutcome::Pasted {
+                restored,
+                reads,
+                restore,
+                ..
+            } => {
+                assert!(!restored);
+                assert_eq!(reads, 0);
+                assert_eq!(restore, RestoreDecision::ForeignOwner);
+            }
+            other => panic!("expected Pasted, got {other:?}"),
+        }
+        assert_eq!(host.clipboard_text(), Some("fremd"));
+        assert!(!host.still_owner().unwrap());
+    }
+
+    /// Owner ist weiter unser Fenster, die Sequenznummer stammt aber von einer
+    /// fremden Mutation — `still_owner` muss das erkennen, obwohl kein
+    /// `lost_ownership`-Ereignis kam (windows-plan `WM_DESTROYCLIPBOARD`-Guard).
+    #[test]
+    fn same_owner_with_foreign_sequence_never_restores() {
+        let mut host = FakeHost::new().with_text("vorher").with_script(vec![
+            (Duration::from_millis(10), ScriptEvent::OwnRender),
+            (Duration::from_millis(20), ScriptEvent::ForeignSequenceBump),
+        ]);
+        let outcome = inject_paste(&mut host, "transkript", &ctx(1), &output()).unwrap();
+        match outcome {
+            InjectOutcome::Pasted {
+                restored,
+                reads,
+                restore,
+                ..
+            } => {
+                assert!(!restored);
+                assert_eq!(reads, 1);
+                assert_eq!(restore, RestoreDecision::ForeignOwner);
+            }
+            other => panic!("expected Pasted, got {other:?}"),
+        }
+        // Das Transkript bleibt liegen — §7.1: niemals über eine fremde
+        // Änderung hinweg restaurieren.
+        assert_eq!(host.clipboard_text(), Some("transkript"));
+        assert!(!host.still_owner().unwrap());
+    }
+
+    /// `SendInput` kann wegen UIPI Events verschlucken. Dann darf keine Taste
+    /// unten bleiben — auch nicht beim längeren Ctrl+Shift+V-Chord.
+    #[test]
+    fn ctrl_shift_v_failure_releases_every_key_it_pressed() {
+        for fail_at in 1..=3 {
+            let mut host = FakeHost::new()
+                .with_text("vorher")
+                .with_wm_class("WindowsTerminal.exe", "WindowsTerminal.exe")
+                .with_fail_key_after(fail_at);
+            assert!(inject_paste(&mut host, "transkript", &ctx(1), &output()).is_err());
+            let downs: Vec<_> = host.sent.iter().filter(|s| s.down).map(|s| s.key).collect();
+            let ups: Vec<_> = host
+                .sent
+                .iter()
+                .filter(|s| !s.down)
+                .map(|s| s.key)
+                .collect();
+            for key in downs {
+                assert!(
+                    ups.contains(&key),
+                    "Taste {key:?} ohne Up (fail_at {fail_at})"
+                );
+            }
+        }
     }
 
     #[test]

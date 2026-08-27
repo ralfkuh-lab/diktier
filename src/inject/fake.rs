@@ -24,6 +24,14 @@ pub enum ScriptEvent {
     ForeignTakeover(FakeContent),
     /// Ungepumpter SelectionClear + Fremdinhalt, wird beim nächsten Snapshot drainiert (codex H1).
     QueuedClear(FakeContent),
+    /// Windows-Delayed-Rendering (windows-plan Leitentscheidung 4): der eigene
+    /// Render liefert die Daten, zählt als Read **und** erhöht die
+    /// Sequenznummer. Die eigene Generation wandert mit — wir bleiben Owner.
+    OwnRender,
+    /// Fremde Mutation **ohne** Ownership-Wechsel: die Sequenznummer springt,
+    /// `GetClipboardOwner()` zeigt aber weiter auf uns. Kein `lost_ownership`;
+    /// nur der Generationsvergleich in `still_owner` fängt das ab.
+    ForeignSequenceBump,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +179,28 @@ impl FakeHost {
         }
     }
 
+    /// Der eigene Render: Sequenz hoch, eigene Generation mit — genau das, was
+    /// `WM_RENDERFORMAT` + `expected_seq` auf Windows tun.
+    fn apply_own_render(&mut self, out: &mut PumpEvents) {
+        if self.fail_data_request {
+            return;
+        }
+        if self.clipboard.owner != FakeOwner::Us
+            || self.clipboard.our_generation != Some(self.clipboard.generation)
+        {
+            return;
+        }
+        self.clipboard.generation = self.clipboard.generation.saturating_add(1);
+        self.clipboard.our_generation = Some(self.clipboard.generation);
+        out.reads += 1;
+    }
+
+    /// Fremde Sequenzänderung ohne Ownership-Wechsel: die eigene Generation
+    /// bleibt stehen und passt danach nicht mehr.
+    fn apply_foreign_sequence_bump(&mut self) {
+        self.clipboard.generation = self.clipboard.generation.saturating_add(1);
+    }
+
     fn apply_takeover(&mut self, content: FakeContent) {
         self.clipboard.owner = FakeOwner::Foreign;
         self.clipboard.generation = self.clipboard.generation.saturating_add(1);
@@ -194,6 +224,8 @@ impl FakeHost {
                         out.reads += 1;
                     }
                 }
+                ScriptEvent::OwnRender => self.apply_own_render(out),
+                ScriptEvent::ForeignSequenceBump => self.apply_foreign_sequence_bump(),
             }
         }
     }
@@ -221,6 +253,8 @@ impl FakeHost {
                     self.apply_takeover(content);
                     out.lost_ownership = true;
                 }
+                ScriptEvent::OwnRender => self.apply_own_render(out),
+                ScriptEvent::ForeignSequenceBump => self.apply_foreign_sequence_bump(),
             }
         }
     }

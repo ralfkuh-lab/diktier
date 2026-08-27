@@ -310,6 +310,13 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
 - Mikrofon-Pegel/Gerätewahl (RMS lag im Test bei 0,0007; Schwelle 0,0075 —
   vermutlich Mute/Pegel am Jabra, nicht Code).
 - `output.mode = "type"`, Notifications, Icon-Design, `.lnk`-Autostart.
+- 🔍 **Modifier-only-Hotkey** (z. B. `Ctrl+Win` wie bei Wispr Flow, Wunsch
+  Ralf 2026-08-27): heute verlangt die Config einen `key`; ein reiner
+  Modifier-Chord braucht ein eigenes Hook-Zustandsmodell (Halten beginnt beim
+  zweiten Down, endet beim ersten Up, Einzeltasten müssen durchgehen) auf
+  beiden Plattformen. Folgepaket nach dem Dev-Milestone.
+- 🔍 Watchdog gegen still entfernten LL-Hook (`LowLevelHooksTimeout`), Sol-
+  Blocker 5 zu Paket A; Restrisiko akzeptiert.
 
 ## Umsetzung
 

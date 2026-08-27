@@ -1,3 +1,9 @@
+//! §9: Das Binary läuft im **Windows-Subsystem** — ein Autostart-Eintrag oder
+//! ein Doppelklick soll kein Konsolenfenster aufreißen. `not(test)` ist wichtig:
+//! ohne das erbte auch der Test-Harness das Subsystem und `cargo test` liefe
+//! stumm.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod audio;
 mod autostart;
 mod config;
@@ -91,7 +97,80 @@ struct Cli {
     tray_test: Option<u32>,
 }
 
+/// §9/Plan WP5: Als Windows-Subsystem-Programm erbt der Prozess **keine**
+/// Konsole. `AttachConsole(ATTACH_PARENT_PROCESS)` hängt ihn an die des
+/// Aufrufers, damit `--foreground`, `--help`, `--version` und die Spikes wie
+/// gewohnt auf stderr/stdout schreiben. Gibt es keine Eltern-Konsole (Autostart,
+/// Doppelklick), passiert nichts — **kein** `AllocConsole` (Entscheidung
+/// 2026-08-27): der Daemon loggt dann in `diktier.log` (§10).
+///
+/// Muss vor jeder Ausgabe laufen: Rusts stdio holt sich das Handle bei jedem
+/// Schreiben über `GetStdHandle`, ein Attach danach käme also zu spät für alles
+/// schon Geschriebene.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{
+        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+
+    // SAFETY: dokumentierte Konstante, kein Zeiger. Fehlschlag (keine
+    // Eltern-Konsole, schon eine angehängt) ist ausdrücklich in Ordnung.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
+        return;
+    }
+
+    // `AttachConsole` verschafft dem Prozess eine Konsole, setzt aber die
+    // Standardhandles nicht: bei einem GUI-Subsystem-Programm sind sie NULL,
+    // und Rusts stdio schriebe ins Leere. Deshalb genau dann `CONIN$`/`CONOUT$`
+    // öffnen und eintragen, wenn noch kein brauchbares Handle da ist — eine
+    // Umleitung des Aufrufers (`> log.txt`, Pipe) bleibt so unangetastet.
+    let fix = |which: STD_HANDLE, name: &str, access: u32| {
+        // SAFETY: parameterloser Lesezugriff auf die Handle-Tabelle.
+        let existing: HANDLE = unsafe { GetStdHandle(which) };
+        if !existing.is_null() && existing != INVALID_HANDLE_VALUE {
+            return;
+        }
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` ist NUL-terminiert und lebt über den Aufruf; die
+        // Konsolen-Pseudodateien existieren, seit `AttachConsole` gelang.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                ptr::null(),
+                OPEN_EXISTING,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            // SAFETY: gültiges, gerade geöffnetes Handle; der Prozess besitzt
+            // es bis zum Ende und schließt es nie — genau das will die
+            // Handle-Tabelle.
+            unsafe { SetStdHandle(which, handle) };
+        }
+    };
+    fix(STD_INPUT_HANDLE, "CONIN$", GENERIC_READ | GENERIC_WRITE);
+    fix(STD_OUTPUT_HANDLE, "CONOUT$", GENERIC_READ | GENERIC_WRITE);
+    fix(STD_ERROR_HANDLE, "CONOUT$", GENERIC_READ | GENERIC_WRITE);
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
 fn main() -> ExitCode {
+    // Erster Schritt, vor Clap und vor `signals::install()`.
+    attach_parent_console();
     ExitCode::from(cli_main(std::env::args_os()))
 }
 
@@ -533,6 +612,9 @@ fn tray_test(secs: u32) -> u8 {
         }
     };
     eprintln!("SPIKE tray-backend={}", tray.backend_name());
+    // Nur die SNI-Diagnose ist Linux — auf Windows gibt es keinen
+    // StatusNotifierItem-Busnamen.
+    #[cfg(target_os = "linux")]
     eprintln!(
         "SPIKE tray-sni=org.kde.StatusNotifierItem-{}-1",
         std::process::id()

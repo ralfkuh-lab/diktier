@@ -66,14 +66,110 @@ global-hotkey = { version = "=0.8.0", default-features = false }
 # Phase 2b Tray: betrayer 0.4.1 ist die aktuelle 0.4-Patchversion (Apr 2025,
 # letzte Release). Linux: StatusNotifierItem + DBusMenu über zbus, eigener
 # D-Bus-Thread — kein Extra-Eventloop, kein GTK. Spec §4.3: tray-icon nur
-# wenn SNI unter Cinnamon scheitert. Windows braucht Eventloop auf demselben
-# Thread; Phase 2b ist Linux-Smoke, Windows bleibt cfg-Stub. Fallback später:
-# ksni (Linux) / Shell_NotifyIconW (Windows) hinter TrayBackend.
+# wenn SNI unter Cinnamon scheitert. Fallback später: ksni hinter TrayBackend.
+# Phase 5/WP1: Linux-only. Windows bekommt `Shell_NotifyIconW` direkt über
+# `windows-sys` (Leitentscheidung 1) — betrayer würde dort einen eigenen
+# Eventloop auf dem Tray-Thread verlangen und ein zweites Fenster-Framework
+# mitbringen, ohne dass davon etwas gebraucht wird.
 betrayer = "=0.4.1"
 # Phase 3d Single-Instance (§5.3): `flock` für den gehaltenen advisory Lock.
 # 0.2.189 steht ohnehin schon transitiv im Lock (cpal/x11rb) — kein zusätzlicher
 # Baum, dafür die richtigen Konstanten statt einer handgeschriebenen ABI.
 libc = "=0.2.189"
+
+# Phase 5 Windows (§3, §5): exakt pinnen.
+# windows-sys 0.61.2 steht ohnehin schon transitiv im Lock (u. a. über
+# cpal/ureq/rustls) — dieselbe Version direkt zu ziehen kostet keinen zweiten
+# Baum und keine zweite `windows-link`-Kopie. Kein `windows`-Crate: dessen
+# COM-/RAII-Schicht wird hier nirgends gebraucht, die rohen `extern "system"`-
+# Signaturen von windows-sys reichen und bleiben in `unsafe`-Blöcken sichtbar.
+#
+# Features wachsen mit den Arbeitspaketen; hier steht, was WP2 (Hotkey,
+# `WH_KEYBOARD_LL`) und WP3 (Inject: Clipboard + `SendInput`) tatsächlich
+# aufrufen — die vollständige API→Feature-Tabelle für WP4/WP5 liegt in
+# docs/windows-plan.md WP1.
+#   Win32_Foundation                 WP2: WPARAM/LPARAM/LRESULT, GetLastError
+#                                    WP3: HWND/HANDLE/HGLOBAL, CloseHandle,
+#                                         GlobalFree, ERROR_CLASS_ALREADY_EXISTS
+#   Win32_UI_WindowsAndMessaging     WP2: SetWindowsHookExW, CallNextHookEx,
+#                                         UnhookWindowsHookEx, GetMessageW,
+#                                         PeekMessageW, PostThreadMessageW, MSG,
+#                                         KBDLLHOOKSTRUCT, LLKHF_*, WM_*
+#                                    WP3: RegisterClassW/WNDCLASSW,
+#                                         CreateWindowExW/CREATESTRUCTW,
+#                                         DefWindowProcW, DestroyWindow,
+#                                         UnregisterClassW, DispatchMessageW,
+#                                         MsgWaitForMultipleObjects/QS_ALLINPUT,
+#                                         Get/SetWindowLongPtrW (GWLP_USERDATA),
+#                                         HWND_MESSAGE, GetForegroundWindow,
+#                                         GetWindowThreadProcessId,
+#                                         WM_RENDER*/WM_DESTROYCLIPBOARD
+#   Win32_UI_Input_KeyboardAndMouse  WP2: GetAsyncKeyState, VK_*
+#                                    WP3: SendInput, INPUT/KEYBDINPUT,
+#                                         KEYEVENTF_*
+#   Win32_System_LibraryLoader       GetModuleHandleW (HINSTANCE für Hook und
+#                                    Fensterklasse)
+#   Win32_System_Threading           WP2: GetCurrentThreadId (Ziel für
+#                                         PostThreadMessageW)
+#                                    WP3: OpenProcess,
+#                                         QueryFullProcessImageNameW,
+#                                         PROCESS_QUERY_LIMITED_INFORMATION
+#   Win32_System_DataExchange        WP3: OpenClipboard, CloseClipboard,
+#                                         EmptyClipboard, SetClipboardData,
+#                                         GetClipboardData, GetClipboardOwner,
+#                                         GetClipboardSequenceNumber,
+#                                         IsClipboardFormatAvailable,
+#                                         CountClipboardFormats
+#   Win32_System_Memory              WP3: GlobalAlloc/Lock/Unlock/Size,
+#                                         GMEM_MOVEABLE
+#   Win32_Graphics_Gdi               WP3: nur als Typ-Voraussetzung —
+#                                    windows-sys stellt WNDCLASSW/RegisterClassW
+#                                    erst mit diesem Feature bereit (hbrBackground
+#                                    ist ein HBRUSH).
+#                                    WP4: CreateDIBSection, CreateBitmap,
+#                                         DeleteObject, BITMAPINFO, BI_RGB,
+#                                         DIB_RGB_COLORS
+#   Win32_UI_Shell                   WP4: Shell_NotifyIconW, NOTIFYICONDATAW,
+#                                         NIM_*, NIF_*, NIN_SELECT,
+#                                         NIN_KEYSELECT, NOTIFYICON_VERSION_4
+#   Win32_System_Console             WP5: SetConsoleCtrlHandler, AttachConsole,
+#                                         ATTACH_PARENT_PROCESS, GetStdHandle,
+#                                         SetStdHandle, CTRL_*_EVENT
+#   Win32_Security                   WP5: nur als Typ-Voraussetzung —
+#                                    windows-sys deklariert CreateMutexW mit
+#                                    `*const SECURITY_ATTRIBUTES` und blendet es
+#                                    ohne dieses Feature aus. Übergeben wird
+#                                    NULL (Default-DACL).
+#   Win32_Storage_FileSystem         WP5: CreateFileW für CONOUT$/CONIN$ —
+#                                    AttachConsole hängt die Konsole an, setzt
+#                                    aber die Standardhandles eines
+#                                    GUI-Subsystem-Prozesses nicht.
+#
+# WP4 nutzt aus Win32_UI_WindowsAndMessaging zusätzlich: RegisterWindowMessageW,
+# CreatePopupMenu/AppendMenuW/TrackPopupMenu/DestroyMenu, SetForegroundWindow,
+# PostMessageW, GetSystemMetrics/SM_CXSMICON, CreateIconIndirect/DestroyIcon/
+# ICONINFO, WM_QUERYENDSESSION/WM_ENDSESSION/WM_CONTEXTMENU/WM_APP.
+# WP5 nutzt aus Win32_Foundation zusätzlich ERROR_ALREADY_EXISTS/
+# ERROR_INVALID_HANDLE und aus Win32_System_Threading CreateMutexW.
+#
+# Nicht aufgenommen: Win32_System_Ole, das in 0.61 nur CF_UNICODETEXT liefern
+# würde. Der Wert (13) ist stabile winuser.h-ABI und steht als Konstante in
+# src/inject/windows.rs — ein COM-Feature dafür wäre unverhältnismäßig.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 tempfile = "3"
