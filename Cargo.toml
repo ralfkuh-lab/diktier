@@ -134,6 +134,21 @@ libc = "=0.2.189"
 #                                    WP4: CreateDIBSection, CreateBitmap,
 #                                         DeleteObject, BITMAPINFO, BI_RGB,
 #                                         DIB_RGB_COLORS
+#                                    Overlay: CreateCompatibleDC, SelectObject,
+#                                         DeleteDC, BLENDFUNCTION, AC_SRC_OVER,
+#                                         AC_SRC_ALPHA, MonitorFromWindow,
+#                                         MonitorFromPoint, GetMonitorInfoW,
+#                                         MONITORINFO, MONITOR_DEFAULTTO*
+#   Win32_UI_HiDpi                   Overlay (WP-O2): SetThreadDpiAwarenessContext,
+#                                         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+#                                         GetDpiForWindow. Per-Thread-PMv2 auf
+#                                         dem Overlay-Thread; prozessweite
+#                                         Awareness (Manifest) bleibt bewusst
+#                                         außen vor, siehe docs/overlay-plan.md.
+#                                         **Nicht** GetDpiForMonitor: laut MS
+#                                         nicht DPI-aware, richtet sich nach der
+#                                         Prozess-Awareness (Sol-Impl-Review,
+#                                         Blocker 1).
 #   Win32_UI_Shell                   WP4: Shell_NotifyIconW, NOTIFYICONDATAW,
 #                                         NIM_*, NIF_*, NIN_SELECT,
 #                                         NIN_KEYSELECT, NOTIFYICON_VERSION_4
@@ -157,6 +172,12 @@ libc = "=0.2.189"
 # WP5 nutzt aus Win32_Foundation zusätzlich ERROR_ALREADY_EXISTS/
 # ERROR_INVALID_HANDLE und aus Win32_System_Threading CreateMutexW.
 #
+# Das Aufnahme-Overlay nutzt aus Win32_UI_WindowsAndMessaging zusätzlich:
+# UpdateLayeredWindow/ULW_ALPHA, WS_EX_LAYERED/NOACTIVATE/TRANSPARENT/TOPMOST,
+# SW_SHOWNOACTIVATE/SW_HIDE, SetWindowPos/SWP_NOACTIVATE/SWP_NOZORDER (
+# DPI-Bootstrap), WM_NCHITTEST/HTTRANSPARENT, WM_DPICHANGED, WM_DISPLAYCHANGE,
+# WM_SETTINGCHANGE/SPI_SETWORKAREA — und aus Win32_Foundation POINT/SIZE/RECT.
+#
 # Nicht aufgenommen: Win32_System_Ole, das in 0.61 nur CF_UNICODETEXT liefern
 # würde. Der Wert (13) ist stabile winuser.h-ABI und steht als Konstante in
 # src/inject/windows.rs — ein COM-Feature dafür wäre unverhältnismäßig.
@@ -171,6 +192,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Threading",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

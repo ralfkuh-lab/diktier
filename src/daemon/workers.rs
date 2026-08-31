@@ -13,7 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::audio::{AudioSource, CpalAudioSource};
+use crate::audio::{AudioSource, CpalAudioSource, LevelTap};
 use crate::config::{AudioConfig, OutputConfig};
 use crate::download::{self, ArtifactManifest, DownloadError, HttpTransport, Progress};
 use crate::engine::{ParakeetTranscriber, transcribe_pcm};
@@ -461,12 +461,20 @@ pub struct AudioWorker {
 }
 
 impl AudioWorker {
-    pub fn spawn(config: AudioConfig, out: Sender<Msg>, log: Arc<Logger>) -> Result<Self, String> {
+    /// `level`: geteilter Pegel fürs Aufnahme-Overlay (§4.5) oder `None`, wenn
+    /// `[overlay] enabled = false` ist — dann rechnet der cpal-Callback ihn
+    /// gar nicht erst aus.
+    pub fn spawn(
+        config: AudioConfig,
+        level: Option<Arc<LevelTap>>,
+        out: Sender<Msg>,
+        log: Arc<Logger>,
+    ) -> Result<Self, String> {
         let (tx, rx) = mpsc::channel();
         let worker_out = out.clone();
         let join = thread::Builder::new()
             .name("diktier-audio".into())
-            .spawn(move || audio_loop(rx, worker_out, &config, &log))
+            .spawn(move || audio_loop(rx, worker_out, &config, level, &log))
             .map_err(|e| format!("Audio-Thread: {e}"))?;
         Ok(Self {
             tx,
@@ -512,8 +520,14 @@ impl AudioWorker {
     }
 }
 
-fn audio_loop(rx: Receiver<AudioCmd>, out: Sender<Msg>, config: &AudioConfig, log: &Logger) {
-    let mut source = CpalAudioSource::new(config);
+fn audio_loop(
+    rx: Receiver<AudioCmd>,
+    out: Sender<Msg>,
+    config: &AudioConfig,
+    level: Option<Arc<LevelTap>>,
+    log: &Logger,
+) {
+    let mut source = CpalAudioSource::new(config, level);
     let mut recording = false;
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -1223,6 +1237,171 @@ fn tray_loop(
     }
 }
 
+// -------------------------------------------------------------- Overlay
+
+/// §4.5: Was der Daemon dem Overlay-Thread sagen kann. Mehr braucht es nicht —
+/// der Pegel kommt am Kanal vorbei über den geteilten `LevelTap`.
+#[cfg(windows)]
+pub enum OverlayCmd {
+    Show,
+    Hide,
+    Shutdown,
+}
+
+/// Takt der Overlay-Schleife. Sichtbar rendert jeder Durchlauf (≈50 Frames/s),
+/// unsichtbar schläft sie nur.
+#[cfg(windows)]
+const OVERLAY_TICK: Duration = Duration::from_millis(20);
+
+/// Das Overlay-Fenster lebt komplett auf diesem Thread — wie das Tray-Icon auf
+/// seinem (Phase-5-Leitentscheidung 2). Fremde Threads schicken Kommandos,
+/// niemand sonst fasst das `HWND` an.
+#[cfg(windows)]
+pub struct OverlayWorker {
+    tx: Sender<OverlayCmd>,
+    join: Option<JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl OverlayWorker {
+    /// Ready-Handshake mit 10-s-Frist wie beim [`TrayWorker`]. Ein Fehler ist
+    /// **nie** fatal (SPEC §4.5): Der Aufrufer loggt eine Warnung und
+    /// diktiert ohne Overlay weiter.
+    pub fn spawn(level: Arc<LevelTap>, log: Arc<Logger>) -> Result<Self, String> {
+        let (tx, rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let join = thread::Builder::new()
+            .name("diktier-overlay".into())
+            .spawn(move || overlay_loop(rx, level, &ready_tx, &log))
+            .map_err(|e| format!("Overlay-Thread: {e}"))?;
+        match ready_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                join: Some(join),
+            }),
+            Ok(Err(message)) => {
+                join_with_timeout(join, Duration::from_secs(2));
+                Err(message)
+            }
+            Err(_) => {
+                join_with_timeout(join, Duration::from_secs(2));
+                Err("Overlay-Thread antwortet nicht".into())
+            }
+        }
+    }
+
+    /// Idempotent; der Worker koalesziert ohnehin auf den letzten Wunsch.
+    pub fn set_visible(&self, visible: bool) {
+        let _ = self.tx.send(if visible {
+            OverlayCmd::Show
+        } else {
+            OverlayCmd::Hide
+        });
+    }
+
+    pub fn shutdown(&mut self, timeout: Duration) -> bool {
+        let _ = self.tx.send(OverlayCmd::Shutdown);
+        match self.join.take() {
+            Some(join) => join_with_timeout(join, timeout),
+            None => true,
+        }
+    }
+}
+
+/// Was in einer Runde an Kommandos anlag.
+#[cfg(windows)]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OverlayRound {
+    /// Der **letzte** Sichtbarkeitswunsch der Runde — eine schnelle Folge
+    /// `Show → Hide → Show` zeigt nie ein veraltetes Fenster (Sol Major 7).
+    pub visible: Option<bool>,
+    /// `Shutdown` hat Vorrang: Was danach kommt, wird nicht mehr ausgeführt.
+    pub shutdown: bool,
+}
+
+/// Kommandos einer Runde **vollständig** drainen und auf den letzten
+/// Sichtbarkeitszustand reduzieren.
+#[cfg(windows)]
+fn drain_overlay_commands(rx: &Receiver<OverlayCmd>) -> OverlayRound {
+    let mut round = OverlayRound::default();
+    loop {
+        match rx.try_recv() {
+            Ok(OverlayCmd::Show) => round.visible = Some(true),
+            Ok(OverlayCmd::Hide) => round.visible = Some(false),
+            // Der abgerissene Kanal heißt „Daemon ist weg" — dasselbe wie
+            // `Shutdown`.
+            Ok(OverlayCmd::Shutdown) | Err(TryRecvError::Disconnected) => {
+                round.shutdown = true;
+                round.visible = None;
+                return round;
+            }
+            Err(TryRecvError::Empty) => return round,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn overlay_loop(
+    rx: Receiver<OverlayCmd>,
+    level: Arc<LevelTap>,
+    ready: &Sender<Result<(), String>>,
+    log: &Logger,
+) {
+    use crate::overlay::OverlayWindow;
+
+    let mut window = match OverlayWindow::new() {
+        Ok(window) => {
+            let _ = ready.send(Ok(()));
+            window
+        }
+        Err(err) => {
+            // Ohne Fenster gibt es keinen Consumer mehr — der Audio-Callback
+            // soll den Pegel gar nicht erst ausrechnen (Sol-Impl-Review
+            // Major 4). Der Daemon verwirft den Tap zusätzlich, weil der
+            // Ready-Handshake fehlschlägt; beides zusammen deckt auch den
+            // Fall ab, dass er ihn doch schon weitergereicht hätte.
+            level.deactivate();
+            let _ = ready.send(Err(err.to_string()));
+            return;
+        }
+    };
+    log.info("Overlay bereit (per-Monitor-DPI v2)");
+
+    loop {
+        let round = drain_overlay_commands(&rx);
+        if round.shutdown {
+            break;
+        }
+        if let Some(visible) = round.visible
+            && visible != window.is_visible()
+        {
+            if visible {
+                if let Err(err) = window.show() {
+                    // §4.5: nie fatal — Warnung, Overlay aus, Diktieren läuft.
+                    log.warn(format!("Overlay nicht anzeigbar: {err}"));
+                    break;
+                }
+                log.info(format!("Overlay sichtbar: {}", window.describe()));
+            } else {
+                window.hide();
+            }
+        }
+        window.pump();
+        if window.is_visible()
+            && let Err(err) = window.frame(level.take())
+        {
+            log.warn(format!("Overlay-Frame: {err}"));
+            break;
+        }
+        thread::sleep(OVERLAY_TICK);
+    }
+    // Egal ob regulärer Shutdown oder dauerhafter Fehler: Ab hier gibt es
+    // keinen Consumer mehr, und der Audio-Callback hört auf zu rechnen
+    // (Sol-Impl-Review Major 4).
+    level.deactivate();
+    // Der `Drop` räumt Fenster, Klasse und DIB ab — auf dem Owner-Thread.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1364,6 +1543,50 @@ mod tests {
                 other.is_ok()
             ),
         }
+    }
+
+    /// Sol Major 7: Pro Runde werden alle Overlay-Kommandos gedraint und auf
+    /// den **letzten** Sichtbarkeitswunsch reduziert. Sonst zeigte ein
+    /// schneller Tray-Toggle (`Show → Hide → Show`) die Karte verzögert oder
+    /// gar nach dem Ende der Aufnahme.
+    #[cfg(windows)]
+    #[test]
+    fn overlay_commands_coalesce_and_shutdown_wins() {
+        let (tx, rx) = mpsc::channel();
+        assert_eq!(
+            drain_overlay_commands(&rx),
+            OverlayRound {
+                visible: None,
+                shutdown: false
+            },
+            "leere Runde ändert nichts"
+        );
+
+        for cmd in [OverlayCmd::Show, OverlayCmd::Hide, OverlayCmd::Show] {
+            tx.send(cmd).unwrap();
+        }
+        assert_eq!(
+            drain_overlay_commands(&rx),
+            OverlayRound {
+                visible: Some(true),
+                shutdown: false
+            }
+        );
+
+        // `Shutdown` hat Vorrang — auch über ein `Show`, das noch dahinter
+        // liegt.
+        tx.send(OverlayCmd::Hide).unwrap();
+        tx.send(OverlayCmd::Shutdown).unwrap();
+        tx.send(OverlayCmd::Show).unwrap();
+        let round = drain_overlay_commands(&rx);
+        assert!(round.shutdown);
+        assert_eq!(round.visible, None, "nach dem Shutdown wird nichts gezeigt");
+
+        // Ein abgerissener Kanal (Daemon weg) ist dasselbe wie `Shutdown`.
+        let (tx, rx) = mpsc::channel::<OverlayCmd>();
+        tx.send(OverlayCmd::Show).unwrap();
+        drop(tx);
+        assert!(drain_overlay_commands(&rx).shutdown);
     }
 
     /// Ein lebender Kanal meldet nichts — sonst hätte jeder normale Befehl

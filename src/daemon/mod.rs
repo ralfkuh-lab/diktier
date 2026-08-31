@@ -46,6 +46,8 @@ use crate::tray;
 
 use dispatch::{Actors, QuitLatch, Timers, drive, enqueue_batch};
 use logging::Logger;
+#[cfg(windows)]
+use workers::OverlayWorker;
 use workers::{
     AudioWorker, DownloadWorker, EngineWorker, HotkeyWorker, InjectWorker, Msg, TrayWorker,
     WorkerKind,
@@ -253,13 +255,51 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
         }
     };
 
+    // §4.5: Der Pegel-Tap entsteht **nur**, wenn das Overlay wirklich läuft —
+    // sonst rechnet der cpal-Callback ihn gar nicht erst aus (Overlay-Plan
+    // Leitentscheidung 10, echter Null-Kosten-Pfad). Das Overlay gibt es nur
+    // unter Windows (Plattform-Entscheidung 2026-08-27).
+    let overlay_enabled = cfg!(windows) && config.overlay.enabled;
+    let wanted_tap = overlay_enabled.then(crate::audio::level::new_tap);
+
+    // §4.5: „Ein Overlay-Fehler deaktiviert nur das Overlay (Log-Warnung);
+    // Diktieren läuft weiter." Deshalb **kein** Abbruch wie bei Tray/Audio.
+    //
+    // Und deshalb **vor** dem AudioWorker (Sol-Impl-Review Major 4): Erst wenn
+    // der Ready-Handshake steht, gibt es einen Consumer für den Pegel. Ohne
+    // ihn bekommt der cpal-Callback gar keinen Tap und rechnet nichts aus.
+    // Stirbt der Overlay-Thread später, schaltet er den Tap selbst ab.
+    #[cfg(windows)]
+    let (overlay, level_tap) = match wanted_tap {
+        Some(tap) => match OverlayWorker::spawn(tap.clone(), log.clone()) {
+            Ok(worker) => (Some(worker), Some(tap)),
+            Err(err) => {
+                log.warn(format!(
+                    "Aufnahme-Overlay nicht verfügbar: {err} — Diktieren läuft ohne"
+                ));
+                (None, None)
+            }
+        },
+        None => {
+            log.info("Aufnahme-Overlay ausgeschaltet ([overlay] enabled = false)");
+            (None, None)
+        }
+    };
+    // Linux kennt kein Overlay — dort ist der Tap immer `None` (siehe oben).
+    #[cfg(not(windows))]
+    let level_tap = wanted_tap;
+
     // codex M2: Ein Worker, der nicht startet, ist ein Startfehler — sonst
     // liefe der Daemon ohne Mikrofon bzw. ohne Hotkey stumm weiter.
-    let audio = match AudioWorker::spawn(config.audio.clone(), tx.clone(), log.clone()) {
+    let audio = match AudioWorker::spawn(config.audio.clone(), level_tap, tx.clone(), log.clone()) {
         Ok(worker) => worker,
         Err(err) => {
             log.error(format!("Audio-Worker nicht gestartet: {err}"));
             let (mut inject, mut tray_worker) = (inject, tray_worker);
+            #[cfg(windows)]
+            if let Some(mut overlay) = overlay {
+                overlay.shutdown(Duration::from_secs(2));
+            }
             inject.shutdown(Duration::from_secs(2));
             tray_worker.shutdown(Duration::from_secs(2));
             return 1;
@@ -272,6 +312,10 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
         Err(err) => {
             log.error(format!("Hotkey-Worker nicht gestartet: {err}"));
             let (mut inject, mut tray_worker, mut audio) = (inject, tray_worker, audio);
+            #[cfg(windows)]
+            if let Some(mut overlay) = overlay {
+                overlay.shutdown(Duration::from_secs(2));
+            }
             inject.shutdown(Duration::from_secs(2));
             tray_worker.shutdown(Duration::from_secs(2));
             audio.shutdown(Duration::from_secs(2));
@@ -288,6 +332,10 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
         audio,
         inject,
         tray: tray_worker,
+        #[cfg(windows)]
+        overlay,
+        #[cfg(windows)]
+        overlay_shown: false,
         hotkey,
         hotkey_grabbed: true,
         #[cfg(windows)]
@@ -319,6 +367,13 @@ struct Daemon {
     audio: AudioWorker,
     inject: InjectWorker,
     tray: TrayWorker,
+    /// §4.5: Aufnahme-Overlay. `None` = abgeschaltet oder nicht aufgebaut —
+    /// beides ist kein Fehlerzustand.
+    #[cfg(windows)]
+    overlay: Option<OverlayWorker>,
+    /// Was das Overlay zuletzt zeigen sollte (nur bei Wechsel senden).
+    #[cfg(windows)]
+    overlay_shown: bool,
     hotkey: HotkeyWorker,
     /// §4.4: Hält der Hotkey-Worker die Taste gerade gegriffen?
     hotkey_grabbed: bool,
@@ -363,6 +418,25 @@ enum AudioIntent {
     Released,
 }
 
+/// §4.5: Steht die Overlay-Karte in diesem Zustand?
+///
+/// **Inklusive `Injecting`** (Sol Major 5): Der Vertrag ist „sichtbar bis
+/// `idle`" — nach der Inferenz läuft noch der Paste-/copy_only-Pfad, der
+/// Sekunden dauern kann. Verschwände die Karte schon mit dem Ergebnis, wäre
+/// das Feedback vor dem Ende weg.
+///
+/// Weil der Abgleich **zustands**- und nicht ereignisgetrieben ist (Design
+/// „agy B5"), deckt er Release, Tray-Klick, 60-s-Cap, Pause-Discard und
+/// FatalError von selbst ab. `QuitRequested` läuft bewusst **nicht** hierüber
+/// (es lässt den Zustand unverändert), sondern über den Worker-Shutdown.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn overlay_visible(runtime: &Runtime) -> bool {
+    matches!(
+        runtime.state,
+        AppState::Recording { .. } | AppState::Transcribing { .. } | AppState::Injecting { .. }
+    )
+}
+
 /// Was soll mit dem Aufnahmegerät geschehen? `None` = nicht anfassen
 /// (`recording` gehört dem laufenden Diktat, in der Startsequenz und in
 /// `transcribing`/`injecting` folgt gleich wieder `idle`).
@@ -397,6 +471,18 @@ impl Daemon {
         if self.hotkey_grabbed != grabbed {
             self.hotkey.set_grabbed(grabbed);
             self.hotkey_grabbed = grabbed;
+        }
+
+        // §4.5: Die Karte hängt am Kernzustand — genau wie Tray und Gerät.
+        // Gesendet wird nur bei einem Wechsel; der Worker koalesziert
+        // zusätzlich auf den letzten Wunsch einer Runde.
+        #[cfg(windows)]
+        if let Some(overlay) = &self.overlay {
+            let visible = overlay_visible(runtime);
+            if self.overlay_shown != visible {
+                overlay.set_visible(visible);
+                self.overlay_shown = visible;
+            }
         }
 
         if let Some(intent) = audio_intent(runtime)
@@ -578,6 +664,15 @@ impl Daemon {
         }
 
         let mut stuck: Vec<&'static str> = Vec::new();
+        // §4.5: Das Overlay zuerst — die Karte soll weg sein, bevor der Rest
+        // abbaut. Ein Timeout landet wie bei den übrigen Workern im harten
+        // Prozessende.
+        #[cfg(windows)]
+        if let Some(overlay) = &mut self.overlay
+            && !overlay.shutdown(remaining(deadline).min(Duration::from_secs(2)))
+        {
+            stuck.push("overlay");
+        }
         if !self
             .hotkey
             .shutdown(remaining(deadline).min(Duration::from_secs(2)))
@@ -981,6 +1076,45 @@ mod tests {
             state,
             paused,
             ..Runtime::default()
+        }
+    }
+
+    /// §4.5: Die Karte steht in `recording`, `transcribing` **und**
+    /// `injecting` — und sonst nirgends. Geprüft über **alle**
+    /// `AppState`-Varianten, damit ein neuer Zustand hier auffällt.
+    #[test]
+    fn the_overlay_is_visible_from_recording_until_idle() {
+        use crate::state::RecordingSource::{Hotkey, TrayClick};
+
+        for source in [Hotkey, TrayClick] {
+            for state in [
+                AppState::Recording { source },
+                AppState::Transcribing { source },
+                AppState::Injecting { source },
+            ] {
+                assert!(
+                    overlay_visible(&runtime_in(state, false)),
+                    "{state:?} muss die Karte zeigen"
+                );
+                // Der Pausezustand ändert daran nichts: eine laufende
+                // Aufnahme wird davon nicht unsichtbar.
+                assert!(overlay_visible(&runtime_in(state, true)));
+            }
+        }
+
+        for state in [
+            AppState::Starting,
+            AppState::Downloading,
+            AppState::Loading,
+            AppState::Idle,
+            AppState::Error,
+        ] {
+            for paused in [false, true] {
+                assert!(
+                    !overlay_visible(&runtime_in(state, paused)),
+                    "{state:?} darf keine Karte zeigen"
+                );
+            }
         }
     }
 

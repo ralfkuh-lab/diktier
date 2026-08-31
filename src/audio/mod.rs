@@ -5,6 +5,8 @@
 mod capture;
 mod convert;
 mod gate;
+/// Mikrofonpegel fürs Aufnahme-Overlay (§4.5).
+pub mod level;
 mod resample;
 mod spsc;
 
@@ -13,6 +15,7 @@ use std::path::Path;
 use thiserror::Error;
 
 pub use capture::CpalAudioSource;
+pub use level::LevelTap;
 
 pub const ENGINE_RATE: u32 = 16_000;
 

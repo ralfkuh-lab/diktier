@@ -322,11 +322,13 @@ gelten entsprechend nur noch für Win10/Win11.
   Modifier-Chord braucht ein eigenes Hook-Zustandsmodell (Halten beginnt beim
   zweiten Down, endet beim ersten Up, Einzeltasten müssen durchgehen) auf
   beiden Plattformen. Folgepaket nach dem Dev-Milestone.
-- 🔍 **Aufnahme-Indikator** (Wunsch Ralf 2026-08-27): Tray-Icons lassen sich
+- ✅ **Aufnahme-Indikator** (Wunsch Ralf 2026-08-27): Tray-Icons lassen sich
   unter Win11 nicht programmatisch sichtbar erzwingen (einmal manuell
-  anheften, pfadgebunden). Alternative: kleines randloses Overlay
-  (`WS_EX_NOACTIVATE|WS_EX_TOPMOST|WS_EX_TOOLWINDOW`) nur während
-  `recording`, kein Fokuswechsel — SPEC §4.2-konform. Folgepaket.
+  anheften, pfadgebunden). Umgesetzt als randloses Layered-Window-Overlay
+  (`WS_EX_LAYERED|WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT`
+  plus `WM_NCHITTEST → HTTRANSPARENT`) mit Mikrofonpegel, sichtbar von
+  `recording` bis `idle`, kein Fokuswechsel — SPEC §4.2/§4.5-konform. Plan und
+  Verträge: [overlay-plan.md](overlay-plan.md).
 - 🔍 Sol-Gesamtreview offen: `CTRL_CLOSE_EVENT` ohne Cleanup-Ack (nur
   `--foreground`-Konsole), `WM_ENDSESSION` nur über Poll-Queue, Tray-Retry
   nach fehlgeschlagenem `NIM_ADD`, Pfad-Kanonisierung Download-Mutex.

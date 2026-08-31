@@ -1,11 +1,14 @@
-# Diktier — Spec v1.3
+# Diktier — Spec v1.4
 
-Stand: 2026-08-26. Verbindlich für die Implementierung. Änderungen nur über
+Stand: 2026-08-31. Verbindlich für die Implementierung. Änderungen nur über
 diesen Text.
 
 v1.1: Codex-Review (`docs/reviews/spec-codex.md`). v1.2: Agy-Kreuz-Review
 (`docs/reviews/spec-agy.md`). v1.3: Claude-Review
 (`docs/reviews/spec-claude.md`). Entscheidungen in §17 und §18.
+v1.4 (2026-08-31, Ralf): Aufnahme-Overlay aus v2 vorgezogen — §2-Eintrag
+gestrichen, neu §4.5 und `[overlay]` in §8; Plan
+`docs/overlay-plan.md`, Review `docs/reviews/plan-overlay-sol.md`.
 
 ## 1. Ziel
 
@@ -34,7 +37,7 @@ Cursor, Tray, Config, Autostart. Kein Preview-Dialog.
 - Cinnamon **Wayland** (Programm startet mit verständlichem Fehler, ohne
   Hotkey; Tray darf Quit anbieten)
 - Meeting-Transkription, Diarization
-- OSD/Waveform-Overlay
+- ~~OSD/Waveform-Overlay~~ (v1.4: vorgezogen, siehe §4.5)
 - Cloud, Telemetrie
 - Whisper-`initial_prompt`, Wortersetzungen
 - Tastensimulation als Default-Ausgabe
@@ -153,6 +156,23 @@ logisches Release.
 
 Verlorenes Release (z. B. Desktop gesperrt): nach dem 60-s-Cap genau
 einmal transkribieren; ein späteres Release ignorieren.
+
+### 4.5 Aufnahme-Overlay (Windows, v1.4)
+
+Während `recording`, `transcribing` und `injecting` zeigt ein kleines,
+randloses Layered Window unten mittig (Monitor des fokussierten
+Fensters) den Mikrofonpegel: scrollende Waveform-Historie plus
+Pegelmeter mit Peak-Hold, Optik nach Omarchy-Voxtype-OSD. Bei `idle`,
+`error` und in allen Abbruchpfaden (Pause-Discard, Quit) verschwindet
+es.
+
+Die Fokusregel §4.2 gilt uneingeschränkt: `WS_EX_NOACTIVATE`,
+`SW_SHOWNOACTIVATE`, keine Fokus-APIs, durchklickbar
+(`WS_EX_TRANSPARENT` + `WM_NCHITTEST → HTTRANSPARENT`). Ein
+Overlay-Fehler (Fensterbau, Rendering) deaktiviert nur das Overlay
+(Log-Warnung); Diktieren läuft weiter. Abschaltbar über
+`[overlay] enabled` (§8). Windows-only; Details und Verträge:
+`docs/overlay-plan.md`.
 
 ## 5. Architektur
 
@@ -476,6 +496,9 @@ restore_clipboard_delay_ms = 200
 
 [tray]
 show_notifications_on_error = true
+
+[overlay]
+enabled = true          # Aufnahme-Overlay (§4.5), Windows-only
 ```
 
 Validierung:
@@ -688,7 +711,8 @@ Kein GUI-Snapshot.
 - Zweiter Hotkey → Review-Dialog (darf Fokus nehmen). PTT bleibt fokusfrei.
 - `OutputSink::review`.
 - Wortersetzungen.
-- Optional OSD, `parakeet-primeline`, weitere Modelle nach eigenem Gate.
+- `parakeet-primeline`, weitere Modelle nach eigenem Gate. (OSD: seit
+  v1.4 in v1, §4.5.)
 - HTTP ist Nicht-Ziel und wird nicht vorbereitet.
 
 ## 15. Abgrenzung WhisperDictate

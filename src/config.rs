@@ -32,6 +32,9 @@ restore_clipboard_delay_ms = 200
 
 [tray]
 show_notifications_on_error = true
+
+[overlay]
+enabled = true          # Aufnahme-Overlay (§4.5), Windows-only
 "#;
 
 const HOTKEY_KEYS: &[&str] = &["key", "modifiers", "mode"];
@@ -45,6 +48,7 @@ const OUTPUT_KEYS: &[&str] = &[
     "restore_clipboard_delay_ms",
 ];
 const TRAY_KEYS: &[&str] = &["show_notifications_on_error"];
+const OVERLAY_KEYS: &[&str] = &["enabled"];
 
 const NAMED_KEYS: &[&str] = &[
     "Space",
@@ -105,6 +109,7 @@ pub struct Config {
     pub engine: EngineConfig,
     pub output: OutputConfig,
     pub tray: TrayConfig,
+    pub overlay: OverlayConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +173,13 @@ pub struct TrayConfig {
     pub show_notifications_on_error: bool,
 }
 
+/// §4.5: Aufnahme-Overlay. Default an; unter Linux ohne Wirkung
+/// (Windows-only, Plattform-Entscheidung 2026-08-27).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayConfig {
+    pub enabled: bool,
+}
+
 impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
@@ -217,6 +229,12 @@ impl Default for TrayConfig {
     }
 }
 
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawConfig {
@@ -225,6 +243,7 @@ struct RawConfig {
     engine: RawEngine,
     output: RawOutput,
     tray: RawTray,
+    overlay: RawOverlay,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,6 +334,18 @@ impl Default for RawTray {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RawOverlay {
+    enabled: bool,
+}
+
+impl Default for RawOverlay {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Linux: `~/.config/diktier/config.toml`. Windows: `%APPDATA%\diktier\config.toml`.
 pub fn config_path() -> Result<PathBuf, ConfigError> {
     #[cfg(target_os = "linux")]
@@ -390,6 +421,7 @@ fn collect_unknown_keys(value: &toml::Value, warnings: &mut Vec<String>) {
             "engine" => collect_unknown_table(val, "engine", ENGINE_KEYS, warnings),
             "output" => collect_unknown_table(val, "output", OUTPUT_KEYS, warnings),
             "tray" => collect_unknown_table(val, "tray", TRAY_KEYS, warnings),
+            "overlay" => collect_unknown_table(val, "overlay", OVERLAY_KEYS, warnings),
             other => warnings.push(format!(
                 "Unbekannter Config-Schlüssel wird ignoriert: {other}"
             )),
@@ -510,6 +542,10 @@ fn validate_and_clamp(raw: RawConfig, warnings: &mut Vec<String>) -> Result<Conf
         },
         tray: TrayConfig {
             show_notifications_on_error: raw.tray.show_notifications_on_error,
+        },
+        // Nichts zu clampen: ein einzelner Schalter (§4.5).
+        overlay: OverlayConfig {
+            enabled: raw.overlay.enabled,
         },
     })
 }
@@ -697,6 +733,31 @@ mod tests {
         assert_eq!(loaded.config, Config::default());
         assert!(loaded.warnings.is_empty());
         assert!(!loaded.created);
+    }
+
+    /// §4.5: Das Overlay ist per Default an, lässt sich abschalten, und eine
+    /// fehlende Sektion ist kein Fehler (bestehende config.toml aus einer
+    /// älteren Version).
+    #[test]
+    fn overlay_defaults_to_on_and_can_be_switched_off() {
+        let missing = parse_toml("[hotkey]\nkey = \"F9\"\n").unwrap();
+        assert!(
+            missing.config.overlay.enabled,
+            "fehlende Sektion heißt Default an"
+        );
+        assert!(missing.warnings.is_empty());
+
+        let off = parse_toml("[overlay]\nenabled = false\n").unwrap();
+        assert!(!off.config.overlay.enabled);
+        assert!(off.warnings.is_empty());
+
+        let on = parse_toml("[overlay]\nenabled = true\n").unwrap();
+        assert!(on.config.overlay.enabled);
+
+        // Tippfehler in der Sektion: ignorieren + Warnung (§8-Tabelle).
+        let typo = parse_toml("[overlay]\nenable = false\n").unwrap();
+        assert!(typo.config.overlay.enabled, "unbekannter Key wirkt nicht");
+        assert_warning_contains(&typo.warnings, "overlay.enable");
     }
 
     #[test]

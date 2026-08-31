@@ -10,11 +10,12 @@ use cpal::{ErrorKind, SampleFormat, Stream, StreamConfig, SupportedStreamConfig}
 use crate::config::AudioConfig;
 
 use super::convert::{
-    downmix_interleaved, f64_interleaved_to_f32, i8_interleaved_to_f32, i16_interleaved_to_f32,
-    i32_interleaved_to_f32, i64_interleaved_to_f32, u8_interleaved_to_f32, u16_interleaved_to_f32,
-    u32_interleaved_to_f32,
+    ToUnitF32, downmix_interleaved, f64_interleaved_to_f32, i8_interleaved_to_f32,
+    i16_interleaved_to_f32, i32_interleaved_to_f32, i64_interleaved_to_f32, u8_interleaved_to_f32,
+    u16_interleaved_to_f32, u32_interleaved_to_f32,
 };
 use super::gate::CaptureGate;
+use super::level::{self, LevelTap};
 use super::resample::resample_mono_to_16k;
 use super::spsc::OverwriteSpsc;
 use super::{AudioError, CapturedAudio, ENGINE_RATE};
@@ -113,6 +114,13 @@ pub struct CpalAudioSource {
     /// sofort (der Stream läuft trotzdem weiter, damit das Gerät nicht
     /// suspendiert).
     gate: Arc<CaptureGate>,
+    /// Pegel fürs Aufnahme-Overlay (§4.5). `None` = Overlay aus; dann rechnet
+    /// der Callback gar nicht erst (Overlay-Plan Leitentscheidung 2).
+    level: Option<Arc<LevelTap>>,
+    /// Generation des **aktuell offenen** Streams. Sein Callback trägt genau
+    /// diesen Wert; wechselt er, ist der alte Stream für den Tap tot
+    /// (Sol-Impl-Review Major 2).
+    level_generation: u32,
     recording: bool,
     native_rate: u32,
     native_channels: u16,
@@ -123,7 +131,9 @@ pub struct CpalAudioSource {
 }
 
 impl CpalAudioSource {
-    pub fn new(config: &AudioConfig) -> Self {
+    /// `level`: geteilter Pegel fürs Overlay oder `None`, wenn es aus ist.
+    pub fn new(config: &AudioConfig, level: Option<Arc<LevelTap>>) -> Self {
+        let level_generation = level.as_ref().map(|tap| tap.generation()).unwrap_or(0);
         Self {
             wanted_device: config.device.clone(),
             max_duration_secs: config.max_duration_secs.max(1),
@@ -131,6 +141,8 @@ impl CpalAudioSource {
             ring: None,
             lost: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(CaptureGate::new()),
+            level,
+            level_generation,
             recording: false,
             native_rate: 0,
             native_channels: 0,
@@ -185,6 +197,11 @@ impl CpalAudioSource {
         let opened_at = Instant::now();
         self.stream = None;
         self.ring = None;
+        // **Vor** dem ersten falliblen Schritt (Sol-Impl-Review Major 3): Der
+        // alte Stream ist gerade gefallen, seine Generation ist damit tot —
+        // auch wenn das Öffnen gleich scheitert. Der neue Callback bekommt die
+        // frische Generation weiter unten mit.
+        self.new_level_generation();
         let (_host, device) = self.host_and_device()?;
         let name = device
             .description()
@@ -206,34 +223,99 @@ impl CpalAudioSource {
         // alten `Arc` und kann den neuen Ring nicht mehr sehen.
         self.gate = Arc::new(CaptureGate::new());
         let gate = &self.gate;
+        let tap = self.level.as_ref();
+        let generation = self.level_generation;
         let (stream, ring) = match sample_format {
-            SampleFormat::I8 => {
-                build_i8(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
-            SampleFormat::U8 => {
-                build_u8(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
-            SampleFormat::I16 => {
-                build_i16(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
-            SampleFormat::U16 => {
-                build_u16(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
-            SampleFormat::I32 => {
-                build_i32(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
-            SampleFormat::U32 => {
-                build_u32(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
-            SampleFormat::I64 => {
-                build_i64(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
-            SampleFormat::F32 => {
-                build_f32(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
-            SampleFormat::F64 => {
-                build_f64(&device, &config, min_samples, channels, &self.lost, gate)?
-            }
+            SampleFormat::I8 => build_i8(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
+            SampleFormat::U8 => build_u8(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
+            SampleFormat::I16 => build_i16(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
+            SampleFormat::U16 => build_u16(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
+            SampleFormat::I32 => build_i32(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
+            SampleFormat::U32 => build_u32(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
+            SampleFormat::I64 => build_i64(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
+            SampleFormat::F32 => build_f32(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
+            SampleFormat::F64 => build_f64(
+                &device,
+                &config,
+                min_samples,
+                channels,
+                &self.lost,
+                gate,
+                tap,
+                generation,
+            )?,
             other => {
                 return Err(AudioError::Failed(format!(
                     "Sampleformat {other:?} wird nicht unterstützt"
@@ -262,8 +344,45 @@ impl CpalAudioSource {
         if result.is_err() {
             self.lost.store(true, Ordering::Release);
             self.stream = None;
+            // Reset-Matrix (c): ein fehlgeschlagenes `play()` heißt Gerät
+            // verloren. Der Stream ist weg — also stirbt auch seine
+            // Generation, und das Overlay bleibt nicht auf dem letzten Peak
+            // stehen.
+            self.new_level_generation();
         }
         result
+    }
+
+    /// Neue Stream-Generation: Peak auf 0 **und** alle Callbacks des alten
+    /// Streams dauerhaft abgeklemmt (Sol-Impl-Review Major 2 und 3).
+    ///
+    /// Genau hier liegt der Unterschied zu einem bloßen `clear()`: Ein
+    /// Callback, der den Gate-Abschnitt schon betreten hat, läuft nach einem
+    /// `disarm()` noch bis zu seinem Publish weiter. Ein gelöschter Peak wäre
+    /// von ihm sofort wieder überschrieben; eine gewechselte Generation nicht
+    /// — sein `compare_exchange` scheitert und er bricht ab.
+    ///
+    /// Aufgerufen wird das dort, wo ein Stream **entsteht oder verschwindet**:
+    /// `open()`, `release()`, `discard_after_stuck_producer()` und
+    /// fehlgeschlagenes `play()`.
+    fn new_level_generation(&mut self) {
+        if let Some(tap) = &self.level {
+            self.level_generation = tap.bump_generation();
+        }
+    }
+
+    /// Peak auf Stille, Generation unverändert — für die Stellen, an denen
+    /// derselbe Stream weiterläuft: `start()` vor `arm()` und `stop()` nach
+    /// `disarm()` + erfolgreichem `wait_idle()`.
+    ///
+    /// Der Zeitpunkt ist kein Detail: Weil der Tap **innerhalb** desselben
+    /// Gate-Abschnitts wie die Ring-Writes publiziert wird, beweist
+    /// `wait_idle()` auch das Ende der Tap-Publikation (Sol Major 3 des
+    /// Plan-Reviews). Wo dieser Beweis fehlt, steht [`Self::new_level_generation`].
+    fn clear_level(&self) {
+        if let Some(tap) = &self.level {
+            tap.clear();
+        }
     }
 
     /// Gerät und Ring wegwerfen, weil der Producer nicht zur Ruhe kam
@@ -273,10 +392,23 @@ impl CpalAudioSource {
         self.lost.store(true, Ordering::Release);
         self.stream = None;
         self.ring = None;
+        // Der neue Lauf bekommt ein **eigenes** Gate. Der hängende Callback
+        // hält aber weiter den alten Guard und darf bis zu seinem Publish
+        // laufen — deshalb reicht das Gate hier nicht, und die Generation
+        // wechselt mit (Sol-Impl-Review Major 2).
         self.gate = Arc::new(CaptureGate::new());
+        self.new_level_generation();
     }
 }
 
+/// §6.4: Ein Fehler außer Xrun heißt „Gerät verloren".
+///
+/// Der Pegel wird hier **nicht** angefasst (Sol-Impl-Review Major 3): Dieser
+/// Callback entwaffnet kein Gate und wartet auf keinen In-flight-Zähler, ein
+/// Reset von hier aus wäre also sofort von einem parallel laufenden
+/// Daten-Callback überschreibbar. Der stabile Reset passiert auf dem
+/// Owner-Thread — `is_open()` meldet das verlorene Gerät, der nächste
+/// `prepare()`/`start()` läuft in `open()` und wechselt dort die Generation.
 fn err_fn(lost: Arc<AtomicBool>) -> impl FnMut(cpal::Error) + Send + 'static {
     move |err| {
         if err.kind() != ErrorKind::Xrun {
@@ -295,10 +427,19 @@ fn err_fn(lost: Arc<AtomicBool>) -> impl FnMut(cpal::Error) + Send + 'static {
 ///
 /// Der Guard hält den In-flight-Zähler über **alle** Ringzugriffe — daran
 /// erkennt der Consumer, wann `drain`/`reset` sicher sind (codex H1).
+///
+/// Der Pegel fürs Overlay (§4.5) wird **innerhalb** desselben Gate-Abschnitts
+/// publiziert und trägt die Generation des Streams, zu dem dieser Callback
+/// gehört. Ist `tap` `None` (Overlay aus) oder hat der Consumer sich
+/// abgemeldet, kostet das einen Branch bzw. einen Relaxed-Load **pro
+/// Callback-Buffer**, nicht pro Sample — gerechnet wird dann gar nichts
+/// (Sol Major 4 des Plan-Reviews, Major 4 des Impl-Reviews).
 #[inline]
-fn push_if_armed<T: Copy + Default>(
+fn push_if_armed<T: Copy + Default + ToUnitF32>(
     gate: &CaptureGate,
     ring: &OverwriteSpsc<T>,
+    tap: Option<&LevelTap>,
+    generation: u32,
     data: &[T],
     channels: usize,
 ) {
@@ -308,10 +449,33 @@ fn push_if_armed<T: Copy + Default>(
     for frame in data.chunks_exact(channels) {
         ring.push_frame(frame);
     }
+    publish_level(tap, generation, data, channels);
+}
+
+/// Der Publish-Schritt aus [`push_if_armed`], als eigene Funktion — so kann
+/// der Test einen Callback exakt an dieser Stelle anhalten (Sol-Impl-Review
+/// Major 2 verlangt die Barriere **innerhalb** des betretenen Abschnitts).
+#[inline]
+fn publish_level<T: ToUnitF32>(
+    tap: Option<&LevelTap>,
+    generation: u32,
+    data: &[T],
+    channels: usize,
+) {
+    let Some(tap) = tap else {
+        return;
+    };
+    // Erst fragen, dann rechnen: Ohne Consumer wird der Buffer nicht mehr
+    // angefasst.
+    if !tap.is_active() {
+        return;
+    }
+    tap.publish(generation, level::buffer_peak(data, channels));
 }
 
 macro_rules! impl_build {
     ($name:ident, $ty:ty, $variant:ident) => {
+        #[allow(clippy::too_many_arguments)]
         fn $name(
             device: &cpal::Device,
             config: &StreamConfig,
@@ -319,15 +483,23 @@ macro_rules! impl_build {
             channels: u16,
             lost: &Arc<AtomicBool>,
             gate: &Arc<CaptureGate>,
+            level: Option<&Arc<LevelTap>>,
+            generation: u32,
         ) -> Result<(Stream, TypedRing), AudioError> {
             let ring = Arc::new(OverwriteSpsc::<$ty>::new(min_samples, channels as usize));
             let prod = ring.clone();
             let gate = gate.clone();
+            // Die Generation gehört zu **diesem** Stream und ändert sich nie
+            // mehr: Wechselt der Owner-Thread sie, ist dieser Callback für den
+            // Tap tot (Sol-Impl-Review Major 2).
+            let tap = level.cloned();
             let ch = channels as usize;
             let stream = device
                 .build_input_stream(
                     *config,
-                    move |data: &[$ty], _| push_if_armed(&gate, &prod, data, ch),
+                    move |data: &[$ty], _| {
+                        push_if_armed(&gate, &prod, tap.as_deref(), generation, data, ch)
+                    },
                     err_fn(lost.clone()),
                     None,
                 )
@@ -376,6 +548,10 @@ impl super::AudioSource for CpalAudioSource {
         self.gate.disarm();
         self.stream = None;
         self.ring = None;
+        // Reset-Matrix (c): pausiert wird kein Pegel mehr angezeigt. Hier
+        // fällt der Stream, ohne dass auf seinen Callback gewartet wird —
+        // also die Generation wechseln, nicht bloß den Peak löschen.
+        self.new_level_generation();
     }
 
     fn start(&mut self) -> Result<(), AudioError> {
@@ -398,6 +574,11 @@ impl super::AudioSource for CpalAudioSource {
         if let Some(ring) = &self.ring {
             ring.reset();
         }
+        // Reset-Matrix (a): **vor** `arm()`, damit kein Peak der letzten
+        // Aufnahme in die neue hineinragt. Der Stream bleibt derselbe — seine
+        // Generation muss also stehen bleiben, sonst publizierte sein
+        // Callback nie wieder.
+        self.clear_level();
         self.play_stream()?;
         self.gate.arm();
         self.recording = true;
@@ -420,6 +601,11 @@ impl super::AudioSource for CpalAudioSource {
                     .into(),
             ));
         }
+        // Reset-Matrix (b): erst **nach** `disarm()` + erfolgreichem
+        // `wait_idle()` — jetzt ist bewiesen, dass kein Callback mehr
+        // publiziert. Während `transcribing`/`injecting` läuft die Waveform
+        // damit sichtbar leer (Overlay-Plan Leitentscheidung 5).
+        self.clear_level();
         let Some(ring) = &self.ring else {
             return Err(AudioError::Failed("keine Aufnahme".into()));
         };
@@ -657,7 +843,7 @@ mod tests {
         let ring = OverwriteSpsc::<f32>::new(64, 1);
         let gate = CaptureGate::new();
         for _ in 0..50 {
-            push_if_armed(&gate, &ring, &[0.5, 0.5, 0.5, 0.5], 1);
+            push_if_armed(&gate, &ring, None, 0, &[0.5, 0.5, 0.5, 0.5], 1);
         }
         let mut out = Vec::new();
         ring.drain(&mut out);
@@ -667,7 +853,7 @@ mod tests {
         assert_eq!(gate.in_flight(), 0, "kein Producer bleibt im Gate hängen");
 
         gate.arm();
-        push_if_armed(&gate, &ring, &[0.25, 0.5], 1);
+        push_if_armed(&gate, &ring, None, 0, &[0.25, 0.5], 1);
         let mut out = Vec::new();
         ring.drain(&mut out);
         assert_eq!(out, vec![0.25, 0.5], "scharf nimmt der Callback an");
@@ -680,10 +866,201 @@ mod tests {
         let ring = OverwriteSpsc::<i16>::new(8, 2);
         let gate = CaptureGate::new();
         gate.arm();
-        push_if_armed(&gate, &ring, &[1, 2, 3, 4, 5], 2);
+        push_if_armed(&gate, &ring, None, 0, &[1, 2, 3, 4, 5], 2);
         let mut out = Vec::new();
         ring.drain(&mut out);
         assert_eq!(out, vec![1, 2, 3, 4], "unvollständiges Frame bleibt liegen");
+    }
+
+    /// §4.5: Der Pegel entsteht im selben Gate-Abschnitt wie die Ring-Writes.
+    /// Also gilt auch für ihn: entwaffnet wird nichts publiziert.
+    #[test]
+    fn the_level_tap_is_published_only_inside_the_gate() {
+        let ring = OverwriteSpsc::<f32>::new(64, 1);
+        let gate = CaptureGate::new();
+        let tap = level::new_tap();
+        let generation = tap.generation();
+
+        for _ in 0..10 {
+            push_if_armed(&gate, &ring, Some(&tap), generation, &[0.9, -0.9], 1);
+        }
+        assert_eq!(
+            tap.take(),
+            0.0,
+            "ein entwaffnetes Gate darf keinen Pegel durchlassen"
+        );
+
+        gate.arm();
+        push_if_armed(&gate, &ring, Some(&tap), generation, &[0.25, -0.5, 0.1], 1);
+        assert!((tap.take() - 0.5).abs() < 1e-6, "Betragspeak");
+        assert_eq!(tap.take(), 0.0, "danach steht der Tap wieder auf 0");
+    }
+
+    /// Sol-Impl-Review Major 4: Meldet sich der Consumer ab, wird im Callback
+    /// weder gerechnet noch publiziert — der Pegelpfad kostet dann nur noch
+    /// den einen Relaxed-Load pro Buffer.
+    #[test]
+    fn a_deactivated_consumer_stops_the_level_path_in_the_callback() {
+        let ring = OverwriteSpsc::<f32>::new(256, 1);
+        let gate = CaptureGate::new();
+        let tap = level::new_tap();
+        let generation = tap.generation();
+        gate.arm();
+
+        push_if_armed(&gate, &ring, Some(&tap), generation, &[0.5], 1);
+        assert!((tap.take() - 0.5).abs() < 1e-6);
+
+        tap.deactivate();
+        for _ in 0..100 {
+            push_if_armed(&gate, &ring, Some(&tap), generation, &[1.0], 1);
+        }
+        assert_eq!(tap.take(), 0.0, "ohne Consumer wird nichts mehr publiziert");
+
+        // Die Aufnahme selbst läuft davon unbeeindruckt weiter.
+        let mut out = Vec::new();
+        ring.drain(&mut out);
+        assert_eq!(out.len(), 101, "der Ring bekommt weiter jedes Frame");
+    }
+
+    /// Sol-Impl-Review Major 2, der harte Fall: Der alte Callback hat den
+    /// Gate-Abschnitt **schon betreten**, als der Owner-Thread den
+    /// Stuck-Producer-Pfad läuft (`disarm`, neues Gate, neue Generation, neu
+    /// `arm`). Erst danach kommt er zu seinem Publish — und darf den Pegel des
+    /// neuen Streams trotzdem nicht anfassen.
+    ///
+    /// Die Barriere sitzt deshalb **innerhalb** des betretenen Abschnitts,
+    /// genau an der Stelle, an der `push_if_armed` seinen Publish macht (das
+    /// ist `publish_level`, dieselbe Zeile).
+    #[test]
+    fn an_in_flight_callback_of_the_old_stream_cannot_publish_into_the_new_one() {
+        let tap = level::new_tap();
+        let old_gate = Arc::new(CaptureGate::new());
+        let old_ring = Arc::new(OverwriteSpsc::<f32>::new(64, 1));
+        let old_generation = tap.generation();
+        old_gate.arm();
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let switched = Arc::new(std::sync::Barrier::new(2));
+        let straggler = {
+            let (gate, ring, tap) = (old_gate.clone(), old_ring.clone(), tap.clone());
+            let (entered, switched) = (entered.clone(), switched.clone());
+            std::thread::spawn(move || {
+                let guard = gate.enter().expect("Gate war scharf");
+                ring.push_frame(&[0.8]);
+                entered.wait();
+                switched.wait();
+                // Ab hier ist der Stream längst weggeworfen — der Callback
+                // weiß das nicht und läuft in seinen Publish.
+                publish_level(Some(&tap), old_generation, &[1.0_f32], 1);
+                drop(guard);
+            })
+        };
+
+        entered.wait();
+        // Genau die Sequenz aus `stop()`/`discard_after_stuck_producer()`:
+        old_gate.disarm();
+        assert!(
+            !old_gate.wait_idle(Duration::from_millis(20)),
+            "der Producer steht noch im Gate — deshalb der Stuck-Pfad"
+        );
+        let new_gate = Arc::new(CaptureGate::new());
+        let new_ring = OverwriteSpsc::<f32>::new(64, 1);
+        let new_generation = tap.bump_generation();
+        new_gate.arm();
+
+        switched.wait();
+        straggler.join().unwrap();
+        assert_eq!(
+            tap.take(),
+            0.0,
+            "der Nachzügler darf den neuen Lauf nicht vollaussteuern"
+        );
+
+        // … und der neue Stream schreibt ganz normal weiter.
+        push_if_armed(&new_gate, &new_ring, Some(&tap), new_generation, &[0.3], 1);
+        assert!((tap.take() - 0.3).abs() < 1e-6);
+    }
+
+    /// Sol-Impl-Review Major 3: Der Fehler-Callback markiert nur `lost`. Er
+    /// entwaffnet kein Gate und wartet auf keinen In-flight-Zähler — ein Reset
+    /// von dort wäre vom laufenden Daten-Callback sofort überschrieben. Der
+    /// stabile Reset kommt vom Owner-Thread über die Generation.
+    #[test]
+    fn a_device_error_does_not_race_the_running_callback_for_the_tap() {
+        let gate = CaptureGate::new();
+        let ring = OverwriteSpsc::<f32>::new(64, 1);
+        let tap = level::new_tap();
+        let generation = tap.generation();
+        let lost = Arc::new(AtomicBool::new(false));
+        let mut on_error = err_fn(lost.clone());
+        gate.arm();
+
+        // Gerätefehler …
+        on_error(cpal::Error::new(ErrorKind::DeviceNotAvailable));
+        assert!(lost.load(Ordering::Acquire), "das Gerät gilt als verloren");
+
+        // … und danach ein noch laufender Daten-Callback. Früher hätte der
+        // gerade gelöschte Tap hier sofort wieder einen Peak bekommen.
+        push_if_armed(&gate, &ring, Some(&tap), generation, &[0.9], 1);
+        assert!((tap.take() - 0.9).abs() < 1e-6);
+
+        // Erst der Owner-Thread räumt stabil ab: neue Generation, alter
+        // Callback dauerhaft abgeklemmt.
+        let next = tap.bump_generation();
+        push_if_armed(&gate, &ring, Some(&tap), generation, &[1.0], 1);
+        assert_eq!(tap.take(), 0.0, "der alte Callback kommt nicht mehr durch");
+        assert_ne!(next, generation);
+
+        // Ein Xrun ist kein Geräteverlust.
+        let quiet = Arc::new(AtomicBool::new(false));
+        let mut on_xrun = err_fn(quiet.clone());
+        on_xrun(cpal::Error::new(ErrorKind::Xrun));
+        assert!(!quiet.load(Ordering::Acquire));
+    }
+
+    /// Barrieren-Test analog `wait_idle_blocks_until_the_producer_left_the_gate`:
+    /// Was `wait_idle()` als ruhig meldet, publiziert auch keinen Pegel mehr.
+    #[test]
+    fn no_level_is_published_after_disarm_and_a_successful_wait_idle() {
+        let gate = Arc::new(CaptureGate::new());
+        let ring = Arc::new(OverwriteSpsc::<f32>::new(1_024, 1));
+        let tap = level::new_tap();
+        let generation = tap.generation();
+        gate.arm();
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let producer = {
+            let (gate, ring, tap) = (gate.clone(), ring.clone(), tap.clone());
+            let (entered, release) = (entered.clone(), release.clone());
+            std::thread::spawn(move || {
+                let guard = gate.enter().expect("Gate war scharf");
+                entered.wait();
+                release.wait();
+                // Der Callback steht noch **im** Gate und publiziert erst jetzt.
+                publish_level(Some(&tap), generation, &[0.6_f32], 1);
+                ring.push_frame(&[0.6]);
+                drop(guard);
+            })
+        };
+
+        entered.wait();
+        gate.disarm();
+        assert!(
+            !gate.wait_idle(Duration::from_millis(20)),
+            "solange der Producer im Gate steht, ist es nicht ruhig"
+        );
+
+        release.wait();
+        producer.join().unwrap();
+        assert!(gate.wait_idle(Duration::from_secs(2)));
+        // Genau hier räumt `stop()` den Tap ab (Reset-Matrix b) — der Stream
+        // läuft weiter, also bleibt die Generation stehen …
+        tap.clear();
+        for _ in 0..100 {
+            push_if_armed(&gate, &ring, Some(&tap), generation, &[1.0], 1);
+        }
+        assert_eq!(tap.take(), 0.0, "… und das entwaffnete Gate hält dicht");
     }
 
     /// codex H1, der harte Fall: Ein Callback hängt **im** Ring fest. Dann darf

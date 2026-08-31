@@ -32,6 +32,46 @@ pub fn f64_to_f32(sample: f64) -> f32 {
     sample as f32
 }
 
+/// Ein einzelnes natives Sample → f32 in `[-1, 1]`, ohne Allokation.
+///
+/// Dieselben Faktoren wie die `*_interleaved_to_f32`-Funktionen — der
+/// Pegel-Tap (`super::level`) misst damit exakt das, was später auch in der
+/// Engine landet, ohne dafür einen `Vec` zu bauen (Realtime-Vertrag §6.4).
+///
+/// Bei den vorzeichenbehafteten Formaten steht bewusst der Nenner `2^(n-1)`
+/// statt `MIN.abs()` da: `i32::MIN.abs()` liefe über. Die vorzeichenlosen
+/// Formate sind Offset-Binary um denselben Mittelpunkt.
+pub trait ToUnitF32: Copy {
+    fn to_unit_f32(self) -> f32;
+}
+
+macro_rules! impl_to_unit_f32 {
+    ($ty:ty, $convert:path) => {
+        impl ToUnitF32 for $ty {
+            #[inline]
+            fn to_unit_f32(self) -> f32 {
+                $convert(self)
+            }
+        }
+    };
+}
+
+impl_to_unit_f32!(i8, i8_to_f32);
+impl_to_unit_f32!(u8, u8_to_f32);
+impl_to_unit_f32!(i16, i16_to_f32);
+impl_to_unit_f32!(u16, u16_to_f32);
+impl_to_unit_f32!(i32, i32_to_f32);
+impl_to_unit_f32!(u32, u32_to_f32);
+impl_to_unit_f32!(i64, i64_to_f32);
+impl_to_unit_f32!(f64, f64_to_f32);
+
+impl ToUnitF32 for f32 {
+    #[inline]
+    fn to_unit_f32(self) -> f32 {
+        self
+    }
+}
+
 /// Interleaved → mono. 1 Kanal: Kopie. Sonst arithmetisches Mittel je Frame.
 pub fn downmix_interleaved(interleaved: &[f32], channels: usize) -> Vec<f32> {
     let channels = channels.max(1);

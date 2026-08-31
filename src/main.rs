@@ -14,6 +14,9 @@ mod hotkey;
 #[cfg(windows)]
 mod hotkey_dialog;
 mod inject;
+/// Aufnahme-Overlay (§4.5) — Windows-only, wie der Hotkey-Dialog.
+#[cfg(windows)]
+mod overlay;
 mod paths;
 mod single_instance;
 mod state;
@@ -107,6 +110,16 @@ struct Cli {
         conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test", "record_test"]
     )]
     tray_test: Option<u32>,
+
+    /// SPIKE: Aufnahme-Overlay SECS Sekunden mit Live-Pegel zeigen (nur mit --foreground).
+    #[arg(
+        long,
+        value_name = "SECS",
+        num_args = 0..=1,
+        default_missing_value = "15",
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test", "record_test", "tray_test", "hotkey_dialog_test"]
+    )]
+    overlay_test: Option<u32>,
 }
 
 /// §9/Plan WP5: Als Windows-Subsystem-Programm erbt der Prozess **keine**
@@ -235,6 +248,10 @@ where
         eprintln!("diktier: --hotkey-dialog-test nur mit --foreground (SPIKE)");
         return 2;
     }
+    if cli.overlay_test.is_some() && !cli.foreground {
+        eprintln!("diktier: --overlay-test nur mit --foreground (SPIKE)");
+        return 2;
+    }
     if let Some(text) = cli.inject_test {
         return inject_test(&text);
     }
@@ -249,6 +266,9 @@ where
     }
     if let Some(autoclose) = cli.hotkey_dialog_test {
         return hotkey_dialog_test(autoclose);
+    }
+    if let Some(secs) = cli.overlay_test {
+        return overlay_test(secs);
     }
 
     run_daemon(cli.foreground)
@@ -526,13 +546,30 @@ fn record_test(secs: u32) -> u8 {
         eprintln!("Warnung: {warning}");
     }
 
-    let mut src = CpalAudioSource::new(&loaded.config.audio);
+    // §4.5 / Gate A des Overlay-Plans: derselbe LevelTap wie im Daemon, damit
+    // sich beim Sprechen plausible Peaks und bei Stille 0 nachweisen lassen.
+    let tap = audio::level::new_tap();
+    let mut src = CpalAudioSource::new(&loaded.config.audio, Some(tap.clone()));
     let t_cap = Instant::now();
     if let Err(err) = src.start() {
         eprintln!("{err}");
         return 1;
     }
-    std::thread::sleep(std::time::Duration::from_secs(u64::from(secs)));
+    let record_end = Instant::now() + std::time::Duration::from_secs(u64::from(secs));
+    let mut window_peak = 0.0_f32;
+    let mut next_report = Instant::now() + std::time::Duration::from_millis(500);
+    while Instant::now() < record_end {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        window_peak = window_peak.max(tap.take());
+        if Instant::now() >= next_report {
+            eprintln!(
+                "SPIKE level peak={window_peak:.6} bar={:.2}",
+                audio::level::bar_height(window_peak)
+            );
+            window_peak = 0.0;
+            next_report += std::time::Duration::from_millis(500);
+        }
+    }
     let captured = match src.stop() {
         Ok(c) => c,
         Err(err) => {
@@ -658,6 +695,107 @@ fn hotkey_dialog_test(autoclose_secs: u32) -> u8 {
 #[cfg(not(windows))]
 fn hotkey_dialog_test(_autoclose_secs: u32) -> u8 {
     eprintln!("diktier: --hotkey-dialog-test gibt es nur unter Windows");
+    2
+}
+
+/// SPIKE (§4.5): Aufnahme-Overlay ohne Daemon zeigen — Gate B des
+/// Overlay-Plans (Fokusprobe, Klickdurchgriff, DPI/Monitorwechsel) lässt sich
+/// damit fahren, bevor Config und Kernzustand verdrahtet sind.
+///
+/// Der Pegel kommt vom Default-Gerät. Gibt es keins (oder streikt es), läuft
+/// ein synthetischer Sweep — die Karte soll sich auch dann bewegen.
+#[cfg(windows)]
+fn overlay_test(secs: u32) -> u8 {
+    eprintln!("SPIKE --overlay-test (kein Produktionspfad)");
+    if secs == 0 {
+        eprintln!("diktier: --overlay-test SECS muss ≥ 1 sein");
+        return 2;
+    }
+    let loaded = match config::load() {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!("{err}");
+            return match err {
+                ConfigError::Io(_) => 1,
+                _ => 2,
+            };
+        }
+    };
+
+    let tap = audio::level::new_tap();
+    let mut source = CpalAudioSource::new(&loaded.config.audio, Some(tap.clone()));
+    let live = match source.start() {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!("SPIKE overlay: kein Mikrofon ({err}) — synthetischer Sinus-Sweep");
+            false
+        }
+    };
+    eprintln!(
+        "SPIKE overlay: pegelquelle={}",
+        if live { "mikrofon" } else { "sweep" }
+    );
+
+    let mut window = match overlay::OverlayWindow::new() {
+        Ok(window) => window,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    if let Err(err) = window.show() {
+        eprintln!("{err}");
+        return 1;
+    }
+    eprintln!("SPIKE overlay: karte {}", window.describe());
+    eprintln!(
+        "SPIKE overlay: {secs}s — jetzt in Notepad tippen (§4.2) und durch die Karte klicken"
+    );
+
+    let started = Instant::now();
+    let end = started + std::time::Duration::from_secs(u64::from(secs));
+    let mut last_note = started;
+    while Instant::now() < end {
+        window.pump();
+        let level = if live {
+            tap.take()
+        } else {
+            sweep_level(started.elapsed())
+        };
+        if let Err(err) = window.frame(level) {
+            eprintln!("{err}");
+            return 1;
+        }
+        if last_note.elapsed() >= std::time::Duration::from_secs(3) {
+            last_note = Instant::now();
+            eprintln!("SPIKE overlay: karte {}", window.describe());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    window.hide();
+    if live {
+        let _ = source.stop();
+    }
+    drop(window);
+    eprintln!("SPIKE overlay-test: {secs}s vorbei");
+    0
+}
+
+/// Ersatzpegel ohne Mikrofon: langsam an- und abschwellend, mit kleinem
+/// Flattern — genug, damit Waveform, Meter und Peak-Hold erkennbar arbeiten.
+#[cfg(windows)]
+fn sweep_level(elapsed: std::time::Duration) -> f32 {
+    let t = elapsed.as_secs_f32();
+    let envelope = 0.5 - 0.5 * (t * 0.8).cos();
+    let flutter = 0.5 + 0.5 * (t * 13.0).sin();
+    (envelope * (0.25 + 0.75 * flutter)).clamp(0.0, 1.0)
+}
+
+/// Das Overlay ist Windows-only (Plattform-Entscheidung 2026-08-27).
+#[cfg(not(windows))]
+fn overlay_test(_secs: u32) -> u8 {
+    eprintln!("diktier: --overlay-test gibt es nur unter Windows");
     2
 }
 
@@ -905,5 +1043,37 @@ mod tests {
     #[test]
     fn tray_test_zero_exits_2() {
         assert_eq!(cli_main(["diktier", "--foreground", "--tray-test", "0"]), 2);
+    }
+
+    /// §4.5-Spike: wie die übrigen SPIKE-Flags nur mit `--foreground`, und
+    /// eine Laufzeit von 0 s ergibt kein sinnvolles Overlay.
+    #[test]
+    fn overlay_test_without_foreground_exits_2() {
+        assert_eq!(cli_main(["diktier", "--overlay-test"]), 2);
+        assert_eq!(cli_main(["diktier", "--overlay-test", "5"]), 2);
+    }
+
+    #[test]
+    fn overlay_test_zero_exits_2() {
+        assert_eq!(
+            cli_main(["diktier", "--foreground", "--overlay-test", "0"]),
+            2
+        );
+    }
+
+    /// Zwei Spikes gleichzeitig ergeben keinen Sinn — clap fängt das ab.
+    #[test]
+    fn overlay_test_conflicts_with_the_other_spikes() {
+        assert_eq!(
+            cli_main([
+                "diktier",
+                "--foreground",
+                "--overlay-test",
+                "5",
+                "--tray-test",
+                "5"
+            ]),
+            2
+        );
     }
 }

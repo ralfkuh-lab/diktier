@@ -138,6 +138,24 @@ VS Code.
 `key = "RCtrl"` und `modifiers = ["ctrl"]` löst erst *linke Strg + rechte
 Strg* aus, mit `modifiers = []` die rechte Strg allein.
 
+### Aufnahme-Overlay
+
+Während der Aufnahme erscheint unten mittig auf dem Bildschirm des aktiven
+Fensters eine kleine dunkle Karte mit dem Mikrofonpegel: eine mitlaufende
+Wellenform und darunter ein Pegelmeter mit Peak-Marke. Sie bleibt stehen, bis
+der Text eingefügt ist, und verschwindet dann von selbst.
+
+Die Karte nimmt **nie** den Fokus: Tippen läuft ununterbrochen weiter, und
+Klicks gehen durch sie hindurch auf das Fenster darunter. Eine flache Linie
+trotz Sprechens heißt, dass das Mikrofon stumm oder viel zu leise ist.
+
+Abschalten:
+
+```toml
+[overlay]
+enabled = false
+```
+
 Weitere Schlüssel (selten nötig): `[audio] device`, `max_duration_secs`
 (Obergrenze je Aufnahme, 60 s), `[output] leading_space` (führendes
 Leerzeichen, an), `paste_shortcut` (`auto` erkennt Windows Terminal und nimmt
