@@ -5,7 +5,9 @@ loslassen — der Text landet am Cursor. Läuft komplett offline mit NVIDIA
 Parakeet (TDT 0.6B v3), kein Cloud-Dienst, kein Konto.
 
 Status: **läuft auf Windows 11** (Hotkey, Tray, Einfügen am Cursor,
-Modell-Download, Autostart). Privates Werkzeug, bewusst klein gehalten.
+Modell-Download, Autostart, Aufnahme-Overlay mit Mikrofonpegel).
+Aktuelle Version: [v0.2.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.0).
+Privates Werkzeug, bewusst klein gehalten.
 
 Linux (Mint/X11) war die Ausgangsplattform und ist im Code noch enthalten,
 wird aber nicht mehr weiterentwickelt.
@@ -22,7 +24,8 @@ Zwischenablage.
 
 ## Installation
 
-Die Setup-Exe (`Diktier_<version>_x64-setup.exe`) aus den Releases herunterladen
+Die Setup-Exe (`Diktier_<version>_x64-setup.exe`) aus den
+[Releases](https://github.com/ralfkuh-lab/diktier/releases) herunterladen
 und starten. Sie ist **nicht signiert** — Windows SmartScreen meldet deshalb
 „Der Computer wurde durch Windows geschützt" und „Unbekannter Herausgeber":
 
@@ -97,7 +100,10 @@ laufenden Daemon, `-SkipInstaller` lässt das Setup weg. Das Exe-Icon kommt aus
    einmal aus dem Überlauf (`^`) in die Taskleiste ziehen, damit es immer
    sichtbar ist — Windows merkt sich das.
 2. Cursor dorthin setzen, wo der Text hin soll (Editor, Browser, Teams …).
-3. **F9 halten**, sprechen, loslassen.
+3. **F9 halten**, sprechen, loslassen. Während der Aufnahme zeigt eine
+   kleine Karte unten am Bildschirm den Mikrofonpegel (siehe
+   [Aufnahme-Overlay](#aufnahme-overlay)) — bewegt sich die Wellenform
+   beim Sprechen, kommt auch etwas an.
 4. Der Text wird über die Zwischenablage eingefügt; der vorherige
    Clipboard-Inhalt wird direkt danach wiederhergestellt.
 
@@ -168,8 +174,9 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
 - **Text erscheint nicht, liegt aber in der Zwischenablage.** Fokus hat
   gewechselt, oder das Zielprogramm läuft als Administrator. Strg+V drücken.
 - **Nichts wird erkannt.** Pegel zu leise oder Mikrofon gemutet (Headset-
-  Taste). Mit `--foreground` zeigt das Log `rms=…`; Werte unter 0,0075
-  gelten als Stille.
+  Taste) — das Overlay zeigt es sofort: flache Linie trotz Sprechens.
+  Genauer nachmessen: mit `--foreground` zeigt das Log `rms=…`; Werte
+  unter 0,0075 gelten als Stille.
 - **Hotkey geht nicht.** Tray zeigt `error`, Tooltip nennt den Grund. Andere
   Taste eintragen, neu starten. Linksklick im Tray geht immer.
 - **„läuft bereits".** Es läuft schon eine Instanz (Autostart). Der zweite
@@ -181,11 +188,14 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
 
 Rust, ohne GUI-Framework. Hotkey über einen `WH_KEYBOARD_LL`-Hook,
 Einfügen über Clipboard + `SendInput` (Strg+V) mit Wiederherstellung des
-alten Inhalts, Tray über `Shell_NotifyIcon`. Spracherkennung mit
+alten Inhalts, Tray über `Shell_NotifyIcon`, das Aufnahme-Overlay als
+selbst gezeichnetes Layered Window (`UpdateLayeredWindow`, nimmt nie den
+Fokus). Spracherkennung mit
 [parakeet-rs](https://crates.io/crates/parakeet-rs) auf der ONNX Runtime
 (CPU, INT8) — auf einem aktuellen Laptop rund 0,1 s pro Diktat. Details und
 Entscheidungen: [docs/SPEC.md](docs/SPEC.md), Windows-Portierung:
-[docs/windows-plan.md](docs/windows-plan.md).
+[docs/windows-plan.md](docs/windows-plan.md), Overlay:
+[docs/overlay-plan.md](docs/overlay-plan.md).
 
 ## Lizenz
 
