@@ -70,6 +70,11 @@ pub fn modifier_name(modifier: Modifier) -> &'static str {
 ///
 /// Buchstaben werden als Kleinbuchstabe gegriffen — das ist die Ebene, auf der
 /// X11 den Keycode führt; Shift ist ein Modifier, kein anderer Keysym.
+// Unter Windows ruft nur der Test-Code die Funktion: die §8-Tabelle muss auch
+// dort deckungsgleich zur Virtual-Key-Tabelle geprüft werden
+// (`every_x11_key_also_has_a_virtual_key`). Deshalb kein `cfg`, sondern nur das
+// `dead_code` stummschalten.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn x11_keysym(key: &str) -> Option<u32> {
     if let Some(rest) = key.strip_prefix('F')
         && let Ok(n) = rest.parse::<u8>()

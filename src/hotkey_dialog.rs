@@ -511,7 +511,7 @@ impl Drop for Fonts {
             if !handle.is_null() {
                 // SAFETY: eigene GDI-Objekte; die Fenster, die sie benutzt
                 // haben, sind zu diesem Zeitpunkt zerstört.
-                unsafe { DeleteObject(handle as *mut c_void) };
+                unsafe { DeleteObject(handle) };
             }
         }
     }

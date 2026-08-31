@@ -162,7 +162,7 @@ fn config_error_mode(message: String, log: &Arc<Logger>) -> u8 {
             }
             // §9: Der Autostart hängt nicht an der Config — der Menüpunkt
             // bleibt auch im Fehlerzustand bedienbar.
-            Ok(Msg::ToggleAutostart) => toggle_autostart(&log),
+            Ok(Msg::ToggleAutostart) => toggle_autostart(log),
             // Pause/Tray-Click haben ohne Engine keine Wirkung.
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {}

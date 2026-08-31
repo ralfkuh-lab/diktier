@@ -293,11 +293,9 @@ unsafe extern "system" fn wnd_proc(
     let cell = unsafe { &*ptr };
 
     match msg {
-        WM_RENDERFORMAT => {
-            if wparam as u32 == CF_UNICODETEXT {
-                on_render_format(cell);
-                return 0;
-            }
+        WM_RENDERFORMAT if wparam as u32 == CF_UNICODETEXT => {
+            on_render_format(cell);
+            return 0;
         }
         WM_RENDERALLFORMATS => {
             on_render_all_formats(cell, hwnd);

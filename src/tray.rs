@@ -723,7 +723,7 @@ mod windows {
         if mask.is_null() {
             let err = last_error();
             // SAFETY: eigenes, noch nirgends verwendetes GDI-Objekt.
-            unsafe { DeleteObject(color as *mut c_void) };
+            unsafe { DeleteObject(color) };
             return Err(TrayError::Failed(format!(
                 "Icon-Maske nicht erzeugbar: Win32-Fehler {err}"
             )));
@@ -742,8 +742,8 @@ mod windows {
         let err = last_error();
         // SAFETY: eigene GDI-Objekte, vom Icon nur kopiert, nicht übernommen.
         unsafe {
-            DeleteObject(mask as *mut c_void);
-            DeleteObject(color as *mut c_void);
+            DeleteObject(mask);
+            DeleteObject(color);
         }
         if icon.is_null() {
             return Err(TrayError::Failed(format!(
