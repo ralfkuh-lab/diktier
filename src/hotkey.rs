@@ -105,6 +105,8 @@ pub fn x11_keysym(key: &str) -> Option<u32> {
         "Down" => 0xff54,
         "ScrollLock" => 0xff14,
         "Pause" => 0xff13,
+        // XK_Control_R: die rechte Strg-Taste als Taste, nicht als Modifier.
+        "RCtrl" => 0xffe4,
         _ => return None,
     })
 }
@@ -289,6 +291,10 @@ mod linux {
             "Up" => Code::ArrowUp,
             "Right" => Code::ArrowRight,
             "Down" => Code::ArrowDown,
+            // Nur das Mapping (Windows-first, Plan WP-RCtrl): die Grab-Logik
+            // bleibt unangetastet, ein Modifier als Taste ist unter X11 nicht
+            // erprobt.
+            "RCtrl" => Code::ControlRight,
             _ => return None,
         })
     }
@@ -921,7 +927,7 @@ pub(crate) mod windows {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+        GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RWIN, VK_SHIFT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
@@ -980,6 +986,10 @@ pub(crate) mod windows {
         ("Down", 0x28),       // VK_DOWN
         ("ScrollLock", 0x91), // VK_SCROLL
         ("Pause", 0x13),      // VK_PAUSE
+        // Die **rechte** Strg-Taste als Hotkey-Taste. Sie ist zugleich eine
+        // Modifier-Taste — der Live-Zustand muss deshalb maskiert werden,
+        // siehe [`ModifierState::mask_hotkey_key`].
+        ("RCtrl", 0xa3), // VK_RCONTROL
     ];
 
     /// Config-Schlüssel → Windows-Virtual-Key (§8-Tabelle), das Gegenstück zu
@@ -1095,6 +1105,41 @@ pub(crate) mod windows {
                 alt: is_down(VK_MENU),
                 win: is_down(VK_LWIN) || is_down(VK_RWIN),
             }
+        }
+
+        /// Der eigene Beitrag der Hotkey-**Taste** muss aus dem Live-Zustand
+        /// heraus, wenn sie selbst eine Modifier-Taste ist (§8: `RCtrl`).
+        ///
+        /// `GetAsyncKeyState(VK_CONTROL)` meldet beide Seiten. Bei Hotkey-Taste
+        /// `RCtrl` wäre `ctrl` im Moment des eigenen Downs also immer `true`,
+        /// und der exakte Vergleich `live() == required` könnte mit
+        /// `modifiers = []` nie greifen. Für `VK_RCONTROL` kommt der
+        /// Ctrl-Anteil deshalb allein aus `VK_LCONTROL`:
+        ///
+        /// - `key = "RCtrl", modifiers = []` feuert, obwohl „Ctrl unten" ist;
+        /// - `modifiers = ["ctrl"]` heißt dann: die **linke** Strg zusätzlich
+        ///   gehalten.
+        ///
+        /// Reine Regel, damit sie ohne Win32-Aufruf prüfbar bleibt; `side`
+        /// liefert den Zustand der anderen Seite und wird nur ausgewertet, wenn
+        /// es darauf ankommt.
+        pub fn mask_hotkey_key(self, vk: u16, side: impl FnOnce() -> bool) -> Self {
+            if vk == VK_RCONTROL {
+                return Self {
+                    ctrl: side(),
+                    ..self
+                };
+            }
+            self
+        }
+
+        /// Live-Zustand, wie ihn **dieser** Hotkey braucht: [`current`] plus
+        /// die Maskierung aus [`mask_hotkey_key`].
+        ///
+        /// [`current`]: Self::current
+        /// [`mask_hotkey_key`]: Self::mask_hotkey_key
+        fn current_for(vk: u16) -> Self {
+            Self::current().mask_hotkey_key(vk, || is_down(VK_LCONTROL))
         }
     }
 
@@ -1263,7 +1308,13 @@ pub(crate) mod windows {
                 let Some(ctx) = slot.as_mut() else {
                     return Decision::Pass;
                 };
-                let decision = ctx.state.on_event(event, ModifierState::current);
+                // Der Live-Zustand hängt an der konfigurierten Taste: Ist sie
+                // selbst eine Modifier-Taste (`RCtrl`), maskiert
+                // `current_for` ihren eigenen Beitrag weg.
+                let hotkey_vk = ctx.state.vk;
+                let decision = ctx
+                    .state
+                    .on_event(event, || ModifierState::current_for(hotkey_vk));
                 if let Decision::Emit(hotkey) = decision
                     && ctx.events.send(hotkey).is_err()
                 {
@@ -1889,6 +1940,7 @@ mod tests {
         assert_eq!(x11_keysym("Down"), Some(0xff54));
         assert_eq!(x11_keysym("ScrollLock"), Some(0xff14));
         assert_eq!(x11_keysym("Pause"), Some(0xff13));
+        assert_eq!(x11_keysym("RCtrl"), Some(0xffe4), "XK_Control_R");
         assert_eq!(x11_keysym("F99"), None);
         assert_eq!(x11_keysym("Grüße"), None);
     }
@@ -2009,6 +2061,8 @@ mod tests {
         use super::super::{HotkeyEvent, Modifier, x11_keysym};
 
         const VK_F9: u16 = 0x78;
+        /// VK_RCONTROL — die Hotkey-**Taste** `RCtrl` aus §8.
+        const VK_RCTRL: u16 = 0xa3;
 
         /// §4.4: Die Config bestimmt die Taste — bis in den Virtual-Key.
         #[test]
@@ -2041,6 +2095,7 @@ mod tests {
             assert_eq!(virtual_key("Down"), Some(0x28));
             assert_eq!(virtual_key("ScrollLock"), Some(0x91));
             assert_eq!(virtual_key("Pause"), Some(0x13));
+            assert_eq!(virtual_key("RCtrl"), Some(0xa3), "VK_RCONTROL");
             assert_eq!(virtual_key("F0"), None);
             assert_eq!(virtual_key("F25"), None);
             assert_eq!(virtual_key("Grüße"), None);
@@ -2079,6 +2134,7 @@ mod tests {
                 "Down",
                 "ScrollLock",
                 "Pause",
+                "RCtrl",
             ] {
                 let vk = virtual_key(key).unwrap_or_else(|| panic!("{key}: kein VK"));
                 assert_eq!(vk_name(vk).as_deref(), Some(key), "{key} (VK {vk:#04x})");
@@ -2098,6 +2154,7 @@ mod tests {
                 0x10, 0x11, 0x12, // VK_SHIFT/CONTROL/MENU
                 0x14, 0x90, // VK_CAPITAL, VK_NUMLOCK
                 0x5b, 0x5c, // VK_LWIN/VK_RWIN
+                0xa2, // VK_LCONTROL — nur die **rechte** Strg ist eine Taste
                 0x88, 0xff,
             ] {
                 assert_eq!(vk_name(vk), None, "VK {vk:#04x}");
@@ -2133,6 +2190,7 @@ mod tests {
                 "Down",
                 "ScrollLock",
                 "Pause",
+                "RCtrl",
             ] {
                 assert!(x11_keysym(key).is_some(), "{key}: X11");
                 assert!(virtual_key(key).is_some(), "{key}: VK");
@@ -2211,6 +2269,88 @@ mod tests {
                 state.on_event(down(VK_F9), || mods(true, true, false, false)),
                 Decision::Emit(HotkeyEvent::Press),
                 "der vollständige Chord trifft"
+            );
+        }
+
+        /// §8 `RCtrl`: Die Hotkey-Taste ist selbst eine Modifier-Taste. Ihr
+        /// eigener Beitrag muss aus dem Live-Zustand heraus, sonst könnte
+        /// `modifiers = []` nie greifen — `GetAsyncKeyState(VK_CONTROL)` meldet
+        /// beide Seiten.
+        #[test]
+        fn the_hotkey_keys_own_modifier_contribution_is_masked_away() {
+            // Für `RCtrl` kommt der Ctrl-Anteil allein von der linken Seite.
+            assert_eq!(
+                mods(true, false, false, false).mask_hotkey_key(VK_RCTRL, || false),
+                mods(false, false, false, false),
+                "RCtrl allein ist kein Ctrl"
+            );
+            assert_eq!(
+                mods(true, true, false, false).mask_hotkey_key(VK_RCTRL, || true),
+                mods(true, true, false, false),
+                "linke Strg zusätzlich gehalten: Ctrl bleibt"
+            );
+            // Jede andere Taste bleibt unangetastet — die andere Seite wird
+            // dafür nicht einmal abgefragt.
+            assert_eq!(
+                mods(true, false, false, false).mask_hotkey_key(VK_F9, || panic!("nicht abfragen")),
+                mods(true, false, false, false)
+            );
+        }
+
+        /// `key = "RCtrl", modifiers = []`: Drücken feuert, obwohl „Ctrl unten"
+        /// ist — der Live-Zustand ist bereits maskiert (siehe
+        /// `ModifierState::current_for`).
+        #[test]
+        fn right_ctrl_alone_is_a_full_hotkey() {
+            let mut state = HookState::new(VK_RCTRL, ModifierState::required(&[]));
+            assert_eq!(
+                state.on_event(down(VK_RCTRL), ModifierState::default),
+                Decision::Emit(HotkeyEvent::Press)
+            );
+            assert_eq!(
+                state.on_event(down(VK_RCTRL), ModifierState::default),
+                Decision::Swallow,
+                "Auto-Repeat wie bei jeder anderen Taste"
+            );
+            assert_eq!(
+                state.on_event(up(VK_RCTRL), ModifierState::default),
+                Decision::Emit(HotkeyEvent::Release)
+            );
+        }
+
+        /// Bei Hotkey `RCtrl` meint `ctrl` im Live-Zustand die **linke** Strg.
+        /// Mit `modifiers = []` ist sie ein zusätzlicher Modifier und der Chord
+        /// verfehlt — mit `modifiers = ["ctrl"]` ist sie gefordert.
+        #[test]
+        fn left_ctrl_is_the_extra_modifier_next_to_right_ctrl() {
+            let left_ctrl_down = || mods(true, false, false, false);
+
+            let mut plain = HookState::new(VK_RCTRL, ModifierState::required(&[]));
+            assert_eq!(
+                plain.on_event(down(VK_RCTRL), left_ctrl_down),
+                Decision::Pass,
+                "LCtrl+RCtrl ist kein nacktes RCtrl"
+            );
+            assert_eq!(
+                plain.on_event(up(VK_RCTRL), left_ctrl_down),
+                Decision::Pass,
+                "es gab kein akzeptiertes Down"
+            );
+
+            let mut with_ctrl =
+                HookState::new(VK_RCTRL, ModifierState::required(&[Modifier::Ctrl]));
+            assert_eq!(
+                with_ctrl.on_event(down(VK_RCTRL), left_ctrl_down),
+                Decision::Emit(HotkeyEvent::Press)
+            );
+            assert_eq!(
+                with_ctrl.on_event(up(VK_RCTRL), left_ctrl_down),
+                Decision::Emit(HotkeyEvent::Release)
+            );
+            assert_eq!(
+                with_ctrl.on_event(down(VK_RCTRL), ModifierState::default),
+                Decision::Pass,
+                "ohne linke Strg trifft der Chord nicht"
             );
         }
 

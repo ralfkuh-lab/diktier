@@ -108,6 +108,35 @@ pub enum KeyAction {
     Unsupported,
 }
 
+/// Generisches `VK_CONTROL` in die seitenspezifische Variante übersetzen.
+///
+/// Fenster-Nachrichten (`WM_KEYDOWN` & Co.) melden für **beide** Strg-Tasten
+/// immer `VK_CONTROL` (0x11) — nie `VK_LCONTROL`/`VK_RCONTROL`. Welche Seite
+/// gedrückt wurde, steckt allein im Extended-Bit von `lparam` (Bit 24): gesetzt
+/// = rechte Strg. Ohne diese Übersetzung erreichte der `VK_RCONTROL`-Arm in
+/// [`classify`] nie einen Tastendruck und RCtrl blieb im Dialog ein bloßer
+/// Modifier („Ctrl+…"). Der Low-Level-Hook in [`crate::hotkey`] braucht das
+/// nicht: `KBDLLHOOKSTRUCT.vkCode` unterscheidet die Seiten von sich aus.
+///
+/// Nur Strg wird angefasst — RCtrl ist die einzige Taste, die §8 als Taste
+/// zulässt; Shift/Alt/Win bleiben unverändert generisch und damit Modifier.
+///
+/// Randfall AltGr: Der Treiber erzeugt dafür ein synthetisches **linkes** Ctrl
+/// (Extended-Bit **nicht** gesetzt) plus `VK_RMENU`. AltGr wird hier also zu
+/// `VK_LCONTROL` und bleibt Modifier — keine Kollision mit RCtrl.
+fn side_specific_vk(vk: u16, extended: bool) -> u16 {
+    if vk == VK_CONTROL {
+        if extended { VK_RCONTROL } else { VK_LCONTROL }
+    } else {
+        vk
+    }
+}
+
+/// Extended-Bit (Bit 24) aus dem `lparam` einer Tastatur-Nachricht.
+fn is_extended(lparam: LPARAM) -> bool {
+    (lparam >> 24) & 1 != 0
+}
+
 /// `Escape` und `Enter` sind im Dialog belegt und deshalb **nicht** als
 /// Hotkey wählbar — beide werden vor der VK-Tabelle abgefangen. Das ist der
 /// bewusste Preis dafür, dass der Dialog ohne Maus bedienbar ist; im Fenster
@@ -116,6 +145,13 @@ pub fn classify(vk: u16) -> KeyAction {
     match vk {
         VK_ESCAPE => KeyAction::Cancel,
         VK_RETURN => KeyAction::Apply,
+        // §8: Die **rechte** Strg-Taste ist als Taste wählbar. Deshalb vor
+        // [`is_modifier_vk`] — sie ist beides, und hier gilt sie als Taste. Die
+        // linke Strg und alle übrigen Modifier bleiben Modifier.
+        VK_RCONTROL => match vk_name(VK_RCONTROL) {
+            Some(name) => KeyAction::Key(name),
+            None => KeyAction::Unsupported,
+        },
         vk if is_modifier_vk(vk) => KeyAction::ModifierOnly,
         vk => match vk_name(vk) {
             Some(name) => KeyAction::Key(name),
@@ -156,16 +192,34 @@ pub fn chord_text(modifiers: &[Modifier], key: Option<&str>) -> String {
     out
 }
 
+/// Aus welchem Virtual-Key der Ctrl-Anteil kommt.
+///
+/// Ist die gerade gedrückte Taste selbst die rechte Strg (die als Hotkey-Taste
+/// wählbar ist), darf `VK_CONTROL` nicht gefragt werden — es meldet beide
+/// Seiten, der Dialog zeigte „Ctrl+RCtrl" und schriebe genau das in die Config.
+/// Dieselbe Maskierung wie im Hook
+/// (`hotkey::windows::ModifierState::mask_hotkey_key`).
+fn ctrl_probe_vk(pressed: u16) -> u16 {
+    if pressed == VK_RCONTROL {
+        VK_LCONTROL
+    } else {
+        VK_CONTROL
+    }
+}
+
 /// Physisch gehaltene Modifier, in kanonischer Reihenfolge.
+///
+/// `pressed` ist die Taste, um die es gerade geht — sie bestimmt die
+/// Ctrl-Maskierung (siehe [`ctrl_probe_vk`]).
 ///
 /// Bewusst `GetAsyncKeyState` und nicht `GetKeyState`: Der Hook aus
 /// [`crate::hotkey`] vergleicht später mit **genau** dieser Quelle
-/// (`ModifierState::current`). Was der Dialog anzeigt, ist damit das, was der
-/// Hook zur Laufzeit fordert — inklusive der dort dokumentierten
+/// (`ModifierState::current_for`). Was der Dialog anzeigt, ist damit das, was
+/// der Hook zur Laufzeit fordert — inklusive der dort dokumentierten
 /// AltGr-Kollision (AltGr erscheint als `Ctrl+Alt`).
-fn held_modifiers() -> Vec<Modifier> {
+fn held_modifiers(pressed: u16) -> Vec<Modifier> {
     let mut out = Vec::new();
-    if is_down(VK_CONTROL) {
+    if is_down(ctrl_probe_vk(pressed)) {
         out.push(Modifier::Ctrl);
     }
     if is_down(VK_SHIFT) {
@@ -278,13 +332,14 @@ unsafe extern "system" fn wnd_proc(
         // als System-Taste. Beide werden **nicht** an `DefWindowProcW`
         // weitergereicht — sonst öffnete Alt das Systemmenü.
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            on_key_down(cell, hwnd, wparam as u16);
+            on_key_down(cell, hwnd, wparam as u16, is_extended(lparam));
             return 0;
         }
         // Beim Loslassen eines Modifiers schrumpft die Vorschau wieder.
         WM_KEYUP | WM_SYSKEYUP => {
-            if is_modifier_vk(wparam as u16) {
-                set_preview(cell);
+            let vk = side_specific_vk(wparam as u16, is_extended(lparam));
+            if is_modifier_vk(vk) {
+                set_preview(cell, vk);
             }
             return 0;
         }
@@ -330,16 +385,20 @@ unsafe extern "system" fn wnd_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-fn on_key_down(cell: &RefCell<DialogState>, hwnd: HWND, vk: u16) {
+/// `extended` ist das Extended-Bit der Nachricht — es entscheidet, ob ein
+/// generisches `VK_CONTROL` die linke oder die rechte Strg war (siehe
+/// [`side_specific_vk`]).
+fn on_key_down(cell: &RefCell<DialogState>, hwnd: HWND, vk: u16, extended: bool) {
+    let vk = side_specific_vk(vk, extended);
     match classify(vk) {
         KeyAction::Cancel => close(cell, hwnd, DialogOutcome::Cancelled),
         KeyAction::Apply => apply(cell, hwnd),
-        KeyAction::ModifierOnly => set_preview(cell),
+        KeyAction::ModifierOnly => set_preview(cell, vk),
         KeyAction::Key(key) => {
             if let Ok(mut state) = cell.try_borrow_mut() {
                 state.selected = HotkeySpec {
                     key,
-                    modifiers: held_modifiers(),
+                    modifiers: held_modifiers(vk),
                 };
                 state.display = Display::Selected;
             }
@@ -356,8 +415,11 @@ fn on_key_down(cell: &RefCell<DialogState>, hwnd: HWND, vk: u16) {
 
 /// Modifier-Vorschau nachziehen. Ist kein Modifier mehr gedrückt, steht wieder
 /// die letzte vollständige Auswahl da.
-fn set_preview(cell: &RefCell<DialogState>) {
-    let held = held_modifiers();
+///
+/// `vk` ist die Taste, die den Wechsel ausgelöst hat — sie geht nur in die
+/// Ctrl-Maskierung ein (siehe [`held_modifiers`]).
+fn set_preview(cell: &RefCell<DialogState>, vk: u16) {
+    let held = held_modifiers(vk);
     if let Ok(mut state) = cell.try_borrow_mut() {
         state.display = if held.is_empty() {
             Display::Selected
@@ -764,7 +826,6 @@ mod tests {
             VK_LSHIFT,
             VK_RSHIFT,
             VK_LCONTROL,
-            VK_RCONTROL,
             VK_LMENU,
             VK_RMENU,
             VK_LWIN,
@@ -772,6 +833,69 @@ mod tests {
         ] {
             assert_eq!(classify(vk), KeyAction::ModifierOnly, "VK {vk:#04x}");
         }
+    }
+
+    /// §8: Die rechte Strg-Taste ist als **Taste** wählbar — sie ist die
+    /// einzige Modifier-Taste, die der Dialog nicht als Modifier verbucht.
+    #[test]
+    fn right_ctrl_is_selectable_as_a_key() {
+        assert_eq!(classify(VK_RCONTROL), KeyAction::Key("RCtrl".into()));
+        assert_eq!(
+            classify(VK_LCONTROL),
+            KeyAction::ModifierOnly,
+            "die linke Strg bleibt Modifier"
+        );
+        assert_eq!(classify(VK_CONTROL), KeyAction::ModifierOnly);
+        assert_eq!(chord_text(&[], Some("RCtrl")), "RCtrl");
+    }
+
+    /// Fenster-Nachrichten melden für beide Strg-Tasten `VK_CONTROL`; erst das
+    /// Extended-Bit macht daraus eine Seite. Ohne diese Übersetzung wäre der
+    /// `VK_RCONTROL`-Arm in [`classify`] toter Code.
+    #[test]
+    fn generic_ctrl_becomes_side_specific() {
+        assert_eq!(side_specific_vk(VK_CONTROL, true), VK_RCONTROL);
+        assert_eq!(side_specific_vk(VK_CONTROL, false), VK_LCONTROL);
+        // Alle anderen VKs bleiben unangetastet — auch mit Extended-Bit, das
+        // bei ihnen etwas anderes bedeutet (Ziffernblock, Pfeiltasten, …).
+        for vk in [VK_SHIFT, VK_MENU, VK_RMENU, VK_LWIN, VK_RETURN, 0x7b, 0x41] {
+            assert_eq!(side_specific_vk(vk, false), vk, "VK {vk:#04x}");
+            assert_eq!(side_specific_vk(vk, true), vk, "VK {vk:#04x} extended");
+        }
+    }
+
+    /// Der Weg, den `wnd_proc` geht: erst seitenspezifisch machen, dann
+    /// klassifizieren. Rechte Strg ist eine Taste, linke bleibt Modifier.
+    #[test]
+    fn extended_bit_decides_key_versus_modifier() {
+        assert_eq!(
+            classify(side_specific_vk(VK_CONTROL, true)),
+            KeyAction::Key("RCtrl".into())
+        );
+        assert_eq!(
+            classify(side_specific_vk(VK_CONTROL, false)),
+            KeyAction::ModifierOnly,
+            "linke Strg (und AltGr, das ein linkes Ctrl erzeugt) bleibt Modifier"
+        );
+    }
+
+    #[test]
+    fn extended_bit_is_bit_24_of_lparam() {
+        assert!(is_extended(0x0100_0000));
+        assert!(!is_extended(0x0000_0000));
+        // Repeat-Count, Scancode und die übrigen Flags stören nicht.
+        assert!(is_extended(0xC11D_0001));
+        assert!(!is_extended(0xC01D_0001));
+    }
+
+    /// Sonst zeigte der Dialog beim Drücken von RCtrl „Ctrl+RCtrl" und
+    /// schriebe genau das in die Config: `VK_CONTROL` meldet beide Seiten.
+    #[test]
+    fn right_ctrl_does_not_count_itself_as_a_modifier() {
+        assert_eq!(ctrl_probe_vk(VK_RCONTROL), VK_LCONTROL);
+        // Jede andere Taste fragt weiter beide Seiten ab — wie der Hook.
+        assert_eq!(ctrl_probe_vk(0x7b), VK_CONTROL);
+        assert_eq!(ctrl_probe_vk(VK_LCONTROL), VK_CONTROL);
     }
 
     #[test]

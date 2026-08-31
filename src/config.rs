@@ -64,6 +64,19 @@ const NAMED_KEYS: &[&str] = &[
     "Down",
     "ScrollLock",
     "Pause",
+    // Die **rechte** Strg-Taste als Taste, nicht als Modifier: unter Windows
+    // ein eigener Virtual-Key (`VK_RCONTROL`), unter X11 ein eigenes Keysym.
+    // Die linke Strg bleibt Modifier (`modifiers = ["ctrl"]`).
+    "RCtrl",
+];
+
+/// Schreibweisen, die [`canonical_key`] auf „RCtrl" zieht — case-insensitiv.
+const RIGHT_CTRL_ALIASES: &[&str] = &[
+    "RightCtrl",
+    "RightControl",
+    "RStrg",
+    "Strg rechts",
+    "Ctrl rechts",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -554,6 +567,14 @@ fn canonical_key(raw: &str) -> Option<String> {
     if trimmed.eq_ignore_ascii_case("Rollen") {
         return Some("ScrollLock".to_string());
     }
+    // Die rechte Strg-Taste trägt keine eigene Beschriftung — deshalb die
+    // naheliegenden Schreibweisen (auch die deutschen) auf „RCtrl" ziehen.
+    if RIGHT_CTRL_ALIASES
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(trimmed))
+    {
+        return Some("RCtrl".to_string());
+    }
     for name in NAMED_KEYS {
         if name.eq_ignore_ascii_case(trimmed) {
             return Some((*name).to_string());
@@ -698,6 +719,30 @@ mod tests {
             assert_eq!(loaded.config.hotkey.key, expected, "{raw}");
             assert!(loaded.warnings.is_empty(), "{raw}: {:?}", loaded.warnings);
         }
+    }
+
+    /// Die rechte Strg-Taste ist eine **Taste**, kein Modifier — samt der
+    /// Aliase, die sich auf einer deutschen Tastatur anbieten.
+    #[test]
+    fn right_ctrl_is_a_valid_hotkey_key() {
+        for raw in [
+            "RCtrl",
+            "rctrl",
+            "RightCtrl",
+            "rightcontrol",
+            "RStrg",
+            "Strg rechts",
+            "ctrl rechts",
+        ] {
+            let loaded = parse_toml(&format!("[hotkey]\nkey = \"{raw}\"\n")).unwrap();
+            assert_eq!(loaded.config.hotkey.key, "RCtrl", "{raw}");
+            assert!(loaded.warnings.is_empty(), "{raw}: {:?}", loaded.warnings);
+        }
+        // `modifiers = ["ctrl"]` heißt dann: die **linke** Strg zusätzlich
+        // gehalten (siehe `hotkey::windows::ModifierState::mask_hotkey_key`).
+        let loaded = parse_toml("[hotkey]\nkey = \"RCtrl\"\nmodifiers = [\"ctrl\"]\n").unwrap();
+        assert_eq!(loaded.config.hotkey.key, "RCtrl");
+        assert_eq!(loaded.config.hotkey.modifiers, vec![Modifier::Ctrl]);
     }
 
     #[test]

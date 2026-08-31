@@ -124,13 +124,19 @@ meisten reicht der Hotkey:
 
 ```toml
 [hotkey]
-key = "F9"          # z. B. "F9", "ScrollLock", "Pause", "F12"
+key = "F9"          # z. B. "F9", "ScrollLock", "Pause", "RCtrl", "F12"
 modifiers = []      # z. B. ["Ctrl", "Alt"] — Hotkey ist dann Ctrl+Alt+<key>
 ```
 
 Gute Push-to-Talk-Tasten sind solche, die sonst nichts tun: `ScrollLock`
-(Rollen), `Pause`, hohe F-Tasten. Der Hotkey erreicht das aktive Programm
-nie — F9 togglet also keinen Breakpoint in VS Code.
+(Rollen), `Pause`, `RCtrl` (die rechte Strg-Taste), hohe F-Tasten. Der Hotkey
+erreicht das aktive Programm nie — F9 togglet also keinen Breakpoint in
+VS Code.
+
+`RCtrl` ist die rechte Strg-Taste als **Taste**, nicht als Modifier (Aliase:
+`RightCtrl`, `RStrg`, `Strg rechts`). Die linke Strg bleibt Modifier: mit
+`key = "RCtrl"` und `modifiers = ["ctrl"]` löst erst *linke Strg + rechte
+Strg* aus, mit `modifiers = []` die rechte Strg allein.
 
 Weitere Schlüssel (selten nötig): `[audio] device`, `max_duration_secs`
 (Obergrenze je Aufnahme, 60 s), `[output] leading_space` (führendes
