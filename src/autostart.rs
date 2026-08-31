@@ -23,12 +23,11 @@ pub enum AutostartError {
     Exe(io::Error),
     #[error("Programmpfad ist nicht UTF-8: {0}")]
     ExeNotUtf8(PathBuf),
-    /// Windows: In einer `.cmd` lässt sich ein `"` im Pfad nicht verlässlich
-    /// quoten — cmd.exe kennt dafür kein Escape. NTFS erlaubt das Zeichen in
+    /// In einer `.cmd` lässt sich ein `"` im Pfad nicht verlässlich quoten —
+    /// cmd.exe kennt dafür kein Escape. NTFS erlaubt das Zeichen in
     /// Dateinamen ohnehin nicht; der Fall kann nur über exotische Geräte- oder
     /// Netzwerkpfade kommen und wird abgelehnt, statt eine kaputte Datei zu
     /// schreiben (Plan WP5).
-    #[cfg(windows)]
     #[error("Programmpfad enthält Anführungszeichen: {0}")]
     ExeHasQuote(PathBuf),
     #[error("Autostart-Datei {path}: {source}")]
@@ -41,7 +40,6 @@ impl AutostartError {
         match self {
             Self::Path(_) => 2,
             Self::Exe(_) | Self::ExeNotUtf8(_) | Self::Io { .. } => 1,
-            #[cfg(windows)]
             Self::ExeHasQuote(_) => 1,
         }
     }
@@ -149,31 +147,13 @@ pub fn remove_at(path: &Path) -> Result<RemoveOutcome, AutostartError> {
     }
 }
 
-/// Inhalt des Eintrags. Linux: Desktop Entry Specification 1.5.
-#[cfg(target_os = "linux")]
-pub fn entry_contents(exe: &Path) -> Result<String, AutostartError> {
-    let exec = quote_exec(exe)?;
-    Ok(format!(
-        "# Von diktier --install-autostart erzeugt (Spec §9).\n\
-         [Desktop Entry]\n\
-         Type=Application\n\
-         Version=1.0\n\
-         Name=Diktier\n\
-         Comment=Lokales Push-to-Talk-Diktiertool\n\
-         Exec={exec}\n\
-         Terminal=false\n\
-         StartupNotify=false\n\
-         X-GNOME-Autostart-enabled=true\n"
-    ))
-}
-
-/// Windows: `.cmd` im Startup-Ordner (§9 nennt nur „Startup-Ordner des Users").
+/// Inhalt des Eintrags: `.cmd` im Startup-Ordner (§9 nennt nur
+/// „Startup-Ordner des Users").
 ///
 /// **Ohne `/min`** (Plan WP5): Das Binary läuft im Windows-Subsystem, es gibt
 /// kein Fenster, das minimiert werden könnte. Der leere Titel nach `start` ist
 /// dagegen Pflicht — sonst deutet cmd.exe den gequoteten Pfad als Fenstertitel
 /// und startet nichts.
-#[cfg(windows)]
 pub fn entry_contents(exe: &Path) -> Result<String, AutostartError> {
     let exec = quote_exec(exe)?;
     Ok(format!("@echo off\r\nstart \"\" {exec}\r\n"))
@@ -181,44 +161,17 @@ pub fn entry_contents(exe: &Path) -> Result<String, AutostartError> {
 
 /// §9: „Pfad = gequotetes `current_exe()`."
 ///
-/// Desktop Entry Spec, „The Exec key": innerhalb doppelter Anführungszeichen
-/// müssen `"`, `` ` ``, `$` und `\` mit einem Backslash geschützt werden — und
-/// weil der Wert davor noch die String-Escapes der Datei durchläuft, wird jeder
-/// so entstandene Backslash nochmals verdoppelt. Auf Windows genügt die
-/// Quotierung, dort ist `\` das Pfadtrennzeichen.
+/// Die Quotierung genügt: `\` ist unter Windows das Pfadtrennzeichen und wird
+/// innerhalb der Anführungszeichen nicht als Escape gelesen. Ein `"` im Pfad
+/// ließe sich dagegen nicht schützen und wird abgelehnt.
 pub fn quote_exec(exe: &Path) -> Result<String, AutostartError> {
     let raw = exe
         .to_str()
         .ok_or_else(|| AutostartError::ExeNotUtf8(exe.to_path_buf()))?;
-    #[cfg(target_os = "linux")]
-    {
-        let mut out = String::with_capacity(raw.len() + 2);
-        out.push('"');
-        for ch in raw.chars() {
-            match ch {
-                // Exec-Ebene `\\` → String-Ebene verdoppelt beide: vier Zeichen.
-                '\\' => out.push_str("\\\\\\\\"),
-                // Exec-Ebene `\c` → der Escape-Backslash wird verdoppelt.
-                '"' | '`' | '$' => {
-                    out.push_str("\\\\");
-                    out.push(ch);
-                }
-                // Desktop Entry 1.5: `%` leitet Feldcodes ein (`%f`, `%u`, …);
-                // ein literales Prozentzeichen muss verdoppelt werden (agy B3).
-                '%' => out.push_str("%%"),
-                _ => out.push(ch),
-            }
-        }
-        out.push('"');
-        Ok(out)
+    if raw.contains('"') {
+        return Err(AutostartError::ExeHasQuote(exe.to_path_buf()));
     }
-    #[cfg(windows)]
-    {
-        if raw.contains('"') {
-            return Err(AutostartError::ExeHasQuote(exe.to_path_buf()));
-        }
-        Ok(format!("\"{raw}\""))
-    }
+    Ok(format!("\"{raw}\""))
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), AutostartError> {
@@ -246,13 +199,9 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), AutostartError> {
 mod tests {
     use super::*;
 
-    /// Wonach genau ein eigener Eintrag in der erzeugten Datei zu suchen ist.
-    /// Der Dateiinhalt ist plattformspezifisch (Desktop Entry vs. `.cmd`), die
-    /// geprüfte Regel aus §9 — „eigenen Eintrag aktualisieren, nicht
-    /// verdoppeln" — ist es nicht.
-    #[cfg(target_os = "linux")]
-    const ENTRY_MARKER: &str = "Exec=";
-    #[cfg(windows)]
+    /// Wonach genau ein eigener Eintrag in der erzeugten `.cmd` zu suchen ist
+    /// — für die Regel aus §9: „eigenen Eintrag aktualisieren, nicht
+    /// verdoppeln".
     const ENTRY_MARKER: &str = "start \"\" ";
 
     fn temp_home() -> (tempfile::TempDir, PathBuf) {
@@ -310,62 +259,6 @@ mod tests {
         assert!(home.path().is_dir());
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn exec_quotes_paths_with_spaces() {
-        let quoted = quote_exec(Path::new("/home/a b/diktier")).unwrap();
-        assert_eq!(quoted, "\"/home/a b/diktier\"");
-        let (_home, path) = temp_home();
-        install_at(&path, Path::new("/home/a b/diktier")).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("Exec=\"/home/a b/diktier\""), "{text}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn exec_escapes_reserved_characters() {
-        // Desktop Entry Spec: `"`, `` ` `` und `$` brauchen im gequoteten
-        // Argument einen Backslash, der als String-Escape verdoppelt wird; ein
-        // literaler Backslash braucht deshalb vier.
-        let quoted = quote_exec(Path::new("/tmp/a$b`c\\d\"e/diktier")).unwrap();
-        assert_eq!(quoted, r#""/tmp/a\\$b\\`c\\\\d\\"e/diktier""#, "{quoted}");
-        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
-    }
-
-    /// Desktop Entry 1.5: `%` leitet Feldcodes ein, ein literales Prozentzeichen
-    /// muss `%%` werden — sonst schluckt der Autostart Teile des Pfades (agy B3).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn exec_doubles_literal_percent_signs() {
-        let quoted = quote_exec(Path::new("/tmp/100%/diktier")).unwrap();
-        assert_eq!(quoted, "\"/tmp/100%%/diktier\"", "{quoted}");
-
-        // Ein Pfad, der wie ein Feldcode aussieht, darf keiner werden.
-        let quoted = quote_exec(Path::new("/tmp/%f%u/diktier")).unwrap();
-        assert_eq!(quoted, "\"/tmp/%%f%%u/diktier\"", "{quoted}");
-
-        let (_home, path) = temp_home();
-        install_at(&path, Path::new("/tmp/a%20b/diktier")).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("Exec=\"/tmp/a%%20b/diktier\""), "{text}");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn entry_has_the_keys_autostart_needs() {
-        let text = entry_contents(Path::new("/opt/diktier/diktier")).unwrap();
-        for key in [
-            "[Desktop Entry]",
-            "Type=Application",
-            "Name=Diktier",
-            "Terminal=false",
-            "X-GNOME-Autostart-enabled=true",
-        ] {
-            assert!(text.contains(key), "{key} fehlt in:\n{text}");
-        }
-        assert!(text.ends_with('\n'));
-    }
-
     #[test]
     fn install_leaves_no_temp_file_behind() {
         let (_home, path) = temp_home();
@@ -380,7 +273,6 @@ mod tests {
 
     /// §9: gequoteter Pfad; kein `/min`; ein `"` im Pfad wird abgelehnt, statt
     /// eine kaputte `.cmd` zu schreiben (Plan WP5).
-    #[cfg(windows)]
     #[test]
     fn windows_entry_quotes_the_path_and_stays_unminimized() {
         let text = entry_contents(Path::new(r"C:\Program Files\a b\diktier.exe")).unwrap();
@@ -392,7 +284,6 @@ mod tests {
         assert!(text.ends_with("\r\n"), "{text:?}");
     }
 
-    #[cfg(windows)]
     #[test]
     fn windows_rejects_a_path_with_a_quote() {
         let err = quote_exec(Path::new("C:\\a\"b\\diktier.exe")).unwrap_err();

@@ -1,8 +1,7 @@
 //! `DIKTIER_DEBUG_WAV=1` (Spec §10): genau ein Dump der letzten Aufnahme.
 //!
-//! Linux `$TMPDIR/diktier-$USER/last_recording.wav`, Windows
-//! `%TEMP%\diktier\last_recording.wav`; Rechte `0600`, jede neue Aufnahme
-//! überschreibt die Datei **atomar** (Temp + Rename im selben Verzeichnis).
+//! `%TEMP%\diktier\last_recording.wav`; jede neue Aufnahme überschreibt die
+//! Datei **atomar** (Temp + Rename im selben Verzeichnis).
 //! Nie hochladen — deshalb steht der Pfad genau einmal im Log.
 
 use std::fs;
@@ -21,21 +20,10 @@ pub fn enabled() -> bool {
 
 /// Zielverzeichnis des Dumps.
 pub fn debug_dir() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        let tmp = std::env::var_os("TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-        tmp.join(format!("diktier-{user}"))
-    }
-    #[cfg(windows)]
-    {
-        let tmp = std::env::var_os("TEMP")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        tmp.join("diktier")
-    }
+    let tmp = std::env::var_os("TEMP")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    tmp.join("diktier")
 }
 
 /// Schreibt 16-kHz-mono-f32 als 16-bit-PCM-WAV nach `<dir>/last_recording.wav`.
@@ -80,39 +68,14 @@ fn hound_io(err: hound::Error) -> io::Error {
     }
 }
 
+/// Das Dump-Verzeichnis liegt unter `%TEMP%` im Benutzerprofil und erbt damit
+/// dessen ACL.
 fn create_private_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        if dir.is_dir() {
-            return Ok(());
-        }
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(dir)
-    }
+    fs::create_dir_all(dir)
 }
 
 fn create_private_file(path: &Path) -> io::Result<fs::File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-    }
-    #[cfg(not(unix))]
-    {
-        fs::File::create(path)
-    }
+    fs::File::create(path)
 }
 
 #[cfg(test)]
@@ -121,22 +84,13 @@ mod tests {
     use crate::audio::read_wav_16k_mono;
 
     #[test]
-    fn writes_private_wav_atomically() {
+    fn writes_the_wav_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("diktier-test");
         let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 / 16_000.0) - 0.5).collect();
         let path = write_last_recording(&target, &samples).unwrap();
         assert!(path.ends_with(FILE_NAME));
         assert!(!target.join(TEMP_NAME).exists(), "Temp-Datei aufgeräumt");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "Spec §10: Rechte 0600");
-            let dir_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-            assert_eq!(dir_mode, 0o700);
-        }
 
         let read_back = read_wav_16k_mono(&path).unwrap();
         assert_eq!(read_back.len(), samples.len());

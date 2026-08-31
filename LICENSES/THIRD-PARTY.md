@@ -12,7 +12,7 @@ vollständige Baum in `Cargo.lock` im Quell-Repository.
 
 | Komponente | Datei | Lizenz | Quelle |
 |---|---|---|---|
-| ONNX Runtime (CPU) | `lib/libonnxruntime.so` | MIT (`ONNXRUNTIME-LICENSE.txt`) | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime), offizielles Release |
+| ONNX Runtime (CPU) | `lib\onnxruntime.dll` | MIT (`ONNXRUNTIME-LICENSE.txt`) | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime), offizielles Release |
 
 ## Nachgeladen zur Laufzeit (nicht im Bundle)
 
@@ -30,22 +30,18 @@ gegen Größe und SHA-256 aus `src/models.toml`.
 | `parakeet-rs` | Parakeet-TDT-Decoder, Mel-Frontend | MIT OR Apache-2.0 |
 | `ort` | ONNX-Runtime-Bindung (`load-dynamic`, C-API 1.28) | MIT OR Apache-2.0 |
 | `ndarray` | Tensoren für die Engine-Schnittstelle | MIT OR Apache-2.0 |
-| `cpal` | Audioaufnahme (ALSA/PulseAudio) | Apache-2.0 |
+| `cpal` | Audioaufnahme (WASAPI) | Apache-2.0 |
 | `rubato` | FFT-Resampling auf 16 kHz | MIT |
 | `hound` | WAV-Lesen/-Schreiben | Apache-2.0 |
-| `x11rb` | X11-Protokoll (Clipboard, Paste, Fensterkennung) | MIT OR Apache-2.0 |
-| `global-hotkey` | globaler Push-to-Talk-Hotkey | Apache-2.0 OR MIT |
-| `betrayer` | Tray-Icon über StatusNotifierItem | MIT |
-| `zbus` | D-Bus-Anbindung unter `betrayer` | MIT |
+| `windows-sys` | Win32-Bindungen (Hotkey-Hook, Clipboard/Paste, Tray, Overlay, Named Mutex) | MIT OR Apache-2.0 |
 | `ureq` | HTTPS-Download der Modellartefakte | MIT OR Apache-2.0 |
 | `rustls` | TLS für den Download | Apache-2.0 OR ISC OR MIT |
 | `ring` | Kryptoprimitive unter `rustls` | Apache-2.0 AND ISC |
 | `webpki-roots` | Wurzelzertifikate (Mozilla-CA-Bundle) | CDLA-Permissive-2.0 |
 | `clap` | Kommandozeile | MIT OR Apache-2.0 |
-| `serde`, `toml` | Config- und Manifest-Parsing | MIT OR Apache-2.0 |
+| `serde`, `toml`, `toml_edit` | Config- und Manifest-Parsing, kommentarerhaltendes Rückschreiben | MIT OR Apache-2.0 |
 | `sha2` | SHA-256 der Modellartefakte | MIT OR Apache-2.0 |
 | `thiserror` | Fehlertypen | MIT OR Apache-2.0 |
-| `libc` | `flock` für die Single-Instance-Sperre | MIT OR Apache-2.0 |
 
 Die vollständigen Lizenztexte der Crates liegen in den jeweiligen
 Quellarchiven auf [crates.io](https://crates.io); Apache-2.0, MIT, ISC und
@@ -53,14 +49,8 @@ CDLA-Permissive-2.0 erlauben die Weitergabe in dieser Form.
 
 ## Systembibliotheken
 
-Nicht im Bundle, vom Betriebssystem erwartet (`readelf -d diktier`):
-`libasound.so.2`, `libgcc_s.so.1`, `libm.so.6`, `libc.so.6` —
-glibc-Mindestversion siehe `versions.toml`, Abschnitt `[build_host]`.
-
-`libasound.so.2` gehört zum ALSA-Backend von `cpal` und wird beim Start
-benötigt. Die Aufnahme läuft im Regelfall trotzdem über PulseAudio: `cpal`
-spricht dessen Protokoll direkt über den Unix-Socket (unter PipeWire von
-`pipewire-pulse` bedient) und braucht dafür **keine** `libpulse`.
-
-Auf Debian/Ubuntu/Mint deckt das Paket `libasound2t64` (früher `libasound2`)
-diese Anforderung ab; auf einem Desktop mit Audio ist es ohnehin installiert.
+Nicht im Bundle: Diktier nutzt ausschließlich Windows-Systembibliotheken
+(u. a. `user32.dll`, `shell32.dll`, `gdi32.dll`, `shcore.dll`,
+`kernel32.dll`), die zu Windows 10/11 gehören. Es gibt keine weiteren
+Laufzeitabhängigkeiten; die `onnxruntime.dll` aus dem Bundle setzt eine
+CPU mit AVX2 voraus (siehe `versions.toml`).

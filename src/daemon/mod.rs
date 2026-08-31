@@ -4,8 +4,8 @@
 //! ```text
 //!   Hotkey ┐                        ┌─ Engine  (Modell resident, Inferenz)
 //!   Tray   ├─ mpsc::Sender<Msg> ─▶  │─ Audio   (cpal, Downmix, Resample)
-//!   Audio  │      Event-Loop        │─ Inject  (X11: Clipboard, Paste, Fokus)
-//!   Inject │   transition(…) →      └─ Tray    (betrayer, D-Bus)
+//!   Audio  │      Event-Loop        │─ Inject  (Clipboard, Paste, Fokus)
+//!   Inject │   transition(…) →      └─ Tray    (Shell_NotifyIconW)
 //!   Timer  ┘   dispatch(effects)
 //! ```
 //!
@@ -69,8 +69,7 @@ pub fn run(foreground: bool) -> u8 {
     let log = Arc::new(Logger::new(foreground));
 
     // §5.3: Nur der Daemon nimmt die Sperre, und er nimmt sie als Erstes —
-    // an allen nutzbaren Orten zugleich, sonst liefen zwei Prozesse mit
-    // unterschiedlichem `XDG_RUNTIME_DIR` aneinander vorbei.
+    // ein Named Mutex im sessionlokalen `Local\`-Namensraum.
     let lock = match single_instance::acquire_instance_lock(&mut |problem| log.warn(problem)) {
         Ok(InstanceAcquire::Held(lock)) => lock,
         Ok(InstanceAcquire::Busy) => {
@@ -94,7 +93,7 @@ pub fn run(foreground: bool) -> u8 {
 }
 
 /// §10: Datei-Log anhängen. Scheitert das, bleibt stderr — ein unbeschreibbares
-/// `~/.local/state` ist kein Grund, das Diktieren zu verweigern.
+/// `%LOCALAPPDATA%diktier` ist kein Grund, das Diktieren zu verweigern.
 fn attach_file_log(log: &Logger, foreground: bool) {
     match paths::log_path() {
         Ok(path) => match log.attach_file(&path, paths::LOG_LIMIT_BYTES) {
@@ -226,13 +225,13 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
-    // Inject zuerst: ohne X11-Ausgabe hätte ein Diktat kein Ziel.
+    // Inject zuerst: ohne Ausgabepfad hätte ein Diktat kein Ziel.
     let inject = match InjectWorker::spawn(config.output.clone(), tx.clone(), log.clone()) {
         Ok(worker) => worker,
         Err(err) => {
             log.error(format!(
-                "Ausgabepfad nicht verfügbar: {err}. Diktier v1 unterstützt nur X11 \
-                 (Cinnamon/X11); unter Wayland fehlt der Paste-Pfad."
+                "Ausgabepfad nicht verfügbar: {err}. Ohne Clipboard und Paste-Tastendruck \
+                 hat ein Diktat kein Ziel."
             ));
             return 1;
         }
@@ -257,10 +256,8 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
 
     // §4.5: Der Pegel-Tap entsteht **nur**, wenn das Overlay wirklich läuft —
     // sonst rechnet der cpal-Callback ihn gar nicht erst aus (Overlay-Plan
-    // Leitentscheidung 10, echter Null-Kosten-Pfad). Das Overlay gibt es nur
-    // unter Windows (Plattform-Entscheidung 2026-08-27).
-    let overlay_enabled = cfg!(windows) && config.overlay.enabled;
-    let wanted_tap = overlay_enabled.then(crate::audio::level::new_tap);
+    // Leitentscheidung 10, echter Null-Kosten-Pfad).
+    let wanted_tap = config.overlay.enabled.then(crate::audio::level::new_tap);
 
     // §4.5: „Ein Overlay-Fehler deaktiviert nur das Overlay (Log-Warnung);
     // Diktieren läuft weiter." Deshalb **kein** Abbruch wie bei Tray/Audio.
@@ -269,7 +266,6 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
     // der Ready-Handshake steht, gibt es einen Consumer für den Pegel. Ohne
     // ihn bekommt der cpal-Callback gar keinen Tap und rechnet nichts aus.
     // Stirbt der Overlay-Thread später, schaltet er den Tap selbst ab.
-    #[cfg(windows)]
     let (overlay, level_tap) = match wanted_tap {
         Some(tap) => match OverlayWorker::spawn(tap.clone(), log.clone()) {
             Ok(worker) => (Some(worker), Some(tap)),
@@ -285,9 +281,6 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
             (None, None)
         }
     };
-    // Linux kennt kein Overlay — dort ist der Tap immer `None` (siehe oben).
-    #[cfg(not(windows))]
-    let level_tap = wanted_tap;
 
     // codex M2: Ein Worker, der nicht startet, ist ein Startfehler — sonst
     // liefe der Daemon ohne Mikrofon bzw. ohne Hotkey stumm weiter.
@@ -542,16 +535,6 @@ impl Daemon {
         }
     }
 
-    /// Linux hat keinen Dialog (§4.4: „Nur über Config änderbar") — der
-    /// Menüpunkt taucht dort gar nicht erst auf, die Meldung fängt nur den
-    /// theoretischen Fall ab.
-    #[cfg(not(windows))]
-    fn open_hotkey_dialog(&mut self) {
-        self.log.warn(
-            "Hotkey ändern: Dialog gibt es nur unter Windows — hotkey.key in config.toml setzen",
-        );
-    }
-
     /// Ergebnis des Dialogs: speichern, sofort scharf schalten, Pausezustand
     /// wiederherstellen.
     #[cfg(windows)]
@@ -649,8 +632,9 @@ impl Daemon {
             download.cancel();
         }
 
-        // Phase-2-Erkenntnis (`csd-clipboard`): ohne SAVE_TARGETS verliert
-        // Cinnamon beim Owner-Exit den Clipboard-Inhalt.
+        // Ohne diesen Schritt stirbt ein noch offenes Delayed-Rendering-
+        // Versprechen mit dem Prozess und der Clipboard-Inhalt wäre weg
+        // (`inject::windows::save_to_clipboard_manager` rendert eager).
         let budget = remaining(deadline).min(SAVE_TARGETS_TIMEOUT);
         if !budget.is_zero() {
             match self.inject.save_targets(budget) {

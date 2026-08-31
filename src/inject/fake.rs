@@ -1,4 +1,4 @@
-//! Fake-Clipboard und Fake-Host für Unit-Tests. Kein X11.
+//! Fake-Clipboard und Fake-Host für Unit-Tests. Kein Win32.
 
 use std::time::Duration;
 
@@ -286,7 +286,7 @@ impl ClipboardHost for FakeHost {
 
     fn snapshot_clipboard(&mut self) -> Result<ClipboardSnapshot, InjectError> {
         if self.connection_dead {
-            return Err(InjectError::Failed("X11-Verbindung tot".into()));
+            return Err(InjectError::Failed("Clipboard-Verbindung tot".into()));
         }
         let mut dummy = PumpEvents::default();
         self.drain_pending(&mut dummy);
@@ -304,7 +304,7 @@ impl ClipboardHost for FakeHost {
 
     fn become_owner(&mut self, text: String) -> Result<(), InjectError> {
         if self.connection_dead {
-            return Err(InjectError::Failed("X11-Verbindung tot".into()));
+            return Err(InjectError::Failed("Clipboard-Verbindung tot".into()));
         }
         self.clipboard.generation = self.clipboard.generation.saturating_add(1);
         self.clipboard.our_generation = Some(self.clipboard.generation);
@@ -315,7 +315,7 @@ impl ClipboardHost for FakeHost {
 
     fn still_owner(&mut self) -> Result<bool, InjectError> {
         if self.connection_dead {
-            return Err(InjectError::Failed("X11-Verbindung tot".into()));
+            return Err(InjectError::Failed("Clipboard-Verbindung tot".into()));
         }
         let ours = self.clipboard.owner == FakeOwner::Us
             && self.clipboard.our_generation == Some(self.clipboard.generation);
@@ -375,7 +375,7 @@ impl ClipboardHost for FakeHost {
 
     fn pump(&mut self, timeout: Duration) -> Result<PumpEvents, InjectError> {
         if self.connection_dead {
-            return Err(InjectError::Failed("X11-Verbindung tot".into()));
+            return Err(InjectError::Failed("Clipboard-Verbindung tot".into()));
         }
         let until = self.elapsed.saturating_add(timeout);
         let mut out = PumpEvents::default();

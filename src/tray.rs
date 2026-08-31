@@ -1,4 +1,4 @@
-//! Tray-Backend (Spec §4.3). Linux: betrayer/SNI. Windows: `Shell_NotifyIconW`.
+//! Tray-Backend (Spec §4.3): Notify-Icon über `Shell_NotifyIconW`.
 #![allow(dead_code)]
 
 use thiserror::Error;
@@ -12,14 +12,10 @@ pub enum TrayEvent {
     /// Linksklick: Toggle-Aufnahme folgt in Phase 3 — hier nur Durchreichung.
     LeftClick,
     TogglePause,
-    /// §4.4 + Phase 5: „Hotkey ändern…" — nur Windows bietet den Dialog an,
-    /// das Ereignis selbst bleibt plattformneutral (der Wiring-Code darf es
-    /// auf beiden Seiten kennen).
+    /// §4.4 + Phase 5: „Hotkey ändern…" — der Dialog aus dem Tray-Menü.
     ChangeHotkey,
     /// §9 + Phase 5: „Mit Windows starten" — Häkchen im Menü, Klick legt den
-    /// Autostart-Eintrag an bzw. entfernt ihn. Linux bietet den Punkt nicht an
-    /// (dort ist der Desktop-Entry Sache der Sitzung), das Ereignis bleibt aber
-    /// plattformneutral.
+    /// Autostart-Eintrag an bzw. entfernt ihn.
     ToggleAutostart,
     OpenConfigDir,
     Quit,
@@ -66,23 +62,14 @@ impl TrayStatus {
     }
 }
 
-/// Rohklick, den ein Backend liefern kann. Mapping ist Linux-betrayer (Phase 2b).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayClick {
-    Left,
-    Right,
-    Double,
-}
-
 /// Menüeinträge nach §4.3. Die Statuszeile hat ein Signal, wird aber verworfen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     Status,
     TogglePause,
-    /// Nur im Windows-Menü (§4.4-Dialog); Linux hat keinen Dialog und
-    /// deshalb auch keinen Eintrag.
+    /// §4.4-Dialog „Hotkey ändern…".
     ChangeHotkey,
-    /// Nur im Windows-Menü (§9); mit Häkchen, wenn der Eintrag existiert.
+    /// §9; mit Häkchen, wenn der Eintrag existiert.
     ToggleAutostart,
     OpenConfigDir,
     Quit,
@@ -94,10 +81,10 @@ pub enum TrayError {
     Failed(String),
 }
 
-/// Gemeinsamer Vertrag für betrayer (jetzt), später ksni / Shell_NotifyIconW.
+/// Gemeinsamer Vertrag der Tray-Backends (`Shell_NotifyIconW`, `StubTray`).
 ///
-/// Backends besitzen den UI-/D-Bus-Thread, schicken Events über einen Channel
-/// und blockieren den Aufrufer nicht. `poll` ist nicht blockierend.
+/// Backends besitzen den UI-Thread, schicken Events über einen Channel und
+/// blockieren den Aufrufer nicht. `poll` ist nicht blockierend.
 pub trait TrayBackend {
     fn update(&mut self, runtime: &Runtime, model_key: &str) -> Result<(), TrayError>;
     fn poll(&mut self) -> Result<Option<TrayEvent>, TrayError> {
@@ -117,54 +104,34 @@ impl TrayBackend for StubTray {
     }
 }
 
-/// Genau ein echtes Backend je Plattform. Die frühere `Stub`-Variante ist mit
-/// dem Windows-Backend entfallen — sie wäre auf beiden Plattformen tot
-/// (Paket A hat dasselbe bei `AnyHotkeyBackend` gemacht). `StubTray` selbst
-/// bleibt als Vertragsprobe im Testmodul.
+/// Genau ein echtes Backend. Die frühere `Stub`-Variante ist mit dem
+/// Windows-Backend entfallen — sie wäre tot (Paket A hat dasselbe bei
+/// `AnyHotkeyBackend` gemacht). `StubTray` selbst bleibt als Vertragsprobe im
+/// Testmodul.
 pub enum AnyTray {
-    #[cfg(target_os = "linux")]
-    Betrayer(Box<linux::BetrayerTray>),
-    #[cfg(windows)]
     Win32(Box<windows::Win32Tray>),
 }
 
 impl TrayBackend for AnyTray {
     fn update(&mut self, runtime: &Runtime, model_key: &str) -> Result<(), TrayError> {
         match self {
-            #[cfg(target_os = "linux")]
-            Self::Betrayer(inner) => inner.update(runtime, model_key),
-            #[cfg(windows)]
             Self::Win32(inner) => inner.update(runtime, model_key),
         }
     }
 
     fn poll(&mut self) -> Result<Option<TrayEvent>, TrayError> {
         match self {
-            #[cfg(target_os = "linux")]
-            Self::Betrayer(inner) => inner.poll(),
-            #[cfg(windows)]
             Self::Win32(inner) => inner.poll(),
         }
     }
 
     fn backend_name(&self) -> &'static str {
         match self {
-            #[cfg(target_os = "linux")]
-            Self::Betrayer(inner) => inner.backend_name(),
-            #[cfg(windows)]
             Self::Win32(inner) => inner.backend_name(),
         }
     }
 }
 
-#[cfg(target_os = "linux")]
-pub fn new_backend(runtime: &Runtime, model_key: &str) -> Result<AnyTray, TrayError> {
-    linux::BetrayerTray::new(runtime, model_key)
-        .map(Box::new)
-        .map(AnyTray::Betrayer)
-}
-
-#[cfg(windows)]
 pub fn new_backend(runtime: &Runtime, model_key: &str) -> Result<AnyTray, TrayError> {
     windows::Win32Tray::new(runtime, model_key)
         .map(Box::new)
@@ -210,19 +177,6 @@ pub fn pause_menu_label(paused: bool) -> &'static str {
     }
 }
 
-/// Linux-betrayer (Phase 2b):
-/// - `Double` = SNI `Activate` (Linksklick; betrayer verschluckt den ersten).
-/// - `Left` = dbusmenu-Root `opened` (Rechtsklick öffnet das Menü) — kein Toggle.
-/// - `Right` kommt unter Linux nie.
-///
-/// Windows-Mapping folgt mit dem echten Backend.
-pub fn route_click(click: TrayClick) -> Option<TrayEvent> {
-    match click {
-        TrayClick::Double => Some(TrayEvent::LeftClick),
-        TrayClick::Left | TrayClick::Right => None,
-    }
-}
-
 pub fn route_menu(action: MenuAction) -> Option<TrayEvent> {
     match action {
         MenuAction::Status => None,
@@ -231,33 +185,6 @@ pub fn route_menu(action: MenuAction) -> Option<TrayEvent> {
         MenuAction::ToggleAutostart => Some(TrayEvent::ToggleAutostart),
         MenuAction::OpenConfigDir => Some(TrayEvent::OpenConfigDir),
         MenuAction::Quit => Some(TrayEvent::Quit),
-    }
-}
-
-/// Kindprozess einsammeln, sonst bleibt er bis zum Prozessende ein Zombie
-/// (agy B1). Der Helferthread endet, sobald `xdg-open` fertig ist — auf den
-/// Rückgabewert wartet niemand, das Öffnen ist „fire and forget".
-#[cfg(target_os = "linux")]
-fn reap(child: std::process::Child) {
-    use std::sync::{Arc, Mutex};
-
-    let slot = Arc::new(Mutex::new(Some(child)));
-    let worker = slot.clone();
-    let spawned = std::thread::Builder::new()
-        .name("diktier-xdg-open".into())
-        .spawn(move || {
-            let taken = worker.lock().ok().and_then(|mut slot| slot.take());
-            if let Some(mut child) = taken {
-                let _ = child.wait();
-            }
-        });
-    if spawned.is_err() {
-        // Kein Helferthread verfügbar: lieber hier kurz warten als einen
-        // Zombie hinterlassen — `xdg-open` startet nur den Dateimanager.
-        let taken = slot.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(mut child) = taken {
-            let _ = child.wait();
-        }
     }
 }
 
@@ -274,166 +201,20 @@ pub fn open_config() -> Result<(), TrayError> {
         // sonst öffnet der Klick ins Leere.
         config::load_from(&path).map_err(|e| TrayError::Failed(e.to_string()))?;
     }
-    #[cfg(target_os = "linux")]
-    {
-        let child = std::process::Command::new("xdg-open")
-            .arg(&path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| TrayError::Failed(format!("xdg-open: {e}")))?;
-        reap(child);
-    }
-    #[cfg(windows)]
-    {
-        // `explorer.exe <datei>` öffnet mit der Standard-Anwendung (wie ein
-        // Doppelklick, ohne Konsolenblitzer). Kein Warten: der Explorer meldet
-        // regelmäßig Exitcode 1, obwohl das Fenster aufgeht, und Windows kennt
-        // keine Zombies, ein fallengelassenes `Child` kostet nur das Handle bis
-        // zum Prozessende. Nur nach explizitem Menüklick, nie auf dem PTT-Pfad
-        // (§4.2).
-        std::process::Command::new("explorer.exe")
-            .arg(&path)
-            .spawn()
-            .map_err(|e| TrayError::Failed(format!("explorer.exe: {e}")))?;
-    }
+    // `explorer.exe <datei>` öffnet mit der Standard-Anwendung (wie ein
+    // Doppelklick, ohne Konsolenblitzer). Kein Warten: der Explorer meldet
+    // regelmäßig Exitcode 1, obwohl das Fenster aufgeht, und Windows kennt
+    // keine Zombies, ein fallengelassenes `Child` kostet nur das Handle bis
+    // zum Prozessende. Nur nach explizitem Menüklick, nie auf dem PTT-Pfad
+    // (§4.2).
+    std::process::Command::new("explorer.exe")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| TrayError::Failed(format!("explorer.exe: {e}")))?;
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
-    use std::sync::mpsc::{self, Receiver, TryRecvError};
-
-    use betrayer::{
-        ClickType, Icon, Menu, MenuItem, TrayEvent as BetrayerEvent, TrayIcon, TrayIconBuilder,
-    };
-
-    use super::*;
-
-    const ICON_SIZE: u32 = 32;
-
-    struct IconSet {
-        starting: Icon,
-        downloading: Icon,
-        loading: Icon,
-        idle: Icon,
-        recording: Icon,
-        transcribing: Icon,
-        error: Icon,
-        paused: Icon,
-    }
-
-    impl IconSet {
-        fn new() -> Result<Self, TrayError> {
-            Ok(Self {
-                starting: rgb_icon(128, 128, 128)?,
-                downloading: rgb_icon(30, 144, 255)?,
-                loading: rgb_icon(0, 191, 255)?,
-                idle: rgb_icon(46, 204, 64)?,
-                recording: rgb_icon(220, 50, 47)?,
-                transcribing: rgb_icon(230, 126, 34)?,
-                error: rgb_icon(192, 57, 43)?,
-                paused: rgb_icon(241, 196, 15)?,
-            })
-        }
-
-        fn get(&self, status: TrayStatus) -> Icon {
-            match status {
-                TrayStatus::Starting => self.starting.clone(),
-                TrayStatus::Downloading => self.downloading.clone(),
-                TrayStatus::Loading => self.loading.clone(),
-                TrayStatus::Idle => self.idle.clone(),
-                TrayStatus::Recording => self.recording.clone(),
-                TrayStatus::Transcribing => self.transcribing.clone(),
-                TrayStatus::Error => self.error.clone(),
-                TrayStatus::Paused => self.paused.clone(),
-            }
-        }
-    }
-
-    fn rgb_icon(r: u8, g: u8, b: u8) -> Result<Icon, TrayError> {
-        let mut rgba = vec![0u8; (ICON_SIZE * ICON_SIZE * 4) as usize];
-        for px in rgba.chunks_exact_mut(4) {
-            px[0] = r;
-            px[1] = g;
-            px[2] = b;
-            px[3] = 255;
-        }
-        Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE)
-            .map_err(|e| TrayError::Failed(format!("Icon: {e}")))
-    }
-
-    fn build_menu(runtime: &Runtime, model_key: &str) -> Menu<MenuAction> {
-        Menu::new([
-            MenuItem::button(tooltip_text(runtime, model_key), MenuAction::Status),
-            MenuItem::separator(),
-            MenuItem::button(pause_menu_label(runtime.paused), MenuAction::TogglePause),
-            MenuItem::button("Konfiguration bearbeiten", MenuAction::OpenConfigDir),
-            MenuItem::separator(),
-            MenuItem::button("Beenden", MenuAction::Quit),
-        ])
-    }
-
-    fn map_betrayer(event: BetrayerEvent<MenuAction>) -> Option<TrayEvent> {
-        match event {
-            BetrayerEvent::Tray(ClickType::Left) => route_click(TrayClick::Left),
-            BetrayerEvent::Tray(ClickType::Right) => route_click(TrayClick::Right),
-            BetrayerEvent::Tray(ClickType::Double) => route_click(TrayClick::Double),
-            BetrayerEvent::Menu(action) => route_menu(action),
-        }
-    }
-
-    pub struct BetrayerTray {
-        icon: TrayIcon<MenuAction>,
-        icons: IconSet,
-        rx: Receiver<TrayEvent>,
-    }
-
-    impl BetrayerTray {
-        pub fn new(runtime: &Runtime, model_key: &str) -> Result<Self, TrayError> {
-            let icons = IconSet::new()?;
-            let (tx, rx) = mpsc::channel();
-            let icon = TrayIconBuilder::new()
-                .with_icon(icons.get(tray_status(runtime)))
-                .with_tooltip(tooltip_text(runtime, model_key))
-                .with_menu(build_menu(runtime, model_key))
-                .build(move |event| {
-                    if let Some(mapped) = map_betrayer(event) {
-                        let _ = tx.send(mapped);
-                    }
-                })
-                .map_err(|e| TrayError::Failed(format!("betrayer: {e}")))?;
-            Ok(Self { icon, icons, rx })
-        }
-    }
-
-    impl TrayBackend for BetrayerTray {
-        fn update(&mut self, runtime: &Runtime, model_key: &str) -> Result<(), TrayError> {
-            let status = tray_status(runtime);
-            self.icon.set_icon(Some(self.icons.get(status)));
-            self.icon.set_tooltip(tooltip_text(runtime, model_key));
-            self.icon.set_menu(Some(build_menu(runtime, model_key)));
-            Ok(())
-        }
-
-        fn poll(&mut self) -> Result<Option<TrayEvent>, TrayError> {
-            match self.rx.try_recv() {
-                Ok(event) => Ok(Some(event)),
-                Err(TryRecvError::Empty) => Ok(None),
-                Err(TryRecvError::Disconnected) => {
-                    Err(TrayError::Failed("Tray-Thread beendet".into()))
-                }
-            }
-        }
-
-        fn backend_name(&self) -> &'static str {
-            "betrayer"
-        }
-    }
-}
-
-/// Windows: Notify-Icon über `Shell_NotifyIconW` (windows-plan WP4).
+/// Notify-Icon über `Shell_NotifyIconW` (windows-plan WP4).
 ///
 /// Aufbau nach Leitentscheidung 2: **ein Owner-Thread**. Fenster, Icons, Menü
 /// und das Notify-Icon werden ausschließlich auf dem Thread erzeugt, benutzt
@@ -450,7 +231,6 @@ mod linux {
 /// `WM_ENDSESSION`. Sichtbar wird es nie (kein `WS_VISIBLE`,
 /// `WS_EX_TOOLWINDOW`), es nimmt also auch keinen Fokus — bis auf die eine
 /// Ausnahme aus §4.2, das `SetForegroundWindow` vor dem Kontextmenü.
-#[cfg(windows)]
 mod windows {
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -548,8 +328,7 @@ mod windows {
         out
     }
 
-    /// Farben wie im Linux-`IconSet` — derselbe Zustand sieht auf beiden
-    /// Plattformen gleich aus.
+    /// Eine Farbe je §4.3-Zustand.
     pub(super) fn icon_rgb(status: TrayStatus) -> (u8, u8, u8) {
         match status {
             TrayStatus::Starting => (128, 128, 128),
@@ -1459,13 +1238,6 @@ mod tests {
     }
 
     #[test]
-    fn click_routing_linux_betrayer() {
-        assert_eq!(route_click(TrayClick::Double), Some(TrayEvent::LeftClick));
-        assert_eq!(route_click(TrayClick::Left), None);
-        assert_eq!(route_click(TrayClick::Right), None);
-    }
-
-    #[test]
     fn fake_backend_routes_pause_toggle() {
         let mut tray = FakeTray::default();
         tray.push(TrayEvent::TogglePause);
@@ -1588,7 +1360,7 @@ mod tests {
         }
 
         /// Jeder §4.3-Zustand hat genau einen Platz im `IconSet` und eine
-        /// eigene Farbe (dieselben wie unter Linux).
+        /// eigene Farbe.
         #[test]
         fn every_status_has_its_own_icon_slot_and_color() {
             let mut slots: Vec<usize> = ALL_STATES.iter().copied().map(icon_index).collect();

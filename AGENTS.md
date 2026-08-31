@@ -13,10 +13,15 @@ Reviews: [docs/reviews/spec-codex.md](docs/reviews/spec-codex.md),
 - Auf dem PTT-Pfad kein Fenster öffnen, das den Fokus stiehlt.
 - TDT-Decoder nicht selbst implementieren — `parakeet-rs` (Fallback: `transcribe-rs`).
 
-## Implementierungsreihenfolge
+## Implementierungsreihenfolge (Historie)
 
 1. STT-Spike (gleiche WAV gegen Voxtype auf Omarchy)
 2. Inject-Spike (Windows + Mint, Fokus bleibt, Umlaute)
 3. Daemon + Tray + Config + Autostart
+
+Diese Liste beschreibt den zurückgelegten Weg. **Zielplattform ist seit dem
+2026-08-27 ausschließlich Windows** (Plattform-Entscheidung, siehe
+docs/windows-plan.md); der Linux-/X11-Code ist entfernt, Gates laufen nur noch
+unter Windows.
 
 Gates stehen in der Spec. Nicht committen, solange der Auftrag das verbietet.

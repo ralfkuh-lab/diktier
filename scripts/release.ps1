@@ -3,7 +3,7 @@
     Baut das Windows-Release-Bundle, das Zip und die Setup-Exe (Spec §11).
 
 .DESCRIPTION
-    Windows-Gegenstück zu scripts/release.sh:
+    Legt an:
 
         dist\diktier-<version>-win-x64\
           diktier.exe             # cargo build --release --locked

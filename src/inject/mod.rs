@@ -13,15 +13,11 @@ mod protocol;
 #[cfg(test)]
 mod fake;
 
-#[cfg(target_os = "linux")]
-mod linux;
-
-#[cfg(windows)]
 mod windows;
 
 pub use protocol::{RESTORED_SERVE_GRACE, ResolvedShortcut};
 
-/// Native Vordergrund-Kennung (HWND bzw. X11-Window), als portable Zahl.
+/// Native Vordergrund-Kennung (HWND), als portable Zahl.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowId(pub u64);
 
@@ -80,16 +76,16 @@ impl RestoreDecision {
     }
 }
 
-/// Ausgang des `CLIPBOARD_MANAGER`/`SAVE_TARGETS`-Handshakes im Quit-Pfad.
+/// Ausgang der Clipboard-Sicherung im Quit-Pfad (`save_targets`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardSave {
-    /// Diktier hält die Selection nicht (mehr) — nichts zu sichern.
+    /// Diktier hält das Clipboard nicht (mehr) — nichts zu sichern.
     NotOwner,
-    /// Kein Clipboard-Manager auf der Session.
+    /// Niemand da, der den Inhalt übernehmen könnte (Trait-Default/Stub).
     NoManager,
-    /// Manager hat den Inhalt übernommen.
+    /// Der Inhalt ist gesichert.
     Saved,
-    /// Manager hat abgelehnt (`property == None`).
+    /// Die Übernahme wurde abgelehnt.
     Refused,
     /// Keine Antwort innerhalb der Frist.
     Timeout,
@@ -148,9 +144,10 @@ pub trait OutputSink {
     fn serve_until_read(&mut self, _timeout: Duration) -> Result<u32, InjectError> {
         Ok(0)
     }
-    /// Quit-Pfad (Spec §7.1 Punkt 8 + Phase-2-Erkenntnis `csd-clipboard`):
-    /// den eigenen Clipboard-Inhalt vor dem Prozessende an einen laufenden
-    /// Clipboard-Manager übergeben (ICCCM `CLIPBOARD_MANAGER`/`SAVE_TARGETS`).
+    /// Quit-Pfad (Spec §7.1 Punkt 8): den eigenen Clipboard-Inhalt vor dem
+    /// Prozessende so sichern, dass er ihn überlebt. Der Name stammt vom
+    /// ICCCM-`SAVE_TARGETS`-Handshake, unter Windows ist es ein eager Render
+    /// (siehe `windows::Win32OutputSink::save_to_clipboard_manager`).
     fn save_to_clipboard_manager(
         &mut self,
         _timeout: Duration,
@@ -174,20 +171,10 @@ impl OutputSink for StubOutputSink {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub type PlatformSink = linux::X11OutputSink;
-#[cfg(windows)]
 pub type PlatformSink = windows::Win32OutputSink;
 
 pub fn new_sink(output: OutputConfig) -> Result<PlatformSink, InjectError> {
-    #[cfg(target_os = "linux")]
-    {
-        linux::X11OutputSink::new(output)
-    }
-    #[cfg(windows)]
-    {
-        windows::Win32OutputSink::new(output)
-    }
+    windows::Win32OutputSink::new(output)
 }
 
 #[cfg(test)]

@@ -190,9 +190,6 @@ fn attach_parent_console() {
     fix(STD_ERROR_HANDLE, "CONOUT$", GENERIC_READ | GENERIC_WRITE);
 }
 
-#[cfg(not(windows))]
-fn attach_parent_console() {}
-
 fn main() -> ExitCode {
     // Erster Schritt, vor Clap und vor `signals::install()`.
     attach_parent_console();
@@ -691,13 +688,6 @@ fn hotkey_dialog_test(autoclose_secs: u32) -> u8 {
     }
 }
 
-/// Linux kennt den Dialog nicht (§4.4: „Nur über Config änderbar").
-#[cfg(not(windows))]
-fn hotkey_dialog_test(_autoclose_secs: u32) -> u8 {
-    eprintln!("diktier: --hotkey-dialog-test gibt es nur unter Windows");
-    2
-}
-
 /// SPIKE (§4.5): Aufnahme-Overlay ohne Daemon zeigen — Gate B des
 /// Overlay-Plans (Fokusprobe, Klickdurchgriff, DPI/Monitorwechsel) lässt sich
 /// damit fahren, bevor Config und Kernzustand verdrahtet sind.
@@ -792,13 +782,6 @@ fn sweep_level(elapsed: std::time::Duration) -> f32 {
     (envelope * (0.25 + 0.75 * flutter)).clamp(0.0, 1.0)
 }
 
-/// Das Overlay ist Windows-only (Plattform-Entscheidung 2026-08-27).
-#[cfg(not(windows))]
-fn overlay_test(_secs: u32) -> u8 {
-    eprintln!("diktier: --overlay-test gibt es nur unter Windows");
-    2
-}
-
 fn tray_test(secs: u32) -> u8 {
     eprintln!("SPIKE --tray-test (kein Produktionspfad)");
     if secs == 0 {
@@ -831,13 +814,6 @@ fn tray_test(secs: u32) -> u8 {
         }
     };
     eprintln!("SPIKE tray-backend={}", tray.backend_name());
-    // Nur die SNI-Diagnose ist Linux — auf Windows gibt es keinen
-    // StatusNotifierItem-Busnamen.
-    #[cfg(target_os = "linux")]
-    eprintln!(
-        "SPIKE tray-sni=org.kde.StatusNotifierItem-{}-1",
-        std::process::id()
-    );
     eprintln!(
         "SPIKE tray: zustand={} tooltip={}",
         tray::tray_status(&runtime).as_str(),

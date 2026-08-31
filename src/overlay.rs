@@ -111,7 +111,11 @@ pub fn scale(value: i32, dpi: u32) -> i32 {
     }
     let dpi = if dpi == 0 { 96 } else { dpi };
     let scaled = (f64::from(value) * f64::from(dpi) / 96.0).round() as i32;
-    if value > 0 { scaled.max(1) } else { scaled.min(-1) }
+    if value > 0 {
+        scaled.max(1)
+    } else {
+        scaled.min(-1)
+    }
 }
 
 /// Kartenrechteck in Bildschirmkoordinaten: unten mittig in der Arbeitsfläche
@@ -258,7 +262,9 @@ impl<'a> Canvas<'a> {
         if width <= 0 || height <= 0 {
             return None;
         }
-        let needed = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+        let needed = (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?;
         if pixels.len() < needed {
             return None;
         }
@@ -325,7 +331,9 @@ impl<'a> Canvas<'a> {
         let inv = 1.0 - alpha;
         let idx = self.index(x, y);
         let dst_a = f32::from(self.pixels[idx + 3]);
-        let new_a = (f32::from(u8::MAX) * alpha + dst_a * inv).round().min(255.0);
+        let new_a = (f32::from(u8::MAX) * alpha + dst_a * inv)
+            .round()
+            .min(255.0);
         for (offset, channel) in [color.b, color.g, color.r].into_iter().enumerate() {
             let src = f32::from(channel) * alpha;
             let dst = f32::from(self.pixels[idx + offset]);
@@ -442,7 +450,9 @@ pub fn draw_mic_glyph(canvas: &mut Canvas, area: Rect, color: Color) {
             Rect::new(
                 (center_x - half).round() as i32,
                 stand_top,
-                (center_x + half).round().max((center_x - half).round() + 1.0) as i32,
+                (center_x + half)
+                    .round()
+                    .max((center_x - half).round() + 1.0) as i32,
                 foot_top,
             ),
             color,
@@ -692,8 +702,14 @@ mod tests {
     fn the_card_is_clamped_into_a_tiny_work_area() {
         let work = Rect::new(0, 0, 320, 100);
         let card = card_rect(work, 96);
-        assert!(card.left >= work.left && card.right <= work.right, "{card:?}");
-        assert!(card.top >= work.top && card.bottom <= work.bottom, "{card:?}");
+        assert!(
+            card.left >= work.left && card.right <= work.right,
+            "{card:?}"
+        );
+        assert!(
+            card.top >= work.top && card.bottom <= work.bottom,
+            "{card:?}"
+        );
     }
 
     /// Historie kürzer als die Karte: links bleibt Platz, der neueste Balken
@@ -704,7 +720,10 @@ mod tests {
         let bars = bar_rects(area, &[0.2, 0.4, 1.0], 3, 2);
         assert_eq!(bars.len(), 3);
         assert_eq!(bars[0].0.right, area.right, "neuester Balken ganz rechts");
-        assert!((bars[0].1 - 1.0).abs() < 1e-6, "und trägt den neuesten Wert");
+        assert!(
+            (bars[0].1 - 1.0).abs() < 1e-6,
+            "und trägt den neuesten Wert"
+        );
         assert_eq!(bars[1].0.right, area.right - 5);
         assert!(bars[2].0.left > area.left, "links bleibt Platz");
         // Vollausschlag füllt die Fläche, Stille bleibt eine 1-px-Linie.
@@ -803,10 +822,7 @@ mod tests {
             let mut state = OverlayState::new();
             state.set_capacity(history_capacity(w, h, dpi));
             for step in 0..500 {
-                state.push(
-                    (step % 20) as f32 / 20.0,
-                    Duration::from_millis(20),
-                );
+                state.push((step % 20) as f32 / 20.0, Duration::from_millis(20));
             }
             draw_card(&mut canvas, dpi, &state);
             for y in 0..h {
@@ -890,7 +906,11 @@ mod tests {
     fn drawing_outside_the_canvas_is_clipped() {
         let mut buffer = canvas_buffer(8, 8);
         let mut canvas = Canvas::new(&mut buffer, 8, 8).expect("Puffer passt");
-        fill_rect(&mut canvas, Rect::new(-20, -20, 40, 40), Color::rgb(255, 0, 0));
+        fill_rect(
+            &mut canvas,
+            Rect::new(-20, -20, 40, 40),
+            Color::rgb(255, 0, 0),
+        );
         fill_round_rect(
             &mut canvas,
             Rect::new(-5, -5, 100, 100),
@@ -964,4 +984,3 @@ mod tests {
         assert!(mark[3] > 200 && mark[0] > 200, "Peak-Marke fehlt: {mark:?}");
     }
 }
-

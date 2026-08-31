@@ -1,5 +1,5 @@
 //! Log des Daemons (Spec §10): stderr (im `--foreground`) **plus**
-//! `~/.local/state/diktier/diktier.log`.
+//! `%LOCALAPPDATA%diktierdiktier.log`.
 //!
 //! Der Vertrag aus §10: **keine Transkripte, keine Clipboard-Inhalte, keine
 //! Fenstertitel**. Wo eine Textmenge interessant ist, steht ihre Länge in Bytes.
@@ -141,7 +141,7 @@ impl Logger {
 
     /// Datei-Sink öffnen (§10). Fehler sind nicht fatal: ohne Datei bleibt
     /// stderr, und der Daemon soll nicht daran scheitern, dass
-    /// `~/.local/state` nicht beschreibbar ist.
+    /// `%LOCALAPPDATA%diktier` nicht beschreibbar ist.
     pub fn attach_file(&self, path: &Path, limit: u64) -> io::Result<()> {
         let sink = FileSink::open(path, limit)?;
         let mut slot = self.file.lock().unwrap_or_else(|e| e.into_inner());
@@ -267,11 +267,6 @@ impl FileSink {
 fn open_append(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     options.open(path)
 }
 
@@ -517,19 +512,13 @@ mod tests {
     }
 
     #[test]
-    fn attach_file_creates_the_directory_and_a_private_file() {
+    fn attach_file_creates_the_directory_and_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join(paths::LOG_NAME);
         let log = Logger::new(false);
         log.attach_file(&path, paths::LOG_LIMIT_BYTES).unwrap();
         assert!(log.has_file());
         assert!(path.is_file());
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
-        }
     }
 
     #[test]

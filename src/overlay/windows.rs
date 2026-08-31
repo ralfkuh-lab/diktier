@@ -50,9 +50,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, HTTRANSPARENT, MSG, PM_REMOVE,
     PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETWORKAREA, SW_HIDE,
     SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use super::{Canvas, OverlayState, Rect, card_rect, draw_card, history_capacity};
@@ -111,7 +111,8 @@ fn rect_from(raw: &RECT) -> Rect {
 fn set_thread_dpi_awareness() -> bool {
     // SAFETY: dokumentierte Konstante, kein Zeiger auf eigenen Speicher; der
     // Rückgabewert ist der vorherige Kontext (NULL = Fehler).
-    let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let previous =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     !previous.is_null()
 }
 
@@ -732,8 +733,8 @@ impl OverlayWindow {
         let (width, height) = (surface.width, surface.height);
         {
             let pixels = surface.pixels();
-            let mut canvas =
-                Canvas::new(pixels, width, height).ok_or_else(|| failed("Overlay-Puffer zu klein"))?;
+            let mut canvas = Canvas::new(pixels, width, height)
+                .ok_or_else(|| failed("Overlay-Puffer zu klein"))?;
             draw_card(&mut canvas, *dpi, render);
         }
 

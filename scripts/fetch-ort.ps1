@@ -1,11 +1,12 @@
 # Ungetestet. Verifikation auf Windows in Phase 2.
-# Analog zu fetch-ort.sh: offizielles ONNX-Runtime-CPU-Release Windows x64
-# in der Version, die ort 2.0.0-rc.13 verlangt (ORT 1.28.0).
+# Offizielles ONNX-Runtime-CPU-Release Windows x64 in der Version, die
+# ort 2.0.0-rc.13 verlangt (ORT 1.28.0).
 # Ergebnis: lib/onnxruntime.dll (fester Name, Spec §11).
 #
 # Dev-Staging: zusätzlich nach target\debug\lib\ und target\release\lib\,
 # damit cargo-Binaries und Test-Binaries (deps\ → ..\lib) ohne Env finden.
-# Bewusst kein Suchpfad ..\..\lib im Resolver (siehe fetch-ort.sh).
+# Bewusst kein Suchpfad ..\..\lib im Resolver — der sucht nur lib\ und
+# ..\lib neben der Exe (src\engine.rs, resolve_ort_lib_from_exe_dir).
 
 $ErrorActionPreference = "Stop"
 

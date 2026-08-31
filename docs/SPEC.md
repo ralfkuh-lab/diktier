@@ -9,6 +9,11 @@ v1.1: Codex-Review (`docs/reviews/spec-codex.md`). v1.2: Agy-Kreuz-Review
 v1.4 (2026-08-31, Ralf): Aufnahme-Overlay aus v2 vorgezogen — §2-Eintrag
 gestrichen, neu §4.5 und `[overlay]` in §8; Plan
 `docs/overlay-plan.md`, Review `docs/reviews/plan-overlay-sol.md`.
+v1.5 (2026-08-31, Ralf): **Windows-only.** Der Linux-Code ist entfernt;
+alle Linux-/X11-/Wayland-Passagen dieser Spec (u. a. in §3, §4.4, §5,
+§8, §9) sind historisch und nicht mehr normativ. Die
+Clean-VM-Release-Gates aus §11/§12 sind für den privaten Gebrauch
+ausgesetzt (windows-plan.md, WP7 verworfen).
 
 ## 1. Ziel
 

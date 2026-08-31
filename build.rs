@@ -1,9 +1,9 @@
 //! Build-Script (Phase 5, Paket F): hängt Icon und Versionsressource an die
 //! Exe.
 //!
-//! Nur Windows — `cfg(windows)` ist hier der **Host**, und genau der stimmt:
-//! Die Ressource entsteht beim Bauen über `rc.exe` aus dem Windows SDK. Unter
-//! Linux ist `main` leer und `winresource` steht gar nicht erst im Baum
+//! `cfg(windows)` ist hier der **Host**, und genau der stimmt: Die Ressource
+//! entsteht beim Bauen über `rc.exe` aus dem Windows SDK, und `winresource`
+//! steht nur für diesen Host im Baum
 //! (`[target.'cfg(windows)'.build-dependencies]`).
 //!
 //! Ein Fehlschlag ist **nicht** fatal: fehlt `rc.exe`, bekommt die Exe eben das

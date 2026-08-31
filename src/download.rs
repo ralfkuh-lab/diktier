@@ -89,35 +89,15 @@ pub fn load_manifest() -> Result<ArtifactManifest, DownloadError> {
     toml::from_str(MANIFEST_TOML).map_err(|e| DownloadError::Manifest(e.to_string()))
 }
 
-/// Linux: `~/.local/share/diktier/models/<key>/`.
-/// Windows: `%LOCALAPPDATA%\diktier\models\<key>\`.
+/// `%LOCALAPPDATA%\diktier\models\<key>\`.
 pub fn model_dir(key: &str) -> Result<PathBuf, DownloadError> {
-    #[cfg(target_os = "linux")]
-    {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
-            DownloadError::Path("Umgebungsvariable HOME ist nicht gesetzt".into())
-        })?;
-        Ok(PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("diktier")
-            .join("models")
-            .join(key))
-    }
-    #[cfg(windows)]
-    {
-        let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
-            DownloadError::Path("Umgebungsvariable LOCALAPPDATA ist nicht gesetzt".into())
-        })?;
-        Ok(PathBuf::from(local)
-            .join("diktier")
-            .join("models")
-            .join(key))
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        compile_error!("diktier unterstützt nur Linux und Windows");
-    }
+    let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+        DownloadError::Path("Umgebungsvariable LOCALAPPDATA ist nicht gesetzt".into())
+    })?;
+    Ok(PathBuf::from(local)
+        .join("diktier")
+        .join("models")
+        .join(key))
 }
 
 /// Existenz und Dateigröße gegen das Manifest. SHA-256 nur im Download-Pfad
@@ -427,11 +407,6 @@ fn stream_to_part(
 fn create_part(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o644);
-    }
     options.open(path)
 }
 
@@ -582,17 +557,10 @@ mod tests {
     #[test]
     fn model_dir_matches_spec() {
         let dir = model_dir(DEFAULT_MODEL).unwrap();
-        #[cfg(target_os = "linux")]
-        {
-            assert!(dir.ends_with(format!(".local/share/diktier/models/{DEFAULT_MODEL}")));
-        }
-        #[cfg(windows)]
-        {
-            assert!(
-                dir.ends_with(format!("diktier\\models\\{DEFAULT_MODEL}"))
-                    || dir.ends_with(format!("diktier/models/{DEFAULT_MODEL}"))
-            );
-        }
+        assert!(
+            dir.ends_with(format!("diktier\\models\\{DEFAULT_MODEL}"))
+                || dir.ends_with(format!("diktier/models/{DEFAULT_MODEL}"))
+        );
     }
 
     // ------------------------------------------- Download mit Fake-Transport

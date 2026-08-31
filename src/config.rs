@@ -68,8 +68,8 @@ const NAMED_KEYS: &[&str] = &[
     "Down",
     "ScrollLock",
     "Pause",
-    // Die **rechte** Strg-Taste als Taste, nicht als Modifier: unter Windows
-    // ein eigener Virtual-Key (`VK_RCONTROL`), unter X11 ein eigenes Keysym.
+    // Die **rechte** Strg-Taste als Taste, nicht als Modifier: ein eigener
+    // Virtual-Key (`VK_RCONTROL`).
     // Die linke Strg bleibt Modifier (`modifiers = ["ctrl"]`).
     "RCtrl",
 ];
@@ -173,8 +173,7 @@ pub struct TrayConfig {
     pub show_notifications_on_error: bool,
 }
 
-/// §4.5: Aufnahme-Overlay. Default an; unter Linux ohne Wirkung
-/// (Windows-only, Plattform-Entscheidung 2026-08-27).
+/// §4.5: Aufnahme-Overlay. Default an.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverlayConfig {
     pub enabled: bool,
@@ -346,28 +345,11 @@ impl Default for RawOverlay {
     }
 }
 
-/// Linux: `~/.config/diktier/config.toml`. Windows: `%APPDATA%\diktier\config.toml`.
+/// `%APPDATA%\diktier\config.toml`.
 pub fn config_path() -> Result<PathBuf, ConfigError> {
-    #[cfg(target_os = "linux")]
-    {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| ConfigError::Path("Umgebungsvariable HOME ist nicht gesetzt".into()))?;
-        Ok(PathBuf::from(home)
-            .join(".config")
-            .join("diktier")
-            .join("config.toml"))
-    }
-    #[cfg(windows)]
-    {
-        let appdata = std::env::var_os("APPDATA").ok_or_else(|| {
-            ConfigError::Path("Umgebungsvariable APPDATA ist nicht gesetzt".into())
-        })?;
-        Ok(PathBuf::from(appdata).join("diktier").join("config.toml"))
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        compile_error!("diktier unterstützt nur Linux und Windows");
-    }
+    let appdata = std::env::var_os("APPDATA")
+        .ok_or_else(|| ConfigError::Path("Umgebungsvariable APPDATA ist nicht gesetzt".into()))?;
+    Ok(PathBuf::from(appdata).join("diktier").join("config.toml"))
 }
 
 pub fn load() -> Result<LoadedConfig, ConfigError> {
@@ -1032,9 +1014,6 @@ max_duration_secs = 15
     #[test]
     fn config_path_matches_spec() {
         let path = config_path().unwrap();
-        #[cfg(target_os = "linux")]
-        assert!(path.ends_with(".config/diktier/config.toml"));
-        #[cfg(windows)]
         assert!(path.ends_with("diktier\\config.toml") || path.ends_with("diktier/config.toml"));
     }
 }

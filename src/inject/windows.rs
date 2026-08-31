@@ -1,8 +1,7 @@
 //! Win32-OutputSink: Message-only-Fenster als Clipboard-Owner + `SendInput`
 //! (Spec §7, windows-plan WP3).
 //!
-//! Das Gegenstück zu [`super::linux`]. Zwei Dinge sind auf Windows anders und
-//! prägen den ganzen Modul-Aufbau:
+//! Zwei Eigenheiten von Windows prägen den ganzen Modul-Aufbau:
 //!
 //! 1. **Delayed Rendering statt Selection-Ownership.** Diktier legt kein
 //!    Transkript ins Clipboard, sondern ein Versprechen
@@ -666,8 +665,7 @@ impl ClipboardHost for Win32OutputSink {
 
     fn snapshot_clipboard(&mut self) -> Result<ClipboardSnapshot, InjectError> {
         // Angelaufene Nachrichten zuerst verarbeiten — ein fremder Copy kurz
-        // vor dem Snapshot darf nicht in die neue Session hineinlecken
-        // (Analog zu `drain_events` im X11-Sink).
+        // vor dem Snapshot darf nicht in die neue Session hineinlecken.
         self.pump_messages(Duration::ZERO);
         let _ = self.take_events();
 
@@ -704,10 +702,10 @@ impl ClipboardHost for Win32OutputSink {
         Ok(self.is_still_owner())
     }
 
-    /// Restore eines **nicht leeren** Snapshots. Anders als auf X11 genügt es
-    /// nicht, den Serve-Text zu tauschen: nach `WM_RENDERFORMAT` liegt das
-    /// Transkript als echte Daten im Clipboard, ein späterer Leser fragt uns
-    /// nicht mehr. Der Text muss deshalb eager materialisiert werden.
+    /// Restore eines **nicht leeren** Snapshots. Den Serve-Text zu tauschen
+    /// genügt nicht: nach `WM_RENDERFORMAT` liegt das Transkript als echte
+    /// Daten im Clipboard, ein späterer Leser fragt uns nicht mehr. Der Text
+    /// muss deshalb eager materialisiert werden.
     fn set_serve_text(&mut self, text: String) {
         if !self.is_still_owner() {
             self.state.borrow_mut().serve = text;

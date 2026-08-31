@@ -1,4 +1,4 @@
-//! Plattformneutrales Inject-Protokoll (Spec §7). Kein X11.
+//! Plattformneutrales Inject-Protokoll (Spec §7). Kein Win32.
 
 use std::time::Duration;
 
@@ -214,13 +214,11 @@ pub fn auto_shortcut(wm_class: Option<(&str, &str)>) -> ResolvedShortcut {
 
 /// Windows-Zweig (Spec §7.2, windows-plan WP3).
 ///
-/// Auf Windows gibt es keine X11-`WM_CLASS`; der Sink liefert als
+/// Eine `WM_CLASS` gibt es hier nicht; der Sink liefert als
 /// Trait-Platzhalter **zweimal den Prozess-Basenamen**, also z. B.
 /// `("notepad.exe", "notepad.exe")`. Genau diese Form wird hier erkannt:
-/// beide Werte gleich **und** ein `.exe`-Suffix. X11-Klassen tragen keins, die
-/// Linux-Tabelle darunter bleibt deshalb unberührt — und ein durch Wine
-/// gestartetes Fenster mit der Klasse `foo.exe` führt hier wie dort zu
-/// `CtrlV`.
+/// beide Werte gleich **und** ein `.exe`-Suffix. Die Namen der
+/// Terminal-Tabelle darunter tragen keins, die bleibt deshalb unberührt.
 ///
 /// Die Regel selbst ist kurz: `WindowsTerminal.exe` bindet beide Chords auf
 /// Paste, `conhost`/PowerShell kennen `Ctrl+Shift+V` nicht.
@@ -272,7 +270,7 @@ pub fn modifiers_to_restore(cleared: &[PasteKey], still_held: ModifierState) -> 
         .collect()
 }
 
-/// Host, den das Protokoll steuert. Fake und X11 implementieren das.
+/// Host, den das Protokoll steuert. Fake und Win32-Sink implementieren das.
 pub trait ClipboardHost {
     fn mark_start(&mut self);
     fn elapsed(&self) -> Duration;
@@ -367,19 +365,18 @@ pub fn inject_paste<H: ClipboardHost>(
     })
 }
 
-/// Spec §7.1 Punkt 8: nach Restore bedient Diktier die restaurierte X11-
-/// Selection bis zum Ownership-Verlust weiter. Der Phase-3-Daemon hält die
-/// Connection sowieso — kein Extra-Wait.
+/// Spec §7.1 Punkt 8: nach Restore bedient Diktier den restaurierten Inhalt
+/// bis zum Ownership-Verlust weiter. Der Daemon hält sein Clipboard-Fenster
+/// sowieso — kein Extra-Wait.
 ///
 /// Der Spike `--inject-test` beendet den Prozess sonst direkt nach Restore.
-/// Auf Cinnamon fetcht `csd-clipboard` den restaurierten Inhalt dann nicht
-/// mehr und stellt beim Owner-Exit seinen letzten Fetch (das Transkript)
-/// wieder her; Restore wirkt netto nicht. Deshalb wartet nur der Spike-Pfad
-/// hier, bis die restaurierte Selection mindestens einmal als Daten-Read
-/// bedient wurde, sonst `RESTORED_SERVE_GRACE`.
+/// Stirbt der Owner, bevor irgendwer den restaurierten Inhalt geholt hat,
+/// wirkt der Restore netto nicht. Deshalb wartet nur der Spike-Pfad hier, bis
+/// der restaurierte Inhalt mindestens einmal als Daten-Read bedient wurde,
+/// sonst `RESTORED_SERVE_GRACE`.
 ///
-/// `csd-clipboard` erzeugt False-Positive-Reads (TARGETS, oft UTF8_STRING
-/// schon beim Ownership-Wechsel); Spec §7.1 Punkt 7 akzeptiert das.
+/// Clipboard-Manager erzeugen dabei False-Positive-Reads; Spec §7.1 Punkt 7
+/// akzeptiert das.
 pub fn serve_restored_until_read<H: ClipboardHost>(
     host: &mut H,
     grace: Duration,
@@ -416,7 +413,7 @@ fn wait_for_restore<H: ClipboardHost>(
         } else {
             session.delay().saturating_sub(elapsed)
         };
-        // Kleine Scheiben, damit Fake-Skripte und X11-Events nicht über das
+        // Kleine Scheiben, damit Fake-Skripte und echte Events nicht über das
         // Entscheidungsfenster hinwegschießen.
         let slice = if remaining.is_zero() {
             Duration::from_millis(1)
@@ -561,17 +558,17 @@ mod tests {
         }
     }
 
-    /// Die Windows-Regel greift nur bei der Platzhalterform `(exe, exe)`. Ein
-    /// echtes X11-Paar mit abweichenden Hälften fällt weiter in die
-    /// Linux-Tabelle — auch dann, wenn eine Hälfte auf `.exe` endet.
+    /// Die `.exe`-Regel greift nur bei der Platzhalterform `(exe, exe)`. Ein
+    /// Paar mit abweichenden Hälften fällt weiter in die Terminal-Tabelle —
+    /// auch dann, wenn eine Hälfte auf `.exe` endet.
     #[test]
     fn windows_rule_needs_both_halves_equal() {
         assert_eq!(
             auto_shortcut(Some(("gnome-terminal-server", "Gnome-terminal"))),
             ResolvedShortcut::CtrlShiftV
         );
-        // Ungleiche Hälften: die Windows-Regel greift nicht, die Linux-Tabelle
-        // kennt den Namen nicht → Default.
+        // Ungleiche Hälften: die `.exe`-Regel greift nicht, die
+        // Terminal-Tabelle kennt den Namen nicht → Default.
         assert_eq!(
             auto_shortcut(Some(("windowsterminal.exe", "Xed"))),
             ResolvedShortcut::CtrlV
@@ -584,7 +581,7 @@ mod tests {
 
     /// Ohne `.exe` bleibt alles wie vor Phase 5.
     #[test]
-    fn names_without_exe_suffix_use_the_x11_table() {
+    fn names_without_exe_suffix_use_the_terminal_table() {
         assert_eq!(
             auto_shortcut(Some(("kitty", "kitty"))),
             ResolvedShortcut::CtrlShiftV

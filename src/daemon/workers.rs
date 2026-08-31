@@ -48,7 +48,7 @@ pub enum Msg {
     /// §4.3-Menü „Config-Ordner öffnen" — kein Kern-Event.
     OpenConfigDir,
     /// §4.3-Menü „Hotkey ändern…" — kein Kern-Event, der Daemon öffnet den
-    /// Dialog (Windows) bzw. meldet, dass es ihn nicht gibt (Linux).
+    /// Dialog.
     ChangeHotkey,
     /// §9-Menüpunkt „Mit Windows starten" — kein Kern-Event, der Daemon legt
     /// den Autostart-Eintrag an bzw. entfernt ihn.
@@ -672,7 +672,7 @@ pub enum InjectCmd {
     Shutdown,
 }
 
-/// Die X11-Connection lebt hier — inklusive des bis zu 5 s langen
+/// Das Clipboard-Fenster lebt hier — inklusive des bis zu 5 s langen
 /// Restore-Wartens aus §7.1 P7. Genau deshalb ist der Paste ein eigener Thread:
 /// die Event-Loop bleibt reaktiv, `QuitRequested` greift jederzeit (codex H4).
 pub struct InjectWorker {
@@ -905,7 +905,7 @@ fn inject_loop(
                 // §7.1 P8: solange Diktier Owner ist, muss die Selection
                 // bedient werden — sonst hängt jedes fremde Paste.
                 if let Err(err) = sink.serve_for(Duration::from_millis(10)) {
-                    log.warn(format!("X11-Selection: {err}"));
+                    log.warn(format!("Clipboard-Bedienung: {err}"));
                 }
             }
         }
@@ -1111,8 +1111,8 @@ pub enum TrayCmd {
     Shutdown,
 }
 
-/// betrayer hält seinen D-Bus-Thread selbst; dieser Thread hält das Icon und
-/// hält damit `set_icon`/`set_menu` aus der Event-Loop heraus (§5).
+/// Dieser Thread hält das Icon samt seiner Nachrichtenschleife und hält damit
+/// `set_icon`/`set_menu` aus der Event-Loop heraus (§5).
 pub struct TrayWorker {
     tx: Sender<TrayCmd>,
     join: Option<JoinHandle<()>>,

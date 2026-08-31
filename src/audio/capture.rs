@@ -589,7 +589,7 @@ impl super::AudioSource for CpalAudioSource {
         self.recording = false;
         // Der Stream läuft weiter — nur die Annahme wird abgeschaltet. Würde
         // hier pausiert, suspendierte das Gerät und der nächste Aufnahmestart
-        // kostete wieder ~2 s (gemessen auf Mint 22, Owner-Entscheidung 3c).
+        // kostete wieder ~2 s (gemessen in Phase 3c, Owner-Entscheidung).
         self.gate.disarm();
         // codex H1: Erst wenn nachweislich kein Callback mehr im Ring steht,
         // darf gedraint werden. Kommt er nicht heraus, wird **nicht** gelesen —

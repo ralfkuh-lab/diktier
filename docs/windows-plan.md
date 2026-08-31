@@ -1,13 +1,14 @@
-# Phase 5 — Windows-Portierung (Plan, v2)
+# Phase 5 — Windows-Portierung (Plan, v3)
 
-Stand: 2026-08-27, v2 nach Sol-Review
-([reviews/plan-phase5-sol.md](reviews/plan-phase5-sol.md)). Ziel dieser
-Phase ist ein **Windows-Dev-Milestone**: Diktier läuft auf dem
-Entwicklungsrechner (Win 11, Jabra Evolve2 40) end-to-end. Das ist **kein
-Release** — die Release-Gates aus SPEC §11/§12 (Win10/Win11-Clean-VM,
-Pflicht-Editoren, Bundle im leeren Ordner) stehen als WP7 verbindlich vor
-jedem Release. Verbindlich bleibt [SPEC.md](SPEC.md) v1.3 mit den zwei
-Präzisierungen vom 2026-08-27 (§4.2 Tray-Menü-Ausnahme, §5.3 per-session).
+Stand: 2026-08-31, v3 (v2: 2026-08-27 nach Sol-Review,
+[reviews/plan-phase5-sol.md](reviews/plan-phase5-sol.md)). Ziel dieser
+Phase war ein **Windows-Dev-Milestone**: Diktier läuft auf dem
+Entwicklungsrechner (Win 11, Jabra Evolve2 40) end-to-end — **erreicht**
+(WP1–6 ✅). Die ursprünglich als Release-Voraussetzung geführten
+Clean-VM-Gates (WP7) sind am 2026-08-31 **verworfen** (privates
+Werkzeug, siehe WP7); erstes veröffentlichtes Release ist v0.2.0 mit dem
+Aufnahme-Overlay ([overlay-plan.md](overlay-plan.md)). Verbindlich ist
+[SPEC.md](SPEC.md) (aktuell v1.5).
 
 ## Ausgangslage (auf diesem Rechner verifiziert)
 
@@ -284,44 +285,47 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   Ctrl+C und Fenster-Schließen beenden sauber (Icon weg, Clipboard-Text
   bleibt lesbar); Logoff-Test einmal manuell.
 
-### 🔍 WP6 — Release-Skript und Doku (Release-Voraussetzung)
+### ✅ WP6 — Release-Skript und Doku
 
-- `scripts/release.ps1` analog `release.sh`: Build, Bundle
-  `diktier-<version>-win-x64.zip` mit `diktier.exe`, `lib\onnxruntime.dll`,
-  `LICENSES\`, `versions.toml` (App-Version, ORT 1.28.0 + SHA der DLL,
-  Lock-Hinweis). Inhaltsprüfung des Archivs im Skript.
-- Gate lokal: Archiv in leeren Ordner **mit Leerzeichen im Pfad** entpacken,
-  ORT-Umgebungsvariablen entfernt, Start + STT-Load.
-- README: Abschnitt „Installation (Windows)", Status-Zeile; `docs/SPIKES.md`:
-  Windows-Messwerte dieses Rechners.
+- `scripts/release.ps1` (Build, Bundle, Zip, Setup-Exe via
+  `installer\diktier.nsi`, `versions.toml`, Selbstprüfung) seit Phase 5
+  vorhanden; erstes veröffentlichtes Release ist
+  [v0.2.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.0)
+  (2026-08-31, mit Aufnahme-Overlay).
+- Gate am 2026-08-31 gefahren: 0.2.0-Zip in leeren Ordner **mit
+  Leerzeichen im Pfad** entpackt, `--version` und `--transcribe-wav`
+  (Modell-Load 2,2 s, Transkript korrekt, Exit 0).
+- README hat Installations-Abschnitt und Status-Zeile. Die ursprünglich
+  geplanten Windows-Messwerte in `docs/SPIKES.md` sind **gestrichen**
+  (kein Nutzen mehr; die relevanten Zahlen stehen in diesem Plan und in
+  den Release-Notes).
 
-### 🔍 WP7 — Release-Gates (SPEC §11/§12, vor jedem Release)
+### ❌ WP7 — Release-Gates (SPEC §11/§12) — verworfen
 
-- Win10 22H2 und Win11, jeweils saubere VM, leeres Verzeichnis, Bundle.
-- Inject-Matrix §12: Notepad, VS Code, Windows Terminal/PowerShell;
-  erhöhtes Notepad → kein Paste, kein Fokuswechsel, Text im Clipboard;
-  fremder Copy während des Read-Fensters; kein Read (UIPI) → Tooltip;
-  mehrzeiliger Unicode-Text exakt; Clipboard-History an/aus und ein
-  verbreiteter Clipboard-Manager.
-- Erst danach darf eine Windows-Version als Release gelten.
+Entscheidung Ralf 2026-08-31: Diktier bleibt ein privates Werkzeug für
+diesen Rechner; Clean-VM-Gates (Win10/Win11, Inject-Matrix §12) werden
+nicht gefahren. Releases (ab v0.2.0) gelten ohne dieses Gate — bewusst,
+nicht vergessen. Sollte das Tool je an Dritte verteilt werden, ist
+dieser Punkt neu zu bewerten.
 
 ## Plattform-Entscheidung 2026-08-27
 
-Windows ist ab jetzt die **Primärplattform** (Ralf). Linux wird nicht mehr
-berücksichtigt — kein Mint-Gate, kein Linux-`cargo check`, keine Linux-Pendants
-für neue Features; die Linux-Teile werden ggf. später entfernt. WP7-Gates
-gelten entsprechend nur noch für Win10/Win11.
+Windows ist die **einzige Plattform** (Ralf). Linux wird nicht mehr
+berücksichtigt — kein Mint-Gate, kein Linux-`cargo check`, keine
+Linux-Pendants. **Nachtrag 2026-08-31: Der Linux-Code (X11-Hotkey,
+betrayer-Tray, Pulse/ALSA-Pfade, FileLock, Unix-Signale, Shell-Skripte)
+ist vollständig entfernt.**
 
 ## Nicht in dieser Phase (bewusst, kein Feinschliff-Etikett)
 
-- Mikrofon-Pegel/Gerätewahl (RMS lag im Test bei 0,0007; Schwelle 0,0075 —
-  vermutlich Mute/Pegel am Jabra, nicht Code).
+- Gerätewahl-UI (der Mikrofon-**Pegel** ist seit dem Aufnahme-Overlay
+  sichtbar, [overlay-plan.md](overlay-plan.md) — das damalige
+  Jabra-Rätsel „RMS 0,0007" war tatsächlich Mute am Headset).
 - `output.mode = "type"`, Notifications, Icon-Design, `.lnk`-Autostart.
-- 🔍 **Modifier-only-Hotkey** (z. B. `Ctrl+Win` wie bei Wispr Flow, Wunsch
-  Ralf 2026-08-27): heute verlangt die Config einen `key`; ein reiner
-  Modifier-Chord braucht ein eigenes Hook-Zustandsmodell (Halten beginnt beim
-  zweiten Down, endet beim ersten Up, Einzeltasten müssen durchgehen) auf
-  beiden Plattformen. Folgepaket nach dem Dev-Milestone.
+- ❌ **Modifier-only-Hotkey** (z. B. `Ctrl+Win` wie bei Wispr Flow,
+  Wunsch Ralf 2026-08-27) — **verworfen 2026-08-31**: `RCtrl` als
+  Einzeltaste (seit 82a9155) deckt den Bedarf; das eigene
+  Hook-Zustandsmodell lohnt nicht mehr.
 - ✅ **Aufnahme-Indikator** (Wunsch Ralf 2026-08-27): Tray-Icons lassen sich
   unter Win11 nicht programmatisch sichtbar erzwingen (einmal manuell
   anheften, pfadgebunden). Umgesetzt als randloses Layered-Window-Overlay
@@ -329,11 +333,14 @@ gelten entsprechend nur noch für Win10/Win11.
   plus `WM_NCHITTEST → HTTRANSPARENT`) mit Mikrofonpegel, sichtbar von
   `recording` bis `idle`, kein Fokuswechsel — SPEC §4.2/§4.5-konform. Plan und
   Verträge: [overlay-plan.md](overlay-plan.md).
-- 🔍 Sol-Gesamtreview offen: `CTRL_CLOSE_EVENT` ohne Cleanup-Ack (nur
-  `--foreground`-Konsole), `WM_ENDSESSION` nur über Poll-Queue, Tray-Retry
-  nach fehlgeschlagenem `NIM_ADD`, Pfad-Kanonisierung Download-Mutex.
-- 🔍 Watchdog gegen still entfernten LL-Hook (`LowLevelHooksTimeout`), Sol-
-  Blocker 5 zu Paket A; Restrisiko akzeptiert.
+- ❌ Sol-Gesamtreview-Restpunkte — **geschlossen 2026-08-31 als
+  akzeptiertes Restrisiko** (privates Werkzeug, keiner der Punkte hat
+  sich im Alltag gemeldet): `CTRL_CLOSE_EVENT` ohne Cleanup-Ack (nur
+  `--foreground`-Konsole), `WM_ENDSESSION` nur über Poll-Queue,
+  Tray-Retry nach fehlgeschlagenem `NIM_ADD`, Pfad-Kanonisierung
+  Download-Mutex.
+- ❌ Watchdog gegen still entfernten LL-Hook (`LowLevelHooksTimeout`) —
+  Restrisiko akzeptiert (unverändert seit Paket A).
 
 ## Umsetzung
 

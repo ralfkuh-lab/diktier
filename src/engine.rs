@@ -221,7 +221,7 @@ fn artifacts_err(err: DownloadError) -> EngineError {
 ///
 /// Suchreihenfolge (absolute Pfade):
 /// 1. `lib/<name>` neben der Binary (Bundle-Layout, Spec §11)
-/// 2. `../lib/<name>` (Unix-Prefix `bin/`+`lib/`; Cargo-Test: `deps/` → `../lib`)
+/// 2. `../lib/<name>` (Cargo-Test: `deps/` → `../lib`)
 pub fn resolve_ort_lib() -> Result<PathBuf, EngineError> {
     let exe = std::env::current_exe()
         .map_err(|e| EngineError::Ort(format!("current_exe() fehlgeschlagen: {e}")))?;
@@ -243,25 +243,14 @@ pub(crate) fn resolve_ort_lib_from_exe_dir(exe_dir: &Path) -> Result<PathBuf, En
         }
     }
     Err(EngineError::Ort(format!(
-        "ONNX-Runtime-Library {name} nicht gefunden (gesucht: {} und {}; scripts/fetch-ort.sh)",
+        "ONNX-Runtime-Library {name} nicht gefunden (gesucht: {} und {}; scripts/fetch-ort.ps1)",
         candidates[0].display(),
         candidates[1].display()
     )))
 }
 
 pub(crate) fn ort_lib_filename() -> &'static str {
-    #[cfg(windows)]
-    {
-        "onnxruntime.dll"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "libonnxruntime.so"
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        compile_error!("diktier unterstützt nur Linux und Windows");
-    }
+    "onnxruntime.dll"
 }
 
 fn abspath(path: &Path) -> PathBuf {
@@ -482,7 +471,7 @@ mod tests {
             }
         }
         if let Err(err) = resolve_ort_lib() {
-            panic!("ORT-Library fehlt: {err}\nHinweis: scripts/fetch-ort.sh");
+            panic!("ORT-Library fehlt: {err}\nHinweis: scripts/fetch-ort.ps1");
         }
         let (dir, manifest) = model_artifacts(DEFAULT_MODEL).unwrap_or_else(|e| {
             panic!("Modellpfad/Manifest: {e}");

@@ -9,8 +9,8 @@ Modell-Download, Autostart, Aufnahme-Overlay mit Mikrofonpegel).
 Aktuelle Version: [v0.2.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.0).
 Privates Werkzeug, bewusst klein gehalten.
 
-Linux (Mint/X11) war die Ausgangsplattform und ist im Code noch enthalten,
-wird aber nicht mehr weiterentwickelt.
+Linux (Mint/X11) war die Ausgangsplattform; der Linux-Code ist inzwischen
+vollständig entfernt — Diktier ist Windows-only.
 
 ## Voraussetzungen
 
