@@ -47,10 +47,10 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, HTTRANSPARENT, MSG, PM_REMOVE,
-    PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETWORKAREA, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCCREATE,
+    GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST, MSG,
+    PM_REMOVE, PeekMessageW, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN, SPI_SETWORKAREA, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SetWindowLongPtrW, SetWindowPos, ShowWindow, ULW_ALPHA,
+    UnregisterClassW, UpdateLayeredWindow, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_NCCREATE,
     WM_NCDESTROY, WM_NCHITTEST, WM_SETTINGCHANGE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -623,22 +623,26 @@ impl OverlayWindow {
     /// prozessweiten Awareness (hier unaware → immer 96), und ein fremdes
     /// Vordergrundfenster liefert seine eigene.
     ///
-    /// `SWP_NOACTIVATE` ist Pflicht (§4.2), `SWP_NOZORDER` lässt das
-    /// Topmost-Band unberührt.
+    /// `SWP_NOACTIVATE` ist Pflicht (§4.2). `HWND_TOPMOST` behauptet bei
+    /// jedem Einblenden das Topmost-Band neu: Windows kann ein Fenster aus
+    /// dem Band nehmen und dabei `WS_EX_TOPMOST` stehen lassen (beobachtet
+    /// 2026-09-07 nach Stunden Laufzeit — Karte lag unter dem maximierten
+    /// Zielfenster, Log meldete „sichtbar"). Der Ex-Stil aus
+    /// `CreateWindowExW` allein reicht dagegen nicht.
     fn probe_dpi_in(&self, work: Rect) -> Result<u32, OverlayError> {
         let x = work.left + work.width().max(1) / 2;
         let y = work.top + work.height().max(1) / 2;
-        // SAFETY: eigenes Fenster dieses Threads; `NULL` als
-        // `hWndInsertAfter` ist mit `SWP_NOZORDER` bedeutungslos.
+        // SAFETY: eigenes Fenster dieses Threads; `HWND_TOPMOST` ist ein
+        // dokumentierter Pseudo-Handle für `hWndInsertAfter`.
         let moved = unsafe {
             SetWindowPos(
                 self.hwnd,
-                ptr::null_mut(),
+                HWND_TOPMOST,
                 x,
                 y,
                 PROBE_SIZE,
                 PROBE_SIZE,
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE,
             )
         };
         if moved == 0 {

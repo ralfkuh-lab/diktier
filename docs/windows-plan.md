@@ -291,7 +291,9 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   `installer\diktier.nsi`, `versions.toml`, Selbstprüfung) seit Phase 5
   vorhanden; erstes veröffentlichtes Release ist
   [v0.2.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.0)
-  (2026-08-31, mit Aufnahme-Overlay).
+  (2026-08-31, mit Aufnahme-Overlay); 0.2.1 (2026-09-07) behebt das
+  nach hinten gerutschte Overlay (Topmost-Band neu behauptet, siehe
+  Nachtrag in [overlay-plan.md](overlay-plan.md)).
 - Gate am 2026-08-31 gefahren: 0.2.0-Zip in leeren Ordner **mit
   Leerzeichen im Pfad** entpackt, `--version` und `--transcribe-wav`
   (Modell-Load 2,2 s, Transkript korrekt, Exit 0).

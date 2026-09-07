@@ -1,6 +1,7 @@
 # Aufnahme-Overlay mit Mikrofonpegel (Plan, v3)
 
-Stand: 2026-08-31, v3. v2 nach Plan-Review
+Stand: 2026-08-31, v3; Nachtrag 2026-09-07 (Topmost-Fix, 0.2.1) am Ende.
+v2 nach Plan-Review
 ([reviews/plan-overlay-sol.md](reviews/plan-overlay-sol.md) — Blocker 1
 und alle Majors eingearbeitet, Minors 10–14 übernommen); v3 nach
 Implementierungs-Review
@@ -351,3 +352,37 @@ SPEC §4.2/§4.5/§5.2 + Sol-Review). Zweit-Review durch Sol
 `docs/reviews/impl-overlay-sol.md`; Orchestrator fährt die
 Abnahme-Gates auf diesem Rechner selbst nach. Commit nach grünen
 Gates; kein Push ohne Freigabe.
+
+## ✅ Nachtrag 2026-09-07 — Topmost-Band bei jedem Einblenden neu behaupten (0.2.1)
+
+**Befund.** Nach einigen Stunden Laufzeit des installierten 0.2.0 war
+die Karte beim Diktieren nicht mehr zu sehen, obwohl das Log bei jedem
+Lauf „Overlay sichtbar" mit plausibler Position meldete. Live-Inspektion
+des Fensters während einer Aufnahme: `WS_VISIBLE` gesetzt,
+`UpdateLayeredWindow` erfolgreich, `WS_EX_TOPMOST` **gesetzt** — aber in
+der Z-Reihenfolge lag das Fenster **unter** allen normalen
+Anwendungsfenstern (maximiertes Windows Terminal, Notepad++, Chrome),
+ein Screenshot des Bereichs zeigte nur das Zielfenster. Ein frisch
+erzeugtes Fenster (`--overlay-test`) lag dagegen oben. Windows hatte das
+Fenster also aus dem Topmost-Band genommen und das Style-Bit stehen
+lassen. Auslöser nicht sicher bestimmt; zwischen Daemon-Start und erstem
+Diktat lagen mehrere Sperren/Entsperren, außerdem sind Vollbild-Fenster
+(Teams, Browser-Video) als Auslöser für „Topmost rutscht nach hinten"
+bekannt.
+
+**Ursache im Code.** Topmost kam nur einmal aus dem Ex-Stil in
+`CreateWindowExW`; `show()` behauptete die Bandposition nie neu, der
+DPI-Probe-Aufruf nutzte ausdrücklich `SWP_NOZORDER`.
+
+**Fix (`src/overlay/windows.rs`, `probe_dpi_in`).** Der ohnehin bei
+jedem Einblenden laufende `SetWindowPos`-Aufruf übergibt jetzt
+`HWND_TOPMOST` als `hWndInsertAfter` statt `SWP_NOZORDER`.
+`SWP_NOACTIVATE` bleibt, §4.2 unberührt (kein Fokus, keine Aktivierung).
+Gates: `cargo fmt`, `cargo clippy --all-targets`, `cargo test`
+(351 grün). Release 0.2.1.
+
+**Diagnose-Rezept**, falls es wieder auftritt: Während einer Aufnahme
+per `EnumWindows`/`GW_HWNDPREV` prüfen, welche sichtbaren Fenster in der
+Z-Kette **über** `DiktierOverlay` stehen und dessen Rechteck schneiden;
+liegt dort ein nicht-topmost Anwendungsfenster, ist es dieser Fall.
+Workaround ohne Neubau: Daemon neu starten (Fenster wird frisch erzeugt).

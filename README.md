@@ -6,7 +6,7 @@ Parakeet (TDT 0.6B v3), kein Cloud-Dienst, kein Konto.
 
 Status: **läuft auf Windows 11** (Hotkey, Tray, Einfügen am Cursor,
 Modell-Download, Autostart, Aufnahme-Overlay mit Mikrofonpegel).
-Aktuelle Version: [v0.2.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.0).
+Aktuelle Version: [v0.2.1](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.1).
 Privates Werkzeug, bewusst klein gehalten.
 
 Linux (Mint/X11) war die Ausgangsplattform; der Linux-Code ist inzwischen
@@ -177,6 +177,10 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
   Taste) — das Overlay zeigt es sofort: flache Linie trotz Sprechens.
   Genauer nachmessen: mit `--foreground` zeigt das Log `rms=…`; Werte
   unter 0,0075 gelten als Stille.
+- **Overlay ist weg, obwohl das Log „Overlay sichtbar" meldet.** Windows
+  hat das Fenster aus dem Topmost-Band genommen, es liegt unter dem
+  Zielfenster. Seit 0.2.1 behauptet Diktier die Position bei jedem
+  Einblenden neu; bei älteren Versionen hilft ein Neustart von Diktier.
 - **Hotkey geht nicht.** Tray zeigt `error`, Tooltip nennt den Grund. Andere
   Taste eintragen, neu starten. Linksklick im Tray geht immer.
 - **„läuft bereits".** Es läuft schon eine Instanz (Autostart). Der zweite
