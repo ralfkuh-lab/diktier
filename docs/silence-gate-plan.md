@@ -1,6 +1,9 @@
 # Relativer Silence-Gate (Plan, v2)
 
-Stand: 2026-09-21, v2 nach Plan-Review durch Astra
+Stand: 2026-09-21, v2 nach Plan-Review durch Astra; WP1–WP4 umgesetzt am
+selben Tag (Bericht [reviews/impl-silence-gate-notes.md](reviews/impl-silence-gate-notes.md),
+Auftrag [reviews/impl-silence-gate-prompt.md](reviews/impl-silence-gate-prompt.md)),
+WP0 offen — er entscheidet über Freigabe und Release. v2 nach Plan-Review durch Astra
 ([reviews/plan-silence-gate-astra.md](reviews/plan-silence-gate-astra.md),
 Auftrag [reviews/plan-silence-gate-prompt.md](reviews/plan-silence-gate-prompt.md)):
 alle vier Blocker (B1–B4) und die Hinweise W1–W5 eingearbeitet, K1–K3
@@ -260,7 +263,7 @@ bleibt unverändert (W5). Kippt ein Negativfall (Engine liefert Text),
 zuerst Marge +15 dB oder Lauf 2,0 s aus der Analyse-Tabelle bewerten,
 dann Positivfälle **alle** erneut prüfen (B4).
 
-### 🔍 WP1 — Synthetische Fixtures
+### ✅ WP1 — Synthetische Fixtures
 
 - `testdata/stt/attenuate.py` (eigenes Skript, K3; `normalize.py` bleibt
   Text/WER): liest 16-bit-WAV, multipliziert mit `10^(−dB/20)`, rundet
@@ -275,7 +278,7 @@ dann Positivfälle **alle** erneut prüfen (B4).
   echte Aufnahmen; WER-Definition an §12/§18 angleichen (+0,05-Puffer
   nennen, K3). `testdata/stt/local/` in `.gitignore`.
 
-### 🔍 WP2 — Gate umbauen (`src/engine.rs`)
+### ✅ WP2 — Gate umbauen (`src/engine.rs`)
 
 - Konstanten wie in der Tabelle; Rustdoc mit der normativen Definition
   und den Messwerten aus diesem Plan.
@@ -317,7 +320,7 @@ dann Positivfälle **alle** erneut prüfen (B4).
   Engine-Aufruf nicht stattfand (Wrapper-Transcriber mit Zähler um
   `ParakeetTranscriber`).
 
-### 🔍 WP3 — Aufrufer, CLI, Doku-Zeilen
+### ✅ WP3 — Aufrufer, CLI, Doku-Zeilen
 
 - `src/daemon/workers.rs::engine_loop`: ein Gate-Aufruf über
   `transcribe_pcm`, Report-Zeile für jede Aufnahme (W4), keine
@@ -329,7 +332,7 @@ dann Positivfälle **alle** erneut prüfen (B4).
 - README-Troubleshooting („Nichts wird erkannt“, 0.2.2-Eintrag) auf den
   relativen Gate umformulieren; Hinweis auf `--gate-analyze`.
 
-### 🔍 WP4 — Spec-Nachtrag (SPEC v1.6) — **vor** WP1–3
+### ✅ WP4 — Spec-Nachtrag (SPEC v1.6) — **vor** WP1–3
 
 - Kopfzeile „Spec v1.4“ → „Spec v1.6“, Versionshistorie um v1.6
   ergänzen (K3: v1.5 fehlt bislang im Titel).

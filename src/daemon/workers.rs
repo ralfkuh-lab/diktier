@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::audio::{AudioSource, CpalAudioSource, LevelTap};
 use crate::config::{AudioConfig, OutputConfig};
 use crate::download::{self, ArtifactManifest, DownloadError, HttpTransport, Progress};
-use crate::engine::{ParakeetTranscriber, silence_gate, transcribe_pcm};
+use crate::engine::{ParakeetTranscriber, transcribe_pcm};
 use crate::hotkey::{HotkeyBackend, HotkeyEvent, HotkeySpec, new_backend};
 use crate::inject::{
     self, CaptureContext, ClipboardSave, CopyOnlyReason, InjectOutcome, OutputSink, WindowId,
@@ -265,13 +265,14 @@ fn engine_loop(rx: Receiver<EngineCmd>, out: Sender<Msg>, model: &str, threads: 
                     }));
                     continue;
                 };
-                // Gate-Grund ins Log (§10: nur Messwerte), damit ein leeres
-                // Transkript erklärbar ist — z. B. Mikrofon zu leise.
-                if let Some(gate) = silence_gate(&samples) {
-                    log.info(format!("Silence-Gate: {gate} — Engine nicht aufgerufen"));
-                }
                 let t0 = Instant::now();
-                match transcribe_pcm(engine, &samples) {
+                let (report, result) = transcribe_pcm(engine, &samples);
+                // §6.4: der Gate-Report jeder Aufnahme ins Log — auch bei
+                // Annahme und auch, wenn die Inferenz danach scheitert; er ist
+                // die Datenbasis für die Nachkalibrierung (§10: nur Messwerte,
+                // kein Audio, kein Text).
+                log.run(run, format!("Gate: {report}"));
+                match result {
                     Ok(result) => {
                         // §10: keine Transkripte ins Log — nur Länge und Zeit.
                         log.info(format!(

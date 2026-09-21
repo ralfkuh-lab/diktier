@@ -173,17 +173,27 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
 
 - **Text erscheint nicht, liegt aber in der Zwischenablage.** Fokus hat
   gewechselt, oder das Zielprogramm läuft als Administrator. Strg+V drücken.
-- **Nichts wird erkannt.** Pegel zu leise oder Mikrofon gemutet (Headset-
-  Taste) — das Overlay zeigt es sofort: flache Linie trotz Sprechens.
-  Genauer nachmessen: mit `--foreground` zeigt das Log `rms=…`; Werte
-  unter 0,0075 gelten als Stille.
+- **Nichts wird erkannt.** Mikrofon gemutet (Headset-Taste) oder das
+  falsche Gerät aktiv — das Overlay zeigt es sofort: flache Linie trotz
+  Sprechens. Genauer nachmessen: Das Log schreibt zu **jeder** Aufnahme
+  eine Zeile `Lauf N: Gate: …` mit Entscheidung und Messwerten.
 - **Overlay zeigt Pegel, aber es wird nichts eingefügt, auch im
-  Editor nicht.** Meist greift der Silence-Gate: Das Mikrofon liefert zu
-  leise, die Aufnahme bleibt unter der RMS-Schwelle, die Engine wird gar
-  nicht aufgerufen. Seit 0.2.2 steht der Grund mit Messwerten im Log
-  (`Silence-Gate: … RMS 0.0037 < Schwelle 0.0075 …`) direkt vor
-  „Transkript leer“. Eingangspegel des Mikrofons in den Windows-
-  Soundeinstellungen prüfen.
+  Editor nicht.** Dann hat der Silence-Gate die Aufnahme verworfen und die
+  Engine gar nicht erst aufgerufen. Die Gate-Zeile im Log nennt die Regel:
+  `Regel A` = kürzer als 250 ms, `Regel C` = Pegel unter der absoluten
+  Untergrenze (Mikrofon praktisch stumm), `Regel D` = kein
+  zusammenhängender Sprachabschnitt von 1,5 s, der 12 dB über dem
+  Grundrauschen der Aufnahme liegt. Der Gate misst **relativ** zum
+  Grundrauschen der Aufnahme — ein durchweg leises Mikrofon allein führt
+  also nicht mehr zu „leer“. Bleibt es bei `Regel D`, hilft meist: deutlicher
+  sprechen, eine kurze Pause vor dem Diktat lassen (der Gate braucht ein
+  Rauschfenster als Bezug) und den Eingangspegel in den Windows-
+  Soundeinstellungen anheben.
+- **Gate nachrechnen.** `diktier.exe --gate-analyze <datei.wav> …` wertet
+  fertige 16-kHz-Mono-WAVs ohne Modell aus: Report je Datei plus die
+  Laufdauern bei +10/+12/+15 dB Marge. Aufnahmen zum Nachrechnen liefert
+  `--foreground --record-test 10` (Text auf stdout, Gate-Report auf
+  stderr) oder der Daemon mit `DIKTIER_DEBUG_WAV=1`.
 - **Overlay ist weg, obwohl das Log „Overlay sichtbar" meldet.** Windows
   hat das Fenster aus dem Topmost-Band genommen, es liegt unter dem
   Zielfenster. Seit 0.2.1 behauptet Diktier die Position bei jedem

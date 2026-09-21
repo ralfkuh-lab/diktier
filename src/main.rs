@@ -70,6 +70,16 @@ struct Cli {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     runs: u32,
 
+    /// Silence-Gate je WAV auswerten, mit Alternativen für Marge und Laufdauer
+    /// (§6.4, kein Modell nötig).
+    #[arg(
+        long,
+        value_name = "DATEI",
+        num_args = 1..,
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "inject_test", "hotkey_test", "record_test", "tray_test"]
+    )]
+    gate_analyze: Vec<PathBuf>,
+
     /// SPIKE: nach 3s den kompletten Inject-Pfad ausführen (nur mit --foreground).
     #[arg(
         long,
@@ -225,6 +235,9 @@ where
     if let Some(path) = cli.transcribe_wav {
         return transcribe_wav(&path, cli.runs);
     }
+    if !cli.gate_analyze.is_empty() {
+        return gate_analyze(&cli.gate_analyze);
+    }
     if cli.inject_test.is_some() && !cli.foreground {
         eprintln!("diktier: --inject-test nur mit --foreground (SPIKE)");
         return 2;
@@ -325,12 +338,12 @@ fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
         }
     };
 
-    let rms = engine::rms_f32(&pcm);
-    eprintln!("SPIKE rms={rms:.6}");
-    if engine::is_silence_or_short(&pcm) {
-        if pcm.len() < engine::MIN_SAMPLES_16KHZ {
-            eprintln!("Aufnahme < 250 ms, Engine nicht aufgerufen.");
-        }
+    // §6.4: der Gate-Report gehört auf stderr, der Text bleibt auf stdout.
+    // Hier (und nicht erst aus `transcribe_pcm`), damit eine abgelehnte
+    // Aufnahme das Modell gar nicht erst lädt.
+    let report = engine::silence_gate(&pcm);
+    eprintln!("Gate: {report}");
+    if report.is_rejected() {
         println!();
         return 0;
     }
@@ -351,7 +364,8 @@ fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
         load_start.elapsed().as_secs_f64()
     );
 
-    if let Err(err) = transcribe_pcm(&mut transcriber, &pcm) {
+    // Warmup, ungezählt.
+    if let (_, Err(err)) = transcribe_pcm(&mut transcriber, &pcm) {
         eprintln!("{err}");
         return 1;
     }
@@ -359,7 +373,8 @@ fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
     let mut last = engine::Transcription::empty();
     for _ in 0..runs {
         let infer_start = Instant::now();
-        match transcribe_pcm(&mut transcriber, &pcm) {
+        // Der Report ist derselbe wie oben — der Gate ist deterministisch.
+        match transcribe_pcm(&mut transcriber, &pcm).1 {
             Ok(result) => last = result,
             Err(err) => {
                 eprintln!("{err}");
@@ -370,6 +385,64 @@ fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
     }
     println!("{}", last.text);
     0
+}
+
+/// Silence-Gate-Werkzeug (§6.4, silence-gate-plan WP0): je WAV den Report plus
+/// die Läufe bei alternativen Margen und Laufdauern — damit sich die Konstanten
+/// ohne Rebuild bewerten lassen. Kein Modell, kein Capture.
+fn gate_analyze(paths: &[PathBuf]) -> u8 {
+    const MARGINS_DB: [f32; 3] = [10.0, engine::RELATIVE_MARGIN_DB, 15.0];
+    const RUN_SECS: [f32; 3] = [1.0, engine::MIN_SPEECH_RUN_REL_SECS, 2.0];
+
+    let mut code = 0_u8;
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("{}", path.display());
+        let pcm = match audio::read_wav_16k_mono(path) {
+            Ok(pcm) => pcm,
+            Err(err) => {
+                eprintln!("{err}");
+                code = code.max(match err {
+                    AudioError::Format(_) => 2,
+                    AudioError::Io(_) | AudioError::Failed(_) => 1,
+                });
+                continue;
+            }
+        };
+        let report = engine::silence_gate(&pcm);
+        println!("  {report}");
+        let Some(floor) = report.metrics.and_then(|m| m.floor) else {
+            println!("  (kein volles Fenster — Regel A entscheidet)");
+            continue;
+        };
+
+        let windows = engine::window_rms(&pcm);
+        println!(
+            "  Marge   Schwelle  Lauf      {}",
+            RUN_SECS
+                .iter()
+                .map(|s| format!("≥{s:.1} s"))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+        for db in MARGINS_DB {
+            let threshold = (floor * engine::db_to_ratio(db)).max(engine::MIN_ACTIVE_RMS);
+            let run = engine::longest_run_samples(&windows, threshold, engine::ABS_FLOOR) as f32
+                / 16_000.0;
+            let verdicts = RUN_SECS
+                .iter()
+                .map(|&needed| format!("{:<6}", if run >= needed { "ja" } else { "nein" }))
+                .collect::<Vec<_>>()
+                .join("  ");
+            println!(
+                "  +{db:>2.0} dB  {threshold:.5}   {run:>5.2} s   {}",
+                verdicts.trim_end()
+            );
+        }
+    }
+    code
 }
 
 fn inject_test(text: &str) -> u8 {
@@ -592,12 +665,10 @@ fn record_test(secs: u32) -> u8 {
         );
     }
 
-    let rms = engine::rms_f32(&captured.samples);
-    eprintln!("SPIKE rms={rms:.6}");
-    if engine::is_silence_or_short(&captured.samples) {
-        if captured.samples.len() < engine::MIN_SAMPLES_16KHZ {
-            eprintln!("Aufnahme < 250 ms, Engine nicht aufgerufen.");
-        }
+    // §6.4 / Gate 4 des Silence-Gate-Plans: Report auf stderr, Text auf stdout.
+    let report = engine::silence_gate(&captured.samples);
+    eprintln!("Gate: {report}");
+    if report.is_rejected() {
         println!();
         return 0;
     }
@@ -618,7 +689,7 @@ fn record_test(secs: u32) -> u8 {
         load_start.elapsed().as_secs_f64()
     );
     let infer_start = Instant::now();
-    let result = match transcribe_pcm(&mut transcriber, &captured.samples) {
+    let result = match transcribe_pcm(&mut transcriber, &captured.samples).1 {
         Ok(r) => r,
         Err(err) => {
             eprintln!("{err}");
@@ -983,6 +1054,57 @@ mod tests {
             ]),
             2
         );
+    }
+
+    #[test]
+    fn gate_analyze_without_file_exits_2() {
+        assert_eq!(cli_main(["diktier", "--gate-analyze"]), 2);
+    }
+
+    #[test]
+    fn gate_analyze_conflicts_with_transcribe_wav() {
+        assert_eq!(
+            cli_main([
+                "diktier",
+                "--gate-analyze",
+                "a.wav",
+                "--transcribe-wav",
+                "b.wav"
+            ]),
+            2
+        );
+    }
+
+    #[test]
+    fn gate_analyze_missing_file_exits_1() {
+        assert_eq!(
+            cli_main(["diktier", "--gate-analyze", "/no/such/diktier-missing.wav"]),
+            1
+        );
+    }
+
+    /// §6.4-Werkzeug: mehrere Dateien in einem Lauf, ohne Modell. Die
+    /// 5-s-Rampe reicht für volle Fenster und einen floor.
+    #[test]
+    fn gate_analyze_reads_wavs_without_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ton.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for i in 0..16_000 * 5 {
+            let loud = (16_000 * 2..16_000 * 4).contains(&i);
+            writer
+                .write_sample(if loud { 2_000_i16 } else { 30_i16 })
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        let arg = path.to_str().expect("utf-8 path");
+        assert_eq!(cli_main(["diktier", "--gate-analyze", arg, arg]), 0);
     }
 
     #[test]
