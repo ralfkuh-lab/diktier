@@ -231,7 +231,18 @@ Reihenfolge: WP4 (Spec) → WP1–WP3 (Code, ein Opus-Paket) parallel zu
 WP0 (Aufnahmen durch Ralf) → Kalibrierung/Abnahme → Release.
 WP0 blockiert nicht den Code, aber die **Freigabe** (B4, W5).
 
-### 🔍 WP0 — Kalibrierungsmatrix (Ralf + Analyse-CLI)
+### ✅ WP0 — Kalibrierungsmatrix (Ralf + Analyse-CLI)
+
+**Ergebnis 2026-09-21:** neun Aufnahmen mit der Jabra (Laptop-Mikro
+ausgelassen), Tabelle und Befunde in `docs/SPIKES.md` („Kalibrierung
+relativer Silence-Gate“). Alle Erwartungen der Matrix erfüllt: leise
+Sprache mit Pause → D mit 4 s Lauf und WER wie das Original; Tippen,
+Atmen, Stille → leer; Stuhl/Kabel → B1 (wie heute) mit leerer Engine;
+pausenloses leises Diktat und Einzelwort → leer (Grenze F1). Konstanten
+unverändert. Offen als 🤔: Kandidat „B3: Lauf ≥ 2,0 s über 0,004“ für den
+pausenlosen Fall (Trennung 1,0 s gegen 4,0 s in den Daten), siehe SPIKES.
+
+Ursprüngliche Matrix:
 
 Analyse-CLI (Teil von WP3): `diktier --gate-analyze <wav>…` gibt je
 Datei den `GateReport` als Tabelle auf stdout aus, plus Fensteranzahl

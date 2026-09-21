@@ -184,3 +184,52 @@ cwd ok. Idempotenz von release.sh belegt, shellcheck sauber.
 **Linux-Stand komplett: Phasen 0–4 bestanden.** Offen: Windows-Etappe
 (Pflichtmatrix Win10/11, fetch-ort.ps1-Verifikation, Named Mutex,
 Windows-Autostart, release.ps1).
+
+## Kalibrierung relativer Silence-Gate (Windows, 2026-09-21)
+
+Anlass und Plan: `docs/silence-gate-plan.md` (v2), SPEC v1.6 §6.4.
+Werkzeug: `diktier --gate-analyze` (Release-Build aus `f0563c1`), Aufnahmen
+über den laufenden Daemon 0.2.1 mit `DIKTIER_DEBUG_WAV=1` (Jabra Evolve2 40,
+48 kHz → 16 kHz, Büro-Laptop), Dateien lokal unter `testdata/stt/local/`
+(gitignored, nicht im Repo). „Alt“ = Gate 0.2.1/0.2.2 (absolut), „Neu“ =
+Regeln A/B1/B2/C/D. Laptop-Mikrofon nicht aufgenommen (Owner: „ohne 10“).
+
+| # | Aufnahme | Pegel | Dauer | RMS | max. Fenster | floor | Alt | Neu | Engine |
+|---|---|---|---|---|---|---|---|---|---|
+| 00 | normales Diktat (18 s) | 44 % | 18,4 s | 0,01334 | 0,02799 | 0,00011 | Engine | B1 | Text ok |
+| 01 | Tippen, kein Wort | 44 % | 8,7 s | 0,00039 | 0,00077 | 0,00017 | leer | D leer | — |
+| 02 | Atmen ins Mikro | 44 % | 5,8 s | 0,00153 | 0,00314 | 0,00019 | leer | D leer (Lauf 0,75 s) | — |
+| 03 | Stuhl rollen, Kabel reiben | 44 % | 11,5 s | 0,00792 | 0,04567 | 0,00007 | Engine | B1 | **leer** (0,70 s, keine Halluzination) |
+| 04 | stiller Raum | 44 % | 14,4 s | 0,00005 | 0,00029 | 0,00002 | leer | C leer | — |
+| 05 | Referenzsatz, normal gesprochen | **20 %** | 8,0 s | 0,00697 | 0,01120 | 0,00082 | **leer** | **D** (Lauf 4,25 s) | WER 0,0476 (= Original) |
+| 06 | 3 s Stille, dann Referenzsatz | 20 % | 10,9 s | 0,00497 | 0,01244 | 0,00002 | **leer** | **D** (Lauf 4,00 s) | WER 0,0476 |
+| 07 | Referenzsatz sofort, pausenlos | 20 % | 7,1 s | 0,00675 | 0,00967 | 0,00295 | leer | **D leer** (Schwelle 0,0117 > max) | mit 3 s Null-Vorlauf: WER 0,0476 |
+| 08 | ein Wort („Schreibtisch“) | 20 % | 1,9 s | 0,00616 | 0,01099 | 0,00002 | leer | D leer (Lauf 1,00 s) | — |
+| 09 | Referenzsatz, Gegenprobe | 44 % | 7,9 s | 0,01050 | 0,01838 | 0,00072 | Engine | B1 | WER 0,0476 |
+
+Befunde:
+
+- **Der Bug ist reproduziert und behoben:** 05 und 06 sind der Fall vom
+  Morgen — alter Gate leer, neuer Gate Regel D, Engine wortgleich zur
+  Referenz in voller Lautstärke. Reserve: Lauf 4,0–4,25 s gegen 1,5 s
+  gefordert; bei allen Margen +10/+12/+15 dB identisch.
+- **Negativfälle sicher:** Tippen und Stille kommen nicht über die
+  Aktivitätsgrenze (Jabra-DSP liefert in Pausen nahezu Null → Regel C
+  greift knapp, max. Fenster 0,00029 < 0,0003), Atmen erreicht 0,75 s,
+  die Hälfte der geforderten Laufdauer. Stuhl/Kabel ist lauter als die
+  alte Schwelle (B1, wie heute) — die Engine liefert darauf leer.
+- **Bekannte Grenze bestätigt (Plan F1):** 07 (pausenlos, sofort) und 08
+  (Einzelwort) bleiben leer. Bei 07 ist das Grundrauschen der Aufnahme die
+  leise Sprache selbst; bei 08 ist der Lauf mit 1,0 s gleich lang wie der
+  Klick in `rauschen.wav` und die Stuhlgeräusche.
+- **Kandidat für 07 — zusätzlicher absoluter Pfad „B3: Lauf ≥ 2,0 s über
+  0,004“** (−48 dBFS), längste Läufe über 0,004 je Datei: 07 4,50 s, 05
+  4,25 s, 06 4,00 s, 00 2,50 s · Stuhl/Kabel 1,00 s, `rauschen.wav` 1,00 s,
+  Atmen 0,00 s, Tippen/Stille 0,00 s, `alltag_-16db` 1,00 s (D deckt),
+  `alltag_-22db` 0,25 s (D deckt). Trennung 1,0 s gegen 4,0 s. Nicht
+  umgesetzt — Owner-Entscheidung offen (Spec-Änderung §6.4 → v1.7).
+- **Hinweis zur Phase-1-Zeile oben:** für `fachwoerter.wav` liefern
+  `normalize.py` und die Rust-Portierung auf dem heutigen Transkript WER
+  0,1000 („Rust Demon“, „ONX Modell“ = 2/20), nicht 0,0500. Der historische
+  Eintrag bleibt stehen; der Smoke-Test vergleicht relativ zur unabgesenkten
+  Datei und ist davon unberührt.
