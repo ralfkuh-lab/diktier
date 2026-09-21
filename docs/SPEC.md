@@ -1,4 +1,4 @@
-# Diktier — Spec v1.6
+# Diktier — Spec v1.7
 
 Stand: 2026-09-21. Verbindlich für die Implementierung. Änderungen nur über
 diesen Text.
@@ -19,6 +19,11 @@ definiert (bisherige absolute Regeln bleiben als Ja-Pfade erhalten, neu
 Regel D relativ zum Grundrauschen), Log-Vertrag pro Aufnahme, §12 und
 §18 #12 verknüpft. Plan `docs/silence-gate-plan.md`, Review
 `docs/reviews/plan-silence-gate-astra.md`.
+v1.7 (2026-09-21, Ralf): Regel **B3** im Silence-Gate (§6.4) — absoluter
+Lauf ≥ 2,0 s über 0,004 — nach der Kalibrierung mit echten Aufnahmen
+(`docs/SPIKES.md`, „Kalibrierung relativer Silence-Gate“): pausenloses
+leises Diktat ohne Rauschfenster wird sonst verworfen, obwohl die Engine
+es fehlerfrei erkennt. §18 #13.
 
 ## 1. Ziel
 
@@ -391,7 +396,7 @@ unten; für n ≤ 10 das Minimum). Nicht-endliche Samples → Ablehnung
 `InvalidInput`, keine Bereinigung im Gate.
 
 Konstanten: `RMS_SILENCE_THRESHOLD = 0,0075`, `MIN_SPEECH_RUN_ABS_SECS =
-2,0`, `ABS_FLOOR = 0,0003`, `RELATIVE_MARGIN_DB = 12`, `MIN_ACTIVE_RMS =
+2,0`, `QUIET_SPEECH_RMS = 0,004` (v1.7), `ABS_FLOOR = 0,0003`, `RELATIVE_MARGIN_DB = 12`, `MIN_ACTIVE_RMS =
 0,0010`, `MIN_SPEECH_RUN_REL_SECS = 1,5`. Kalibrierung und Messbelege in
 `docs/SPIKES.md` (2026-08 absolut, 2026-09 relativ) und
 `docs/silence-gate-plan.md`.
@@ -402,6 +407,11 @@ Regeln, die erste zutreffende entscheidet:
 - **B1** Gesamt-RMS ≥ 0,0075 → Engine.
 - **B2** zusammenhängender Lauf von Fenstern mit RMS ≥ 0,0075 über
   ≥ 2,0 s → Engine.
+- **B3** (v1.7) zusammenhängender Lauf von Fenstern mit RMS ≥
+  `QUIET_SPEECH_RMS` (0,004, −48 dBFS) über ≥ 2,0 s → Engine. Deckt
+  leises Sprechen ohne Pause, bei dem D keinen Kontrast findet.
+  Kalibrierung: leise Sprache 4,0–4,5 s Lauf, Störgeräusche (Stuhl,
+  Kabel, Klick, Atmen) ≤ 1,0 s.
 - **C** Maximum der Fenster-RMS < `ABS_FLOOR` → leer
   (`BelowAbsoluteFloor`). Pegelgrenze, kein Gerätebefund; die
   Geräte-Recovery aus §10 ist davon unabhängig.
@@ -410,10 +420,13 @@ Regeln, die erste zutreffende entscheidet:
   und unterbrechen einen Lauf. Längster aktiver Lauf ≥ 1,5 s → Engine,
   sonst leer (`NoRelativeRun`).
 
-Bekannte Grenzen (bewusst, kein Fehler): leise Diktate ohne 1,5 s
-zusammenhängenden Kontrast (Ein-Wort-Diktate, pausenloses Sprechen ohne
-Rauschfenster) und Signale unter `MIN_ACTIVE_RMS` bzw. `ABS_FLOOR`
-werden weiterhin verworfen, sofern nicht B1/B2 greifen.
+Bekannte Grenzen (bewusst, kein Fehler): leise Ein-Wort-Diktate (Lauf
+~1,0 s, nicht von einem Klick unterscheidbar), pausenloses Sprechen
+unter 0,004 ohne Rauschfenster und Signale unter `MIN_ACTIVE_RMS` bzw.
+`ABS_FLOOR` werden weiterhin verworfen, sofern nicht B1/B2/B3 greifen.
+Ein gleichmäßiges Geräusch zwischen 0,004 und 0,0075 über ≥ 2 s erreicht
+seit v1.7 die Engine; der Schutz ist dort die Engine selbst (liefert auf
+Nicht-Sprache leer, SPIKES 2026-09-21).
 
 Log-Vertrag: pro Aufnahme genau eine Zeile mit dem Gate-Report
 (Entscheidung und Regel, Sample- und Fensterzahl, RMS, floor, Maximum,
@@ -834,3 +847,4 @@ Kein Code-Import.
 | 10 | Linux-Build | Verbindlich Mint-22-Basis (Claude N3). |
 | 11 | WER-Puffer (Phase-1-Beleg) | +0,05 wiederhergestellt (Owner, 2026-08-26): byte-gleiche Artefakte, aber verschiedene Mel-Frontends (Voxtype Kaldi-fbank, parakeet-rs NeMo-Style); 4/5 Dateien wortidentisch, „Werstadt“-Fall in `docs/SPIKES.md`. |
 | 12 | Relativer Silence-Gate (v1.6) | Bisherige Ja-Pfade (B1/B2) bleiben, Regel D relativ zum Grundrauschen kommt hinzu; Engine ist pegelrobust (`alltag.wav` −22 dB wortidentisch, 2026-09-21); Grenzen in §6.4; Windows-Mikrofonpegel wird nicht angefasst (Ralf, 2026-09-21). |
+| 13 | Regel B3 (v1.7) | Absoluter Lauf ≥ 2,0 s über 0,004 zusätzlich zu B1/B2/D — pausenloses leises Diktat (WP0-Aufnahme 07: 4,5 s) gegen Störgeräusche (≤ 1,0 s); akzeptiertes Restrisiko: gleichmäßiges Geräusch 0,004–0,0075 über 2 s geht an die Engine (Ralf, 2026-09-21). |

@@ -239,8 +239,9 @@ relativer Silence-Gate“). Alle Erwartungen der Matrix erfüllt: leise
 Sprache mit Pause → D mit 4 s Lauf und WER wie das Original; Tippen,
 Atmen, Stille → leer; Stuhl/Kabel → B1 (wie heute) mit leerer Engine;
 pausenloses leises Diktat und Einzelwort → leer (Grenze F1). Konstanten
-unverändert. Offen als 🤔: Kandidat „B3: Lauf ≥ 2,0 s über 0,004“ für den
-pausenlosen Fall (Trennung 1,0 s gegen 4,0 s in den Daten), siehe SPIKES.
+unverändert. **Entscheidung Ralf 2026-09-21:** Regel B3 („Lauf ≥ 2,0 s
+über `QUIET_SPEECH_RMS` = 0,004“) wird aufgenommen (SPEC v1.7, §18 #13),
+Release 0.3.0 mit Installation.
 
 Ursprüngliche Matrix:
 
