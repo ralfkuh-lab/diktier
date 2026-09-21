@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use crate::audio::{AudioSource, CpalAudioSource, LevelTap};
 use crate::config::{AudioConfig, OutputConfig};
 use crate::download::{self, ArtifactManifest, DownloadError, HttpTransport, Progress};
-use crate::engine::{ParakeetTranscriber, transcribe_pcm};
+use crate::engine::{ParakeetTranscriber, silence_gate, transcribe_pcm};
 use crate::hotkey::{HotkeyBackend, HotkeyEvent, HotkeySpec, new_backend};
 use crate::inject::{
     self, CaptureContext, ClipboardSave, CopyOnlyReason, InjectOutcome, OutputSink, WindowId,
@@ -265,6 +265,11 @@ fn engine_loop(rx: Receiver<EngineCmd>, out: Sender<Msg>, model: &str, threads: 
                     }));
                     continue;
                 };
+                // Gate-Grund ins Log (§10: nur Messwerte), damit ein leeres
+                // Transkript erklärbar ist — z. B. Mikrofon zu leise.
+                if let Some(gate) = silence_gate(&samples) {
+                    log.info(format!("Silence-Gate: {gate} — Engine nicht aufgerufen"));
+                }
                 let t0 = Instant::now();
                 match transcribe_pcm(engine, &samples) {
                     Ok(result) => {

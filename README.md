@@ -6,7 +6,7 @@ Parakeet (TDT 0.6B v3), kein Cloud-Dienst, kein Konto.
 
 Status: **läuft auf Windows 11** (Hotkey, Tray, Einfügen am Cursor,
 Modell-Download, Autostart, Aufnahme-Overlay mit Mikrofonpegel).
-Aktuelle Version: [v0.2.1](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.1).
+Aktuelle Version: [v0.2.2](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.2).
 Privates Werkzeug, bewusst klein gehalten.
 
 Linux (Mint/X11) war die Ausgangsplattform; der Linux-Code ist inzwischen
@@ -177,6 +177,13 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
   Taste) — das Overlay zeigt es sofort: flache Linie trotz Sprechens.
   Genauer nachmessen: mit `--foreground` zeigt das Log `rms=…`; Werte
   unter 0,0075 gelten als Stille.
+- **Overlay zeigt Pegel, aber es wird nichts eingefügt, auch im
+  Editor nicht.** Meist greift der Silence-Gate: Das Mikrofon liefert zu
+  leise, die Aufnahme bleibt unter der RMS-Schwelle, die Engine wird gar
+  nicht aufgerufen. Seit 0.2.2 steht der Grund mit Messwerten im Log
+  (`Silence-Gate: … RMS 0.0037 < Schwelle 0.0075 …`) direkt vor
+  „Transkript leer“. Eingangspegel des Mikrofons in den Windows-
+  Soundeinstellungen prüfen.
 - **Overlay ist weg, obwohl das Log „Overlay sichtbar" meldet.** Windows
   hat das Fenster aus dem Topmost-Band genommen, es liegt unter dem
   Zielfenster. Seit 0.2.1 behauptet Diktier die Position bei jedem

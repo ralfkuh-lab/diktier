@@ -293,7 +293,9 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   [v0.2.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.0)
   (2026-08-31, mit Aufnahme-Overlay); 0.2.1 (2026-09-07) behebt das
   nach hinten gerutschte Overlay (Topmost-Band neu behauptet, siehe
-  Nachtrag in [overlay-plan.md](overlay-plan.md)).
+  Nachtrag in [overlay-plan.md](overlay-plan.md)); 0.2.2 (2026-09-21)
+  loggt den Silence-Gate-Grund mit RMS-Messwerten, nachdem leise
+  Aufnahmen kommentarlos als „Transkript leer“ endeten.
 - Gate am 2026-08-31 gefahren: 0.2.0-Zip in leeren Ordner **mit
   Leerzeichen im Pfad** entpackt, `--version` und `--transcribe-wav`
   (Modell-Load 2,2 s, Transkript korrekt, Exit 0).

@@ -1,6 +1,7 @@
 //! Transcriber-Vertrag (Spec §5.1) und Parakeet-TDT-Engine (Phase 1).
 #![allow(dead_code)]
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -62,24 +63,88 @@ pub fn max_window_rms(pcm_f32_16khz: &[f32]) -> f32 {
     max
 }
 
-/// Zu kurz oder unter der RMS-Schwelle — Engine nicht laden/aufrufen.
+/// Warum der Silence-Gate die Engine nicht aufgerufen hat — mit den
+/// Messwerten, damit ein leeres Transkript im Log erklärbar ist (§10: nur
+/// Zahlen, kein Audio, kein Text).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SilenceGate {
+    /// Kürzer als 250 ms.
+    TooShort { samples: usize },
+    /// Kein 250-ms-Fenster erreicht die Schwelle.
+    BelowThreshold { rms: f32, max_window_rms: f32 },
+    /// Gesamt-RMS unter der Schwelle und kein Lauf ≥ 2 s über der Schwelle.
+    NoLoudRun {
+        rms: f32,
+        max_window_rms: f32,
+        longest_loud_run_secs: f32,
+    },
+}
+
+impl fmt::Display for SilenceGate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooShort { samples } => {
+                write!(f, "zu kurz ({:.3} s < 0.250 s)", *samples as f32 / 16_000.0)
+            }
+            Self::BelowThreshold {
+                rms,
+                max_window_rms,
+            } => write!(
+                f,
+                "unter Schwelle (RMS {rms:.4}, max. 250-ms-Fenster {max_window_rms:.4}, Schwelle {RMS_SILENCE_THRESHOLD:.4})"
+            ),
+            Self::NoLoudRun {
+                rms,
+                max_window_rms,
+                longest_loud_run_secs,
+            } => write!(
+                f,
+                "kein Sprachlauf ≥ 2 s (RMS {rms:.4} < Schwelle {RMS_SILENCE_THRESHOLD:.4}, max. 250-ms-Fenster {max_window_rms:.4}, längster Lauf {longest_loud_run_secs:.2} s)"
+            ),
+        }
+    }
+}
+
+/// Silence-Gate (Spec §6.4 / §12) mit Begründung.
 ///
 /// Primär: `max(RMS über 250-ms-Fenster) < 0.0075` → leer (agy B3 / codex N1).
 /// Wenn der Gesamtpuffer unter der Schwelle bleibt, einzelne laute Fenster
 /// aber drüber sind (Klick in `rauschen.wav` vs. 2 s leise Sprache in langer
 /// Stille): nur Durchläufe von mindestens 2 s über der Schwelle gelten als
 /// Sprache — sonst WAV-Regression (`rauschen.wav`) würde kippen.
-pub fn is_silence_or_short(pcm_f32_16khz: &[f32]) -> bool {
+///
+/// `None` = Sprache, Engine aufrufen.
+pub fn silence_gate(pcm_f32_16khz: &[f32]) -> Option<SilenceGate> {
     if pcm_f32_16khz.len() < MIN_SAMPLES_16KHZ {
-        return true;
+        return Some(SilenceGate::TooShort {
+            samples: pcm_f32_16khz.len(),
+        });
     }
-    if max_window_rms(pcm_f32_16khz) < RMS_SILENCE_THRESHOLD {
-        return true;
+    let rms = rms_f32(pcm_f32_16khz);
+    let max_window_rms = max_window_rms(pcm_f32_16khz);
+    if max_window_rms < RMS_SILENCE_THRESHOLD {
+        return Some(SilenceGate::BelowThreshold {
+            rms,
+            max_window_rms,
+        });
     }
-    if rms_f32(pcm_f32_16khz) >= RMS_SILENCE_THRESHOLD {
-        return false;
+    if rms >= RMS_SILENCE_THRESHOLD {
+        return None;
     }
-    longest_loud_run_secs(pcm_f32_16khz) < 2.0
+    let longest_loud_run_secs = longest_loud_run_secs(pcm_f32_16khz);
+    if longest_loud_run_secs < 2.0 {
+        return Some(SilenceGate::NoLoudRun {
+            rms,
+            max_window_rms,
+            longest_loud_run_secs,
+        });
+    }
+    None
+}
+
+/// Zu kurz oder unter der RMS-Schwelle — Engine nicht laden/aufrufen.
+pub fn is_silence_or_short(pcm_f32_16khz: &[f32]) -> bool {
+    silence_gate(pcm_f32_16khz).is_some()
 }
 
 fn longest_loud_run_secs(pcm: &[f32]) -> f32 {
@@ -409,6 +474,38 @@ mod tests {
         let mut stub = CountingStub { calls: 0 };
         transcribe_pcm(&mut stub, &pcm).unwrap();
         assert_eq!(stub.calls, 1);
+    }
+
+    #[test]
+    fn silence_gate_names_the_reason() {
+        assert!(matches!(
+            silence_gate(&[0.5_f32; 100]),
+            Some(SilenceGate::TooShort { samples: 100 })
+        ));
+        assert!(matches!(
+            silence_gate(&vec![0.001_f32; 16_000 * 2]),
+            Some(SilenceGate::BelowThreshold { .. })
+        ));
+        // 4 s leise plus 0,5 s über der Schwelle: lautes Fenster da, aber kein 2-s-Lauf.
+        let mut pcm = vec![0.001_f32; 16_000 * 4];
+        pcm.extend(std::iter::repeat_n(0.02_f32, 8_000));
+        let gate = silence_gate(&pcm).expect("Gate greift");
+        match gate {
+            SilenceGate::NoLoudRun {
+                rms,
+                max_window_rms,
+                longest_loud_run_secs,
+            } => {
+                assert!(rms < RMS_SILENCE_THRESHOLD);
+                assert!(max_window_rms >= RMS_SILENCE_THRESHOLD);
+                assert!((0.4..=0.6).contains(&longest_loud_run_secs));
+            }
+            other => panic!("unerwartet: {other:?}"),
+        }
+        let text = gate.to_string();
+        assert!(text.contains("RMS"), "{text}");
+        assert!(text.contains("längster Lauf"), "{text}");
+        assert!(silence_gate(&vec![0.02_f32; 16_000 * 2]).is_none());
     }
 
     #[test]
