@@ -6,7 +6,7 @@ Parakeet (TDT 0.6B v3), kein Cloud-Dienst, kein Konto.
 
 Status: **läuft auf Windows 11** (Hotkey, Tray, Einfügen am Cursor,
 Modell-Download, Autostart, Aufnahme-Overlay mit Mikrofonpegel).
-Aktuelle Version: [v0.2.2](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.2.2).
+Aktuelle Version: [v0.3.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.3.0).
 Privates Werkzeug, bewusst klein gehalten.
 
 Linux (Mint/X11) war die Ausgangsplattform; der Linux-Code ist inzwischen
@@ -183,15 +183,17 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
   `Regel A` = kürzer als 250 ms, `Regel C` = Pegel unter der absoluten
   Untergrenze (Mikrofon praktisch stumm), `Regel D` = kein
   zusammenhängender Sprachabschnitt von 1,5 s, der 12 dB über dem
-  Grundrauschen der Aufnahme liegt. Der Gate misst **relativ** zum
-  Grundrauschen der Aufnahme — ein durchweg leises Mikrofon allein führt
-  also nicht mehr zu „leer“. Bleibt es bei `Regel D`, hilft meist: deutlicher
-  sprechen, eine kurze Pause vor dem Diktat lassen (der Gate braucht ein
-  Rauschfenster als Bezug) und den Eingangspegel in den Windows-
-  Soundeinstellungen anheben.
+  Grundrauschen der Aufnahme liegt. **Seit 0.3.0** misst der Gate
+  **relativ** zum Grundrauschen der Aufnahme — ein durchweg leises Mikrofon
+  allein führt also nicht mehr zu „leer“ —, und `Regel B3` lässt zusätzlich
+  leises Sprechen ohne Pause durch (2 s am Stück über 0,004), bei dem es
+  kein Rauschfenster als Bezug gibt. Bleibt es bei `Regel D`, hilft meist:
+  deutlicher sprechen, eine kurze Pause vor dem Diktat lassen und den
+  Eingangspegel in den Windows-Soundeinstellungen anheben.
 - **Gate nachrechnen.** `diktier.exe --gate-analyze <datei.wav> …` wertet
-  fertige 16-kHz-Mono-WAVs ohne Modell aus: Report je Datei plus die
-  Laufdauern bei +10/+12/+15 dB Marge. Aufnahmen zum Nachrechnen liefert
+  fertige 16-kHz-Mono-WAVs ohne Modell aus: Report je Datei, die Laufdauern
+  über den absoluten Schwellen von B3 und B2 sowie die Laufdauern bei
+  +10/+12/+15 dB Marge. Aufnahmen zum Nachrechnen liefert
   `--foreground --record-test 10` (Text auf stdout, Gate-Report auf
   stderr) oder der Daemon mit `DIKTIER_DEBUG_WAV=1`.
 - **Overlay ist weg, obwohl das Log „Overlay sichtbar" meldet.** Windows

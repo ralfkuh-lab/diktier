@@ -296,6 +296,10 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   Nachtrag in [overlay-plan.md](overlay-plan.md)); 0.2.2 (2026-09-21)
   loggt den Silence-Gate-Grund mit RMS-Messwerten, nachdem leise
   Aufnahmen kommentarlos als „Transkript leer“ endeten.
+  0.3.0 (2026-09-21) macht den Silence-Gate relativ zum Grundrauschen
+  (SPEC §6.4, Regel D) und ergänzt Regel B3 für leises Sprechen ohne
+  Pause — die Kalibrierung mit echten Jabra-Aufnahmen steht in
+  [SPIKES.md](SPIKES.md).
 - Gate am 2026-08-31 gefahren: 0.2.0-Zip in leeren Ordner **mit
   Leerzeichen im Pfad** entpackt, `--version` und `--transcribe-wav`
   (Modell-Load 2,2 s, Transkript korrekt, Exit 0).

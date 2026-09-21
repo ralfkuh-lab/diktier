@@ -413,12 +413,25 @@ fn gate_analyze(paths: &[PathBuf]) -> u8 {
         };
         let report = engine::silence_gate(&pcm);
         println!("  {report}");
+
+        // Absolute Pfade B3/B2 ohne Rebuild bewertbar (§6.4, v1.7).
+        let windows = engine::window_rms(&pcm);
+        let abs_run = |threshold: f32| {
+            engine::longest_run_samples(&windows, threshold, engine::ABS_FLOOR) as f32 / 16_000.0
+        };
+        println!(
+            "  absolut {:.4} / {:.4}: Lauf {:.2} s / {:.2} s (B3/B2 ab {:.1} s)",
+            engine::QUIET_SPEECH_RMS,
+            engine::RMS_SILENCE_THRESHOLD,
+            abs_run(engine::QUIET_SPEECH_RMS),
+            abs_run(engine::RMS_SILENCE_THRESHOLD),
+            engine::MIN_SPEECH_RUN_ABS_SECS
+        );
+
         let Some(floor) = report.metrics.and_then(|m| m.floor) else {
             println!("  (kein volles Fenster — Regel A entscheidet)");
             continue;
         };
-
-        let windows = engine::window_rms(&pcm);
         println!(
             "  Marge   Schwelle  Lauf      {}",
             RUN_SECS

@@ -27,6 +27,14 @@ pub const RMS_SILENCE_THRESHOLD: f32 = 0.0075;
 /// Regel B2: Mindestdauer eines Laufs über [`RMS_SILENCE_THRESHOLD`].
 pub const MIN_SPEECH_RUN_ABS_SECS: f32 = 2.0;
 
+/// Regel B3 (v1.7): „leise, aber sicher Sprache“ — 0,004 ≈ −48 dBFS.
+///
+/// Kalibrierung 2026-09-21 (docs/SPIKES.md): leise Diktate halten über dieser
+/// Grenze 4,0–4,5 s durch, Störgeräusche (Stuhl, Kabel, Klick, Atmen)
+/// höchstens 1,0 s. Die Laufdauer ist dieselbe wie bei B2
+/// ([`MIN_SPEECH_RUN_ABS_SECS`]).
+pub const QUIET_SPEECH_RMS: f32 = 0.004;
+
 /// Regel C/D: absolute Untergrenze, −70,5 dBFS ≈ 9,8 LSB bei 16 bit.
 /// Fenster darunter sind nie aktiv und unterbrechen einen Lauf.
 pub const ABS_FLOOR: f32 = 0.0003;
@@ -191,6 +199,8 @@ pub enum SpeechRule {
     B1,
     /// B2: absoluter Lauf ≥ [`MIN_SPEECH_RUN_ABS_SECS`].
     B2,
+    /// B3: Lauf ≥ [`MIN_SPEECH_RUN_ABS_SECS`] über [`QUIET_SPEECH_RMS`].
+    B3,
     /// D: relativer Lauf ≥ [`MIN_SPEECH_RUN_REL_SECS`] über dem Grundrauschen.
     D,
 }
@@ -201,6 +211,9 @@ impl SpeechRule {
             Self::B1 => format!("Regel B1: Gesamt-RMS ≥ {RMS_SILENCE_THRESHOLD:.5}"),
             Self::B2 => format!(
                 "Regel B2: Lauf ≥ {MIN_SPEECH_RUN_ABS_SECS:.2} s über {RMS_SILENCE_THRESHOLD:.5}"
+            ),
+            Self::B3 => format!(
+                "Regel B3: Lauf ≥ {MIN_SPEECH_RUN_ABS_SECS:.2} s über {QUIET_SPEECH_RMS:.5}"
             ),
             Self::D => format!("Regel D: Lauf ≥ {MIN_SPEECH_RUN_REL_SECS:.2} s über Schwelle D"),
         }
@@ -250,6 +263,8 @@ pub struct GateMetrics {
     pub threshold_d: Option<f32>,
     /// Längster Lauf über [`RMS_SILENCE_THRESHOLD`] (Regel B2).
     pub longest_abs_run_secs: f32,
+    /// Längster Lauf über [`QUIET_SPEECH_RMS`] (Regel B3).
+    pub longest_quiet_run_secs: f32,
     /// Längster Lauf über [`GateMetrics::threshold_d`] (Regel D).
     pub longest_rel_run_secs: f32,
 }
@@ -300,8 +315,8 @@ impl fmt::Display for GateReport {
         }
         write!(
             f,
-            ", Lauf abs {:.2} s, Lauf rel {:.2} s",
-            m.longest_abs_run_secs, m.longest_rel_run_secs
+            ", Lauf abs {:.2} s, Lauf {QUIET_SPEECH_RMS:.3} {:.2} s, Lauf rel {:.2} s",
+            m.longest_abs_run_secs, m.longest_quiet_run_secs, m.longest_rel_run_secs
         )
     }
 }
@@ -326,6 +341,9 @@ impl fmt::Display for GateReport {
 /// - **B1** Gesamt-RMS ≥ [`RMS_SILENCE_THRESHOLD`] → Engine.
 /// - **B2** Lauf von Fenstern ≥ [`RMS_SILENCE_THRESHOLD`] über
 ///   [`MIN_SPEECH_RUN_ABS_SECS`] → Engine.
+/// - **B3** Lauf von Fenstern ≥ [`QUIET_SPEECH_RMS`] über
+///   [`MIN_SPEECH_RUN_ABS_SECS`] → Engine (v1.7; leises Sprechen ohne Pause,
+///   bei dem D keinen Kontrast findet).
 /// - **C** max. Fenster-RMS < [`ABS_FLOOR`] → leer
 ///   ([`SilenceGate::BelowAbsoluteFloor`]). Pegelgrenze, kein Gerätebefund.
 /// - **D** `thr = max(floor · 10^(12/20), MIN_ACTIVE_RMS)`; Fenster ≥ `thr`
@@ -341,7 +359,10 @@ impl fmt::Display for GateReport {
 /// Der Gate ist Halluzinationsschutz gegen Stille und Rauschen ohne Sprache,
 /// **keine** Sprachklassifikation. Bekannte Grenzen (Spec §6.4): leise Diktate
 /// ohne 1,5 s zusammenhängenden Kontrast und Signale unter [`MIN_ACTIVE_RMS`]
-/// bzw. [`ABS_FLOOR`] bleiben verworfen, sofern nicht B1/B2 greifen.
+/// bzw. [`ABS_FLOOR`] bleiben verworfen, sofern nicht B1/B2/B3 greifen. Ein
+/// gleichmäßiges Geräusch zwischen [`QUIET_SPEECH_RMS`] und
+/// [`RMS_SILENCE_THRESHOLD`] über ≥ 2 s erreicht seit v1.7 die Engine; der
+/// Schutz ist dort die Engine selbst (SPEC §18 #13).
 ///
 /// Messwerte sind vollständig — auch bei Annahme —, damit sich die Konstanten
 /// aus dem Betriebslog nachkalibrieren lassen (Astra W4).
@@ -371,6 +392,11 @@ pub fn silence_gate(pcm_f32_16khz: &[f32]) -> GateReport {
             RMS_SILENCE_THRESHOLD,
             ABS_FLOOR,
         )),
+        longest_quiet_run_secs: samples_to_secs(longest_run_samples(
+            &windows,
+            QUIET_SPEECH_RMS,
+            ABS_FLOOR,
+        )),
         longest_rel_run_secs: threshold_d.map_or(0.0, |thr| {
             samples_to_secs(longest_run_samples(&windows, thr, ABS_FLOOR))
         }),
@@ -384,7 +410,7 @@ pub fn silence_gate(pcm_f32_16khz: &[f32]) -> GateReport {
     }
 }
 
-/// Regeln A–D in dieser Reihenfolge — die erste zutreffende entscheidet.
+/// Regeln A, B1, B2, B3, C, D in dieser Reihenfolge — die erste zutreffende entscheidet.
 fn decide(samples: usize, m: &GateMetrics) -> GateDecision {
     if samples < MIN_SAMPLES_16KHZ {
         return GateDecision::Rejected(SilenceGate::TooShort);
@@ -394,6 +420,9 @@ fn decide(samples: usize, m: &GateMetrics) -> GateDecision {
     }
     if m.longest_abs_run_secs >= MIN_SPEECH_RUN_ABS_SECS {
         return GateDecision::Speech(SpeechRule::B2);
+    }
+    if m.longest_quiet_run_secs >= MIN_SPEECH_RUN_ABS_SECS {
+        return GateDecision::Speech(SpeechRule::B3);
     }
     if m.max_window_rms < ABS_FLOOR {
         return GateDecision::Rejected(SilenceGate::BelowAbsoluteFloor);
@@ -804,6 +833,83 @@ mod tests {
         let pcm = seq(&[(0.003, secs(8.0)), (0.010, secs(1.75))]);
         let m = metrics(&pcm);
         assert!((m.longest_abs_run_secs - 1.75).abs() < 1e-6, "{m:?}");
+        // Der Lauf liegt auch über QUIET_SPEECH_RMS, bleibt aber unter den
+        // 2,0 s, die B3 fordert — B3 rettet dieses Signal nicht (v1.7).
+        assert!((m.longest_quiet_run_secs - 1.75).abs() < 1e-6, "{m:?}");
+        expect_rejected(&pcm, SilenceGate::NoRelativeRun);
+    }
+
+    // ------------------------------------------------------------ Regel B3
+
+    /// Nachbau von „Aufnahme 07“ (docs/SPIKES.md, 2026-09-21): leise Sprache
+    /// ohne Pause — das Grundrauschen ist die Sprache selbst, D findet keinen
+    /// Kontrast, B3 gibt frei.
+    #[test]
+    fn rule_b3_admits_quiet_speech_without_a_pause() {
+        let pcm = seq(&[(0.003, secs(1.5)), (0.0055, secs(4.0)), (0.003, secs(1.5))]);
+        let m = metrics(&pcm);
+        assert!(m.rms < RMS_SILENCE_THRESHOLD, "{m:?}");
+        assert_eq!(m.longest_abs_run_secs, 0.0, "B2 darf nicht greifen: {m:?}");
+        assert!((m.longest_quiet_run_secs - 4.0).abs() < 1e-6, "{m:?}");
+        assert!(
+            m.threshold_d.unwrap() > m.max_window_rms,
+            "D findet keinen Kontrast: {m:?}"
+        );
+        assert_eq!(m.longest_rel_run_secs, 0.0, "{m:?}");
+        expect_speech(&pcm, SpeechRule::B3);
+    }
+
+    #[test]
+    fn rule_b3_needs_two_full_seconds() {
+        // 1,75 s über 0,004 in Stille: B3 greift nicht, dann entscheidet D.
+        let pcm = seq(&[(0.0, secs(10.0)), (0.0055, secs(1.75))]);
+        let m = metrics(&pcm);
+        assert!((m.longest_quiet_run_secs - 1.75).abs() < 1e-6, "{m:?}");
+        assert!((m.longest_rel_run_secs - 1.75).abs() < 1e-6, "{m:?}");
+        expect_speech(&pcm, SpeechRule::D);
+
+        // Dasselbe ohne Kontrast (floor = Sprache) bleibt leer.
+        let flat = seq(&[(0.003, secs(10.0)), (0.0055, secs(1.75))]);
+        let m = metrics(&flat);
+        assert!((m.longest_quiet_run_secs - 1.75).abs() < 1e-6, "{m:?}");
+        expect_rejected(&flat, SilenceGate::NoRelativeRun);
+    }
+
+    #[test]
+    fn rule_b3_run_is_exact_at_32000_samples() {
+        let quiet = (0.003, secs(10.0));
+        let short = seq(&[quiet, (0.0055, 31_999)]);
+        let exact = seq(&[quiet, (0.0055, 32_000)]);
+        let m = metrics(&short);
+        assert!(
+            (m.longest_quiet_run_secs - 31_999.0 / 16_000.0).abs() < 1e-6,
+            "{m:?}"
+        );
+        expect_rejected(&short, SilenceGate::NoRelativeRun);
+        let m = metrics(&exact);
+        assert!((m.longest_quiet_run_secs - 2.0).abs() < 1e-6, "{m:?}");
+        expect_speech(&exact, SpeechRule::B3);
+    }
+
+    #[test]
+    fn rule_b3_does_not_shadow_b2() {
+        // 8 s @ 0,003 + 2 s @ 0,010: der Lauf erfüllt B2 **und** B3 — die
+        // Reihenfolge entscheidet für B2.
+        let pcm = seq(&[(0.003, secs(8.0)), (0.010, secs(2.0))]);
+        let m = metrics(&pcm);
+        assert!((m.longest_quiet_run_secs - 2.0).abs() < 1e-6, "{m:?}");
+        expect_speech(&pcm, SpeechRule::B2);
+    }
+
+    #[test]
+    fn rule_b3_ignores_a_one_second_disturbance() {
+        // Nachbau Stuhl/Kabel bzw. Klick (SPIKES: Lauf ≤ 1,0 s): laut, aber
+        // zu kurz — und der Rest ist digitale Null.
+        let pcm = seq(&[(0.0, secs(15.0)), (0.03, secs(1.0)), (0.0, secs(6.0))]);
+        let m = metrics(&pcm);
+        assert!(m.rms < RMS_SILENCE_THRESHOLD, "{m:?}");
+        assert!((m.longest_quiet_run_secs - 1.0).abs() < 1e-6, "{m:?}");
+        assert!((m.longest_abs_run_secs - 1.0).abs() < 1e-6, "{m:?}");
         expect_rejected(&pcm, SilenceGate::NoRelativeRun);
     }
 
@@ -862,11 +968,19 @@ mod tests {
 
     #[test]
     fn rule_d_admits_quiet_speech_after_silence() {
-        let pcm = seq(&[(0.0, secs(10.0)), (0.004, secs(3.0))]);
+        // Unter QUIET_SPEECH_RMS, damit D entscheidet und nicht B3 (v1.7).
+        let pcm = seq(&[(0.0, secs(10.0)), (0.0035, secs(3.0))]);
         let m = metrics(&pcm);
         assert!(m.rms < RMS_SILENCE_THRESHOLD, "{m:?}");
+        assert_eq!(m.longest_quiet_run_secs, 0.0, "{m:?}");
         assert!((m.longest_rel_run_secs - 3.0).abs() < 1e-6, "{m:?}");
         expect_speech(&pcm, SpeechRule::D);
+
+        // Derselbe Fall über 0,004 wird seit v1.7 schon von B3 abgefangen.
+        expect_speech(
+            &seq(&[(0.0, secs(10.0)), (0.004, secs(3.0))]),
+            SpeechRule::B3,
+        );
     }
 
     #[test]
@@ -889,7 +1003,7 @@ mod tests {
         assert!((m.longest_rel_run_secs - 1.0).abs() < 1e-6, "{m:?}");
         expect_rejected(&two_clicks, SilenceGate::NoRelativeRun);
 
-        let speech = seq(&[(lsb, secs(10.0)), (0.004, secs(3.0))]);
+        let speech = seq(&[(lsb, secs(10.0)), (0.0035, secs(3.0))]);
         expect_speech(&speech, SpeechRule::D);
     }
 
@@ -1044,12 +1158,13 @@ mod tests {
     #[test]
     fn display_carries_every_measurement() {
         let cases = [
-            level(0.1, MIN_SAMPLES_16KHZ - 1),              // A
-            level(0.02, secs(3.0)),                         // B1
-            seq(&[(0.003, secs(8.0)), (0.010, secs(2.0))]), // B2
-            level(0.0, secs(5.0)),                          // C
-            level(0.001, secs(5.0)),                        // D leer
-            seq(&[(0.0, secs(10.0)), (0.004, secs(3.0))]),  // D Engine
+            level(0.1, MIN_SAMPLES_16KHZ - 1),               // A
+            level(0.02, secs(3.0)),                          // B1
+            seq(&[(0.003, secs(8.0)), (0.010, secs(2.0))]),  // B2
+            level(0.0, secs(5.0)),                           // C
+            level(0.001, secs(5.0)),                         // D leer
+            seq(&[(0.0, secs(10.0)), (0.0035, secs(3.0))]),  // D Engine
+            seq(&[(0.003, secs(3.0)), (0.0055, secs(4.0))]), // B3
         ];
         for pcm in cases {
             let report = silence_gate(&pcm);
@@ -1061,6 +1176,10 @@ mod tests {
                 format!("RMS {:.5}", m.rms),
                 format!("max. Fenster {:.5}", m.max_window_rms),
                 format!("Lauf abs {:.2} s", m.longest_abs_run_secs),
+                format!(
+                    "Lauf {QUIET_SPEECH_RMS:.3} {:.2} s",
+                    m.longest_quiet_run_secs
+                ),
                 format!("Lauf rel {:.2} s", m.longest_rel_run_secs),
                 match m.floor {
                     Some(v) => format!("floor {v:.5}"),
@@ -1102,7 +1221,8 @@ mod tests {
         for (pcm, needle) in [
             (level(0.02, secs(3.0)), "Regel B1"),
             (seq(&[(0.003, secs(8.0)), (0.010, secs(2.0))]), "Regel B2"),
-            (seq(&[(0.0, secs(10.0)), (0.004, secs(3.0))]), "Regel D"),
+            (seq(&[(0.003, secs(3.0)), (0.0055, secs(4.0))]), "Regel B3"),
+            (seq(&[(0.0, secs(10.0)), (0.0035, secs(3.0))]), "Regel D"),
             (level(0.0, secs(5.0)), "Regel C"),
         ] {
             let text = silence_gate(&pcm).to_string();
