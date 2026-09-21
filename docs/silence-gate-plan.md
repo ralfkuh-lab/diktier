@@ -3,7 +3,8 @@
 Stand: 2026-09-21, v2 nach Plan-Review durch Astra; WP1–WP4 umgesetzt am
 selben Tag (Bericht [reviews/impl-silence-gate-notes.md](reviews/impl-silence-gate-notes.md),
 Auftrag [reviews/impl-silence-gate-prompt.md](reviews/impl-silence-gate-prompt.md)),
-WP0 offen — er entscheidet über Freigabe und Release. v2 nach Plan-Review durch Astra
+WP0 offen — er entscheidet über Freigabe und Release. v2 entstand nach dem
+Plan-Review durch Astra
 ([reviews/plan-silence-gate-astra.md](reviews/plan-silence-gate-astra.md),
 Auftrag [reviews/plan-silence-gate-prompt.md](reviews/plan-silence-gate-prompt.md)):
 alle vier Blocker (B1–B4) und die Hinweise W1–W5 eingearbeitet, K1–K3
