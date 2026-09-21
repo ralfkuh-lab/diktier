@@ -19,3 +19,6 @@
 
 __pycache__/
 *.py[cod]
+
+# Lokale Kalibrierungsaufnahmen (silence-gate-plan WP0), nie committen
+/testdata/stt/local/

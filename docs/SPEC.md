@@ -1,6 +1,6 @@
-# Diktier — Spec v1.4
+# Diktier — Spec v1.6
 
-Stand: 2026-08-31. Verbindlich für die Implementierung. Änderungen nur über
+Stand: 2026-09-21. Verbindlich für die Implementierung. Änderungen nur über
 diesen Text.
 
 v1.1: Codex-Review (`docs/reviews/spec-codex.md`). v1.2: Agy-Kreuz-Review
@@ -14,6 +14,11 @@ alle Linux-/X11-/Wayland-Passagen dieser Spec (u. a. in §3, §4.4, §5,
 §8, §9) sind historisch und nicht mehr normativ. Die
 Clean-VM-Release-Gates aus §11/§12 sind für den privaten Gebrauch
 ausgesetzt (windows-plan.md, WP7 verworfen).
+v1.6 (2026-09-21, Ralf): **Relativer Silence-Gate** in §6.4 normativ
+definiert (bisherige absolute Regeln bleiben als Ja-Pfade erhalten, neu
+Regel D relativ zum Grundrauschen), Log-Vertrag pro Aufnahme, §12 und
+§18 #12 verknüpft. Plan `docs/silence-gate-plan.md`, Review
+`docs/reviews/plan-silence-gate-astra.md`.
 
 ## 1. Ziel
 
@@ -369,6 +374,52 @@ es tot → `error` Mic, Retry beim nächsten Press.
 
 Zu kurze Buffer (`< 250 ms`) nicht transkribieren.
 
+#### Silence-Gate (v1.6)
+
+Vor jedem Engine-Aufruf entscheidet ein deterministischer Gate über den
+16-kHz-mono-f32-Puffer. Ablehnung heißt: leeres Ergebnis, **kein**
+Engine-Aufruf. Der Gate ist ein Halluzinationsschutz gegen Stille und
+Rauschen ohne Sprache, keine Sprachklassifikation; er darf kein Signal
+verwerfen, das die Regeln vor v1.6 durchgelassen haben.
+
+Fensterung: Fenster von 4000 Samples (250 ms) ab Sample 0, nicht
+überlappend; ein kürzeres Restfenster geht mit seiner echten
+Sample-Zahl in Maximum und Laufdauern ein, nicht in den floor.
+Laufdauern werden in Samples gezählt. `floor` = RMS der vollen Fenster
+aufsteigend sortiert, Element `⌊0,1 · (n − 1)⌋` (Nearest-Rank nach
+unten; für n ≤ 10 das Minimum). Nicht-endliche Samples → Ablehnung
+`InvalidInput`, keine Bereinigung im Gate.
+
+Konstanten: `RMS_SILENCE_THRESHOLD = 0,0075`, `MIN_SPEECH_RUN_ABS_SECS =
+2,0`, `ABS_FLOOR = 0,0003`, `RELATIVE_MARGIN_DB = 12`, `MIN_ACTIVE_RMS =
+0,0010`, `MIN_SPEECH_RUN_REL_SECS = 1,5`. Kalibrierung und Messbelege in
+`docs/SPIKES.md` (2026-08 absolut, 2026-09 relativ) und
+`docs/silence-gate-plan.md`.
+
+Regeln, die erste zutreffende entscheidet:
+
+- **A** `< 4000` Samples → leer (`TooShort`).
+- **B1** Gesamt-RMS ≥ 0,0075 → Engine.
+- **B2** zusammenhängender Lauf von Fenstern mit RMS ≥ 0,0075 über
+  ≥ 2,0 s → Engine.
+- **C** Maximum der Fenster-RMS < `ABS_FLOOR` → leer
+  (`BelowAbsoluteFloor`). Pegelgrenze, kein Gerätebefund; die
+  Geräte-Recovery aus §10 ist davon unabhängig.
+- **D** `thr = max(floor · 10^(12/20), MIN_ACTIVE_RMS)`; Fenster mit
+  RMS ≥ `thr` sind aktiv, Fenster mit RMS < `ABS_FLOOR` sind nie aktiv
+  und unterbrechen einen Lauf. Längster aktiver Lauf ≥ 1,5 s → Engine,
+  sonst leer (`NoRelativeRun`).
+
+Bekannte Grenzen (bewusst, kein Fehler): leise Diktate ohne 1,5 s
+zusammenhängenden Kontrast (Ein-Wort-Diktate, pausenloses Sprechen ohne
+Rauschfenster) und Signale unter `MIN_ACTIVE_RMS` bzw. `ABS_FLOOR`
+werden weiterhin verworfen, sofern nicht B1/B2 greifen.
+
+Log-Vertrag: pro Aufnahme genau eine Zeile mit dem Gate-Report
+(Entscheidung und Regel, Sample- und Fensterzahl, RMS, floor, Maximum,
+Schwelle D, Laufdauern; RMS-Werte mit fünf Nachkommastellen) — auch bei
+Annahme. Nur Zahlen; §10 gilt unverändert.
+
 Phase-1-STT-Spike mit fertiger WAV prüft **nicht** den Capture-Pfad;
 das ist Pflicht in Phase 2 (echte 44,1- und 48-kHz-Geräte bzw. Fixtures,
 Stereo, Device-lost).
@@ -635,9 +686,10 @@ nutzen dieselbe Zahlenschreibweise wie Parakeet (Ziffern vs. Wort).
   Haswell-Maschine
 - Peak-RSS zusätzlich mit einer 60-s-Datei messen (Ziel ≤ 2 GiB, §3)
 - Halluziniert die Engine auf Stille/Rauschen, darf Diktier einen
-  dokumentierten RMS-Silence-Gate vorschalten (Schwelle in
-  `docs/SPIKES.md`); das gilt **nicht** als Scheitern von `parakeet-rs`,
-  solange die Sprach-Gates bestehen
+  dokumentierten RMS-Silence-Gate vorschalten (Regeln in §6.4,
+  Kalibrierung in `docs/SPIKES.md`: 2026-08 absolut, 2026-09 relativ);
+  das gilt **nicht** als Scheitern von `parakeet-rs`, solange die
+  Sprach-Gates bestehen
 
 `docs/SPIKES.md` hält CPU, RAM, OS, Crate-/ORT-Version, Threads,
 Artefakt-SHA256, Rohtexte, normalisierte Texte, Zeiten.
@@ -781,3 +833,4 @@ Kein Code-Import.
 | 9 | Phase-1-Artefakte | Omarchy-Kopie zulässig bis zur HF-URL (Claude N2). |
 | 10 | Linux-Build | Verbindlich Mint-22-Basis (Claude N3). |
 | 11 | WER-Puffer (Phase-1-Beleg) | +0,05 wiederhergestellt (Owner, 2026-08-26): byte-gleiche Artefakte, aber verschiedene Mel-Frontends (Voxtype Kaldi-fbank, parakeet-rs NeMo-Style); 4/5 Dateien wortidentisch, „Werstadt“-Fall in `docs/SPIKES.md`. |
+| 12 | Relativer Silence-Gate (v1.6) | Bisherige Ja-Pfade (B1/B2) bleiben, Regel D relativ zum Grundrauschen kommt hinzu; Engine ist pegelrobust (`alltag.wav` −22 dB wortidentisch, 2026-09-21); Grenzen in §6.4; Windows-Mikrofonpegel wird nicht angefasst (Ralf, 2026-09-21). |
