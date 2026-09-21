@@ -345,6 +345,11 @@ ist vollständig entfernt.**
   Download-Mutex.
 - ❌ Watchdog gegen still entfernten LL-Hook (`LowLevelHooksTimeout`) —
   Restrisiko akzeptiert (unverändert seit Paket A).
+- 🔍 **Relativer Silence-Gate** (Befund Ralf 2026-09-21: leises
+  Jabra-Signal, −49 dBFS, fürs Ohr klar, Gate verwarf es als Stille;
+  Parakeet erkennt `alltag.wav` auch um 22 dB abgesenkt wortidentisch).
+  Gate soll Sprache am Abstand zum Grundrauschen erkennen statt an
+  einer absoluten Schwelle. Plan: [silence-gate-plan.md](silence-gate-plan.md).
 
 ## Umsetzung
 
