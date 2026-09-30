@@ -16,7 +16,7 @@ Lizenz: [Creative Commons Attribution 4.0 International](https://creativecommons
 | 1. Ursprungsmodell | NVIDIA | [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | von Moondream nicht angegeben; `main` steht seit 2026-08-05 auf `541d1f99c6b0c3cd0b11a95167540bb8edefd82b`, also auch bei Erscheinen von Parakeet Ultra (2026-09-22) |
 | 2. Post-Training | Moondream | [`moondream/parakeet-ultra`](https://huggingface.co/moondream/parakeet-ultra) | von altunenes nicht angegeben; das Repository hat genau einen Commit, `73175eb7aeb0d82f1e2a6b53b3aabc10a90bcd0b` (2026-09-23) |
 | 3. ONNX-Export | altunenes | [`altunenes/parakeet-rs`, Ordner `parakeet-ultra/`](https://huggingface.co/altunenes/parakeet-rs/tree/4d2a8bc71f5c896ec40faa59732e6716295edaf2/parakeet-ultra) | `4d2a8bc71f5c896ec40faa59732e6716295edaf2` |
-| 4. int8-Quantisierung | Diktier-Projekt | [`ralfkuh-lab/diktier`](https://github.com/ralfkuh-lab/diktier), `scripts/quantize-ultra.py` | Commit des Rezepts: wird beim Release eingetragen |
+| 4. int8-Quantisierung | Diktier-Projekt | [`ralfkuh-lab/diktier`](https://github.com/ralfkuh-lab/diktier), `scripts/quantize-ultra.py` | Commit des Rezepts: [`f6ae94f`](https://github.com/ralfkuh-lab/diktier/commit/f6ae94f1bfec55a692f4a4bdf6e473390d3a5ccd) |
 
 Keine dieser Stufen ist eine offizielle Veröffentlichung einer früheren Stufe.
 NVIDIA, Moondream und altunenes haben dieses Artefakt weder erstellt noch
