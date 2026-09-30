@@ -88,6 +88,13 @@ pub fn describe(event: &LogEvent) -> String {
             "Text liegt in der Zwischenablage ({})",
             copy_reason_name(*reason)
         ),
+        // §4.5 / Plan H9: eine Zeile je Hinweis, nur die festen Kartentexte.
+        LogEvent::Notice { notice } => format!(
+            "Hinweis: {} — {} / {}",
+            notice.key(),
+            notice.title(),
+            notice.detail()
+        ),
         LogEvent::Failure { kind } => format!("Fehlerzustand: {}", error_kind_name(*kind)),
         LogEvent::IgnoredRetry { state } => {
             format!("Retry ignoriert (Zustand {})", state_name(*state))
@@ -96,6 +103,11 @@ pub fn describe(event: &LogEvent) -> String {
             format!("Beenden angefordert (Zustand {})", state_name(*state))
         }
         LogEvent::IgnoredAfterQuit => "Ereignis nach dem Beenden ignoriert".into(),
+        LogEvent::TranscriptLostWhileBusy { run, state } => format!(
+            "Transkript von Lauf {} nachträglich verloren — kein Fehlerzustand,              weil gerade {} läuft",
+            run.0,
+            state_name(*state)
+        ),
     }
 }
 
@@ -308,7 +320,7 @@ fn format_utc(unix_secs: i64) -> String {
 
 /// Tage seit 1970-01-01 → (Jahr, Monat, Tag), proleptischer gregorianischer
 /// Kalender (Algorithmus `civil_from_days`, Howard Hinnant).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(super) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -324,6 +336,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Notice;
 
     #[test]
     fn state_names_cover_every_state() {
@@ -398,6 +411,9 @@ mod tests {
             LogEvent::IgnoredTrayClick {
                 state: AppState::Loading,
             },
+            LogEvent::Notice {
+                notice: Notice::PartialRestore,
+            },
         ];
         for event in &events {
             let line = describe(event);
@@ -406,6 +422,11 @@ mod tests {
         }
         assert!(describe(&events[3]).contains("Lauf 3"));
         assert!(describe(&events[2]).contains("120 ms"));
+        assert_eq!(
+            describe(events.last().unwrap()),
+            "Hinweis: restored-partial(zurückschreiben) — Zwischenablage teilweise \
+             wiederhergestellt / Nicht alle Formate ließen sich zurückschreiben"
+        );
     }
 
     // ------------------------------------------------- Datei-Log (§10, Teil 2)

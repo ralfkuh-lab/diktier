@@ -1,6 +1,6 @@
-# Diktier — Spec v1.7
+# Diktier — Spec v1.8
 
-Stand: 2026-09-21. Verbindlich für die Implementierung. Änderungen nur über
+Stand: 2026-09-25. Verbindlich für die Implementierung. Änderungen nur über
 diesen Text.
 
 v1.1: Codex-Review (`docs/reviews/spec-codex.md`). v1.2: Agy-Kreuz-Review
@@ -24,6 +24,14 @@ Lauf ≥ 2,0 s über 0,004 — nach der Kalibrierung mit echten Aufnahmen
 (`docs/SPIKES.md`, „Kalibrierung relativer Silence-Gate“): pausenloses
 leises Diktat ohne Rauschfenster wird sonst verworfen, obwohl die Engine
 es fehlerfrei erkennt. §18 #13.
+v1.8 (2026-09-25, Ralf): **Mehrformat-Clipboard-Restore** (§7.1) —
+alle Win32-auslesbaren Nutzdaten statt nur Unicode-Text, Restore mit
+Transkript-Fallback, Ausschluss aus Win+V-Verlauf und Cloud;
+**Overlay-Hinweis** nach dem Diktat (§4.5) statt der nie angezeigten
+Tooltips aus §4.3/§7.1/§7.3; `output.mode = "type"` gestrichen (§7.5,
+§8); Debug-WAV als Ring der letzten zehn (§10). Plan
+`docs/clipboard-restore-plan.md`, Review
+`docs/reviews/plan-clipboard-restore-sol.md`. §18 #14.
 
 ## 1. Ziel
 
@@ -57,7 +65,13 @@ Cursor, Tray, Config, Autostart. Kein Preview-Dialog.
 - Whisper-`initial_prompt`, Wortersetzungen
 - Tastensimulation als Default-Ausgabe
 - Inject in **erhöhte** Windows-Prozesse (UAC/UIPI)
-- Verlustfreies Clipboard-Restore für Nicht-Text (Bilder, HTML, Dateien)
+- ~~Verlustfreies Clipboard-Restore für Nicht-Text~~ (v1.8: umgesetzt
+  für alle Win32-auslesbaren Nutzdaten, siehe §7.1). Weiterhin
+  Nicht-Ziel: OLE-Objektsemantik (lebendes `IDataObject`, Paste-Link,
+  virtuelle Dateien pro `lindex` wie kopierte Outlook-Elemente,
+  Rückmeldungen wie „Performed DropEffect“ an die Quelle), die
+  Owner-Identität der Quelle (z. B. Excels Kopierrahmen) und Formate,
+  deren Handles nur der Owner deuten kann (§7.1, Formatmatrix)
 - Weitere Parakeet-Varianten (unquantisiert, English-only) — erst nach
   eigenem Gate
 
@@ -100,7 +114,8 @@ Windows: MSVC x64.
 ### 4.2 Fokusregel (nicht verhandelbar)
 
 Der PTT-Pfad darf **kein** Fenster öffnen, das den Fokus nimmt. Feedback
-nur über Tray-Icon, Tooltip und optionale Desktop-Notification bei
+nur über Tray-Icon, Tooltip, das nicht aktivierende Overlay (§4.5, seit
+v1.8 auch mit Hinweiskarte) und optionale Desktop-Notification bei
 Fehlern.
 
 Diktier aktiviert niemals selbst ein Fenster. Zweiter-Instanz-Start
@@ -149,8 +164,9 @@ die Quelle (`Hotkey` vs. `TrayClick`):
 TrayClick-Diktate enden **immer** in `copy_only` — kein Paste-Key auf
 diesem Pfad. Beim Klick aufs Tray-Icon kann Panel/Taskbar den Vordergrund
 halten; eine Fokusprüfung gegen das eigentliche Ziel ist nicht
-verlässlich. Transkript ins Clipboard, Tooltip „Text liegt in der
-Zwischenablage“.
+verlässlich. Transkript ins Clipboard, Overlay-Hinweis „Text liegt in
+der Zwischenablage“ (§4.5; bis v1.7 als Tooltip versprochen, nie
+angezeigt).
 
 Während `transcribing`/`downloading`/`loading`: beide Eingaben ignorieren
 (Log-Warnung).
@@ -188,6 +204,40 @@ Overlay-Fehler (Fensterbau, Rendering) deaktiviert nur das Overlay
 (Log-Warnung); Diktieren läuft weiter. Abschaltbar über
 `[overlay] enabled` (§8). Windows-only; Details und Verträge:
 `docs/overlay-plan.md`.
+
+**Hinweiskarte (v1.8).** Ist nach einem Diktat der vorherige Inhalt der
+Zwischenablage ganz oder teilweise weg, zeigt dieselbe Karte nach
+`injecting` für `NOTICE_DURATION = 3 s` einen zweizeiligen Hinweis mit
+Warn-Glyphe:
+
+| Ausgang (§7.1/§7.3/§4.3) | Zeile 1 | Zeile 2 |
+|---|---|---|
+| `Unrestorable` | Zwischenablage nicht gesichert | Vorheriger Inhalt wurde überschrieben |
+| `RestoreFailed` | Zwischenablage nicht wiederhergestellt | Vorheriger Inhalt wurde überschrieben |
+| `RestoredPartial`, nur beim Sichern verloren | Zwischenablage teilweise wiederhergestellt | Nicht alle Formate ließen sich sichern |
+| `RestoredPartial`, auch beim Zurückschreiben verloren | Zwischenablage teilweise wiederhergestellt | Nicht alle Formate ließen sich zurückschreiben |
+| `NoReadTimeout` | Einfügen nicht bestätigt | Text liegt in der Zwischenablage |
+| `CopyOnly` Fokuswechsel/-verlust | Fokus gewechselt – nicht eingefügt | Text liegt in der Zwischenablage |
+| `CopyOnly` TrayClick | Text liegt in der Zwischenablage | Mit Strg+V einfügen |
+
+Kein Hinweis bei vollständigem Restore (auch wenn GDI-Formate
+synthetisch ersetzt oder OLE-Verweise entfallen sind), bei fremder
+Änderung während des Diktats, bei `restore_clipboard = false` und bei
+leerem Transkript. Inject-Fehler bleiben Tray `error`.
+
+Der Hinweis ist Kernzustand: gesetzt nur beim `InjectFinished` des
+aktuellen Runs, gelöscht bei Ablauf, jedem akzeptierten Aufnahmestart,
+Pause an/aus, Quit, `error` und jedem neuen Run. Die Ansicht hat eine
+feste Priorität: `quitting`, `error` → verborgen;
+`recording`/`transcribing`/`injecting` → Pegel (auch bei einer
+TrayClick-Aufnahme während der Pause, §4.3); `idle` mit Hinweis →
+Hinweis (auch pausiert: Pause an/aus löscht einen alten Hinweis, ein
+neuer entsteht in der Pause nur aus einem Tray-Diktat); sonst verborgen. Der Wechsel Pegel ↔ Hinweis tauscht nur den
+Inhalt, ohne Ausblenden und ohne Aktivierung; die Fokusregel gilt
+unverändert. Scheitert der Textaufbau, steht für 3 s nur die
+Warn-Glyphe (Log-Warnung, Overlay bleibt aktiv). Die Zusage „Hinweis
+sichtbar“ gilt nur bei funktionsfähigem, eingeschaltetem Overlay; sonst
+bleibt die Logzeile.
 
 ## 5. Architektur
 
@@ -278,6 +328,10 @@ Regeln:
   Ein verspätetes Ergebnis eines verworfenen Laufs wird nie injiziert.
 - `idle` heißt: Modell geladen, bereit. Das widerspricht nicht dem
   Audio-Callback-Verbot — Aufnahme gibt es erst ab `idle`.
+- `TranscriptLost` (v1.8, §7.1.1): Meldet der Inject-Worker, dass ein
+  schon abgeschlossener Lauf sein Transkript nachträglich verloren hat,
+  geht der Kern aus `idle` nach `error` (Inject, Hotkey bleibt scharf);
+  in jedem anderen Zustand nur eine Logzeile, kein Wechsel.
 
 ### 5.3 Single-Instance
 
@@ -443,14 +497,19 @@ Default ist **nicht** Zeichen-für-Zeichen-Tippen.
 
 ### 7.1 Default: Clipboard + Paste
 
-Nur Unicode-Plaintext ist der v1-Vertrag.
+Das Transkript ist Unicode-Plaintext. Gesichert und wiederhergestellt
+werden seit v1.8 **alle Win32-auslesbaren Nutzdaten** des vorherigen
+Clipboards (Formatmatrix und Restore-Ablauf in §7.1.1).
 
-1. Wenn der aktuelle Clipboard-Inhalt als Unicode-Text snapshotbar ist:
-   merken (Text + Windows-Sequenznummer bzw. X11-Ownership).
-2. Sonst: kein Restore-Versprechen; nach Paste bleibt das Transkript im
-   Clipboard, Tooltip „Nicht-Text-Clipboard konnte nicht restauriert
-   werden“.
+1. Snapshot des aktuellen Clipboards nach §7.1.1, zusammen mit der
+   Windows-Sequenznummer. Ausgang `Empty`, `Formats` (mindestens ein
+   Nutzformat gesichert) oder `Unrestorable`.
+2. Bei `Unrestorable`: kein Restore-Versprechen; nach Paste bleibt das
+   Transkript im Clipboard, Overlay-Hinweis „Zwischenablage nicht
+   gesichert“ (§4.5).
 3. Transkript setzen. Diktier merkt die **eigene** Generation/Ownership.
+   Unmittelbar vor dem ersten Key-Event wird der Vordergrund erneut
+   geprüft (§7.3); bei Wechsel kein Chord, nur `CopyOnly`.
 4. Paste-Shortcut senden (§7.2).
 5. Restore **nur**, wenn Diktier noch Owner ist bzw. die Windows-
    Sequenznummer unverändert blieb. Fremde Änderung: niemals restaurieren.
@@ -464,9 +523,11 @@ Nur Unicode-Plaintext ist der v1-Vertrag.
    frühestens nach der Mindestwartezeit. Kommt innerhalb von 5 s **kein**
    Read (UIPI, verschluckter Chord, falscher Shortcut — am
    API-Rückgabewert oft nicht erkennbar), unterbleibt das Restore
-   endgültig: Transkript bleibt im Clipboard, Tooltip „Einfügen nicht
-   bestätigt — Text liegt in der Zwischenablage“. Clipboard-Manager und
-   Win+V-History erzeugen ggf. False-Positive-Reads; akzeptiert. Ein zu
+   endgültig: Transkript bleibt im Clipboard, Overlay-Hinweis „Einfügen
+   nicht bestätigt — Text liegt in der Zwischenablage“ (§4.5). Ein
+   bedienter Read ist eine Heuristik, kein Beweis für ein Einfügen:
+   Clipboard-Manager erzeugen ggf. False-Positive-Reads; akzeptiert
+   (der Win+V-Verlauf ist seit v1.8 ausgeschlossen, §7.1.1). Ein zu
    Unrecht unterbliebenes Restore ist der akzeptierte Preis — ein
    weggewischtes Transkript nicht.
 8. Nach dem Restore bedient Diktier die restaurierte X11-Selection bis
@@ -485,6 +546,84 @@ Tastendruck selbst.
 Paste-API-Fehler oder UIPI: Transkript **im Clipboard lassen**, Tray
 `error` „Text liegt in der Zwischenablage“. Kein stilles Verwerfen.
 Diktier fordert keine Elevation an.
+
+#### 7.1.1 Snapshot und Restore aller Formate (v1.8)
+
+**Enumeration.** Im geöffneten Clipboard werden zuerst alle Format-IDs
+in Enumerationsreihenfolge erfasst (`EnumClipboardFormats`), erst danach
+die Daten gelesen. Ende ist `0` mit `GetLastError() == ERROR_SUCCESS`;
+jeder andere Fehler ist ein Snapshot-Fehler, nicht `Empty`. Ein
+Snapshot-Fehler (auch ein erfolgloses `OpenClipboard`) ergibt
+`Unrestorable`: Das Transkript wird trotzdem eingefügt, nur ohne
+Restore-Versprechen. Leer ist nur
+`CountClipboardFormats() == 0`. Synthetisierte Formate werden nicht von
+explizit angebotenen unterschieden; jede ID wird nach ihrer Handle-Klasse
+behandelt:
+
+| Klasse | Formate | Ergebnis |
+|---|---|---|
+| HGLOBAL, Standard | `CF_TEXT` 1, `CF_OEMTEXT` 7, `CF_DIB` 8, `CF_UNICODETEXT` 13, `CF_HDROP` 15, `CF_LOCALE` 16, `CF_DIBV5` 17, `CF_DSPTEXT` 0x81 und weitere Standard-IDs mit HGLOBAL laut Microsoft „Standard Clipboard Formats“ | Bytes gesichert, als neues `GMEM_MOVEABLE` wiederhergestellt |
+| HGLOBAL, registriert | `≥ 0xC000` mit `GlobalSize > 0` und erfolgreichem `GlobalLock` | Bytes gesichert |
+| EMF | `CF_ENHMETAFILE` 14 | `GetEnhMetaFileBits` / `SetEnhMetaFileBits` |
+| GDI, ersetzbar | `CF_BITMAP` 2 und `CF_PALETTE` 9 bei gesichertem DIB/DIBV5; `CF_METAFILEPICT` 3 bei gesichertem EMF | synthetisch ersetzt (Log, kein Hinweis) |
+| OLE-intern | „DataObject“, „Ole Private Data“ | entfällt (Log, kein Hinweis) |
+| verloren | GDI-Formate ohne Gegenstück, `CF_OWNERDISPLAY` 0x80, `CF_DSPBITMAP` 0x82, `CF_DSPMETAFILEPICT` 0x83, `CF_DSPENHMETAFILE` 0x8E, `CF_PRIVATEFIRST..LAST`, `CF_GDIOBJFIRST..LAST`, unbekannte Standard-IDs, `GetClipboardData == NULL`, Lock/Size-Fehler, erschöpftes Budget | Verlust |
+
+GDI-Handles werden nie per `GlobalLock` angefasst. **Begleitformate**
+(`CF_LOCALE`, „Preferred DropEffect“, „Shell Object Offsets“,
+Verlaufs-/Cloud-Policy-Formate) tragen allein keinen Inhalt; `Formats`
+verlangt mindestens ein gesichertes **Nutzformat**, sonst gilt
+`Unrestorable`.
+
+**Budgets.** 128 MiB Summe gesicherter Bytes und 1 s Laufzeit, geprüft
+nach jedem Format; darüber zählen die betroffenen bzw. restlichen
+Formate als Verlust. Beides sind weiche Grenzen: Ein einzelnes
+`GetClipboardData` rendert bei der Quelle synchron und lässt sich nicht
+abbrechen (§18 #14).
+
+**Restore.** Alle Kopien und das Transkript-Fallback werden **vor**
+`OpenClipboard` erzeugt. Im geöffneten Clipboard werden Owner und
+Sequenz erneut geprüft; bei Abweichung wird nichts angefasst (P5). Dann
+`EmptyClipboard` und `SetClipboardData` in Originalreihenfolge;
+scheiternde Formate zählen als Verlust beim Zurückschreiben. Ist danach
+kein Nutzformat platziert, wird noch im geöffneten Clipboard das
+Transkript gesetzt (`RestoreFailed`); scheitert auch das, ist es ein
+Inject-Fehler (Tray `error`). Nicht übergebene Handles gibt Diktier frei.
+Ergebnis: `Restored`, `RestoredPartial` (Verlust beim Sichern oder
+Zurückschreiben), `RestoreFailed` oder `ForeignOwner`.
+
+**Eigener Inhalt.** Ist Diktier beim nächsten Snapshot noch Owner (Owner
+und Sequenz), dient die zuletzt tatsächlich gesetzte Payload als
+Snapshot, ohne eigenes `GetClipboardData`: nach einem Restore die
+platzierten Formate, sonst das Transkript.
+
+**Transkript sichern.** Das Delayed-Rendering-Versprechen des
+Transkripts lebt nur auf dem Paste-Pfad bis zur Restore-Entscheidung
+(Read-Heuristik P7). `CopyOnly` setzt eager; nach einem Ausgang ohne
+Restore (`NoReadTimeout`, `NoPromise`, `Disabled`) und nach jedem Fehler
+nach der Übernahme wird das Transkript eager materialisiert — bei
+`NoPromise`/`Disabled` erst nach dem ersten Read bzw. dem 5-s-Fenster,
+um das einfügende Ziel nicht zu stören (der Inject-Worker ist dann bis
+zu 5 s belegt). Scheitert nach `EmptyClipboard` das eager
+`SetClipboardData`, wird noch im geöffneten Clipboard wieder ein
+Delayed-Versprechen gesetzt. Ein offenes Versprechen versucht der
+Inject-Worker im Idle erneut zu materialisieren (alle 500 ms, höchstens
+10 Versuche, dann Log-Warnung; fremder Copy = aufgeben). Quit rechnet
+mit einer absoluten, monotonen Deadline (Antwortfrist des Daemons minus
+300 ms Marge, höchstens 1,5 s): Wiederholungen nur bis zur Deadline, ein
+erster Versuch auch danach; liegt `SaveTargets` hinter einem laufenden
+Paste, wartet es dessen Ende ab (bis 5 s, kein Abbruch). Ist das
+Transkript nachweislich weg, meldet der Lauf Tray `error` „Zwischenablage
+leer — Transkript verloren“ (nachträglich über `TranscriptLost`, §5.2);
+scheitert die Sicherung beim Beenden, steht die Warnung
+„Transkript beim Beenden nicht gesichert — Zwischenablage kann leer
+sein“ im Log.
+
+**Verlauf und Cloud.** Transkript (auf allen Pfaden) und
+wiederhergestellter Inhalt tragen zusätzlich
+`ExcludeClipboardContentFromMonitorProcessing`. Das schließt sie aus
+Win+V-Verlauf und Cloud-Clipboard aus; das Original steht dort schon vom
+ursprünglichen Kopieren. Für Drittanbieter-Manager gibt es keine Zusage.
 
 ### 7.2 Paste-Shortcut
 
@@ -514,8 +653,10 @@ Tabs desselben Top-Level-Fensters zählt **nicht** als Verlust (sonst
 scheitert VS Code).
 
 Inject nur, wenn Start-Kennung, Ende-Kennung und Vordergrund vor Inject
-**übereinstimmen**. Sonst **kein** Paste-Key, Transkript bleibt im
-Clipboard, Tooltip „Fokus geändert — Text liegt im Clipboard“. Eine nicht
+**übereinstimmen**; seit v1.8 zusätzlich unmittelbar vor dem ersten
+Key-Event, nach dem Setzen des Transkripts. Sonst **kein** Paste-Key,
+Transkript bleibt im Clipboard, Overlay-Hinweis „Fokus gewechselt –
+nicht eingefügt“ (§4.5). Eine nicht
 ermittelbare Kennung (NULL, Secure Desktop, gesperrter Bildschirm) zählt
 als Fokusverlust — das verhindert auch den Paste in den Unlock-Dialog
 eines X11-Lockers nach dem 60-s-Cap bei gesperrtem Desktop.
@@ -529,10 +670,11 @@ eines X11-Lockers nach dem 60-s-Cap bei gesperrtem Desktop.
   Wen das stört: `leading_space = false`.
 - Keine Spoken-Punctuation, keine Replacements in v1.
 
-### 7.5 Optional `output.mode = "type"`
+### 7.5 ~~Optional `output.mode = "type"`~~
 
-Nur Config-Option, ohne v1-Garantie. Spike darf es versuchen. Scheitert
-es, bleibt Paste der Release-Pfad.
+v1.8 gestrichen (Ralf, 2026-09-25): Der Wert wurde bis 0.3.0 gelesen,
+aber nie ausgewertet. Tastensimulation bleibt Nicht-Ziel (§2);
+`output.mode` kennt nur `"paste"` (§8).
 
 ## 8. Config
 
@@ -557,7 +699,7 @@ model = "parakeet-tdt-0.6b-v3-int8"
 threads = 0             # 0 = Runtime-Default
 
 [output]
-mode = "paste"          # "paste" | "type"
+mode = "paste"          # v1 nur dieser Wert
 paste_shortcut = "auto"
 leading_space = true
 restore_clipboard = true
@@ -574,7 +716,7 @@ Validierung:
 
 | Klasse | Beispiele | Wirkung |
 |---|---|---|
-| Fatal | TOML-Syntax, ungültiges `hotkey.key`, `output.mode`, `engine.model` | kein Hotkey, keine Aufnahme, Tray `error` |
+| Fatal | TOML-Syntax, ungültiges `hotkey.key`, `output.mode` (alles außer `"paste"`, auch das frühere `"type"`), `engine.model` | kein Hotkey, keine Aufnahme, Tray `error` |
 | Unbekannte Keys | Tippfehler in Schlüsselnamen | ignorieren + Warnung |
 | Clamped | Zahlen außerhalb | Warnung + Grenze |
 
@@ -590,7 +732,16 @@ diktier                     # Daemon
 diktier --foreground        # Logs auf stderr, auch mit Konsole
 diktier --install-autostart
 diktier --remove-autostart
+diktier --clipboard-check              # v1.8: Formate der Zwischenablage, nur lesend
+diktier --clipboard-check --roundtrip  # v1.8: sichern → überschreiben → zurück, nur ohne Daemon
 ```
+
+`--clipboard-check` zeigt je Format ID, bereinigten Namen, Klasse nach
+§7.1.1 und Größe, nie Inhalte; es kann delayed gerenderte Formate der
+Quelle anstoßen. `--roundtrip` überschreibt die Zwischenablage kurz und
+verweigert den Start, solange der Daemon läuft. Er vergleicht IDs,
+Reihenfolge und Bytes (Präfix in Originallänge, weil Windows Blöcke
+aufrunden darf); über OLE- oder Owner-Semantik sagt er nichts.
 
 Install/Remove **idempotent**. Pfad = gequotetes `current_exe()`. Eigenen
 Eintrag aktualisieren, fremde Einträge nie löschen.
@@ -601,7 +752,10 @@ Eintrag aktualisieren, fremde Einträge nie löschen.
 - Linux: `~/.config/autostart/diktier.desktop`.
 
 Exitcodes: `0` ok (auch zweiter Start), `1` fataler Laufzeitfehler,
-`2` Bedien-/Configfehler.
+`2` Bedien-/Configfehler. Für `--clipboard-check` (v1.8): `0` kein
+Verlust, `3` Verlust, `Unrestorable` oder im Roundtrip nicht alle Formate
+geprüft (Budget erschöpft), `1` Fehler, auch ein wegen laufendem Daemon
+verweigerter `--roundtrip`.
 
 Phase 4: Pfad mit Leerzeichen, zweimal Install/Remove, verschobene
 portable Binary (erneutes `--install-autostart` aktualisiert).
@@ -630,12 +784,19 @@ in `diktier.log` — der Daemon kann parallel laufen (Ein-Writer-Regel).
 Rotation, nicht In-Place-Truncate: erreicht
 `diktier.log` 2 MiB, atomar nach `diktier.log.1` (eine Backup-Datei),
 neue `diktier.log`. Keine Transkripte, keine Clipboard-Inhalte, keine
-Fenstertitel.
+Fenstertitel. Erlaubt sind Clipboard-Metadaten (v1.8): Format-IDs,
+bereinigte Formatnamen (druckbares ASCII, höchstens 40 Zeichen), Größen,
+Dauern und Verlustgründe; keine Pfade aus `CF_HDROP`.
 
-`DIKTIER_DEBUG_WAV=1`: schreibt `$TMPDIR/diktier-$USER/last_recording.wav`
-bzw. `%TEMP%\diktier\last_recording.wav`, Rechte `0600`. Jede neue Debug-
-Aufnahme überschreibt diese Datei atomar — genau ein Dump. Pfad eine
-Logzeile. Nie hochladen.
+`DIKTIER_DEBUG_WAV=1` (v1.8): schreibt je Aufnahme
+`%TEMP%\diktier\rec_<UTC bis ms>_lauf-<N>[-<k>].wav` atomar: exklusiv
+angelegte Temp-Datei `<ziel>.<pid>-<n>.part`, dann Rename **ohne
+Ersetzen**; ist der Name belegt, folgt das Suffix `-2`, `-3` … Behalten
+werden die **zehn** jüngsten Dateien dieses Musters (mit gültigem
+gregorianischem Datum inkl. Monatslänge und Schaltjahr); ältere werden gelöscht, `.part`-Reste erst ab einer
+Stunde Alter, fremde Dateien nie. Die frühere `last_recording.wav` wird
+entfernt. Pfad eine Logzeile. Nie
+hochladen.
 
 ## 11. Verteilung
 
@@ -848,3 +1009,4 @@ Kein Code-Import.
 | 11 | WER-Puffer (Phase-1-Beleg) | +0,05 wiederhergestellt (Owner, 2026-08-26): byte-gleiche Artefakte, aber verschiedene Mel-Frontends (Voxtype Kaldi-fbank, parakeet-rs NeMo-Style); 4/5 Dateien wortidentisch, „Werstadt“-Fall in `docs/SPIKES.md`. |
 | 12 | Relativer Silence-Gate (v1.6) | Bisherige Ja-Pfade (B1/B2) bleiben, Regel D relativ zum Grundrauschen kommt hinzu; Engine ist pegelrobust (`alltag.wav` −22 dB wortidentisch, 2026-09-21); Grenzen in §6.4; Windows-Mikrofonpegel wird nicht angefasst (Ralf, 2026-09-21). |
 | 13 | Regel B3 (v1.7) | Absoluter Lauf ≥ 2,0 s über 0,004 zusätzlich zu B1/B2/D — pausenloses leises Diktat (WP0-Aufnahme 07: 4,5 s) gegen Störgeräusche (≤ 1,0 s); akzeptiertes Restrisiko: gleichmäßiges Geräusch 0,004–0,0075 über 2 s geht an die Engine (Ralf, 2026-09-21). |
+| 14 | Mehrformat-Restore, Hinweiskarte (v1.8) | Anlass: 33× „Nicht-Text-Clipboard“ im Log, Screenshots/Dateien/Formatierung gingen verloren, die versprochenen Tooltips erreichten den Nutzer nie (2026-09-25). „Vollständig“ heißt alle Win32-auslesbaren Nutzdaten byte-gleich in Originalreihenfolge; nicht zugesagt: OLE-Objektsemantik, virtuelle Dateien, Owner-Identität, synthetisch ersetzte GDI-Formate. Akzeptierte Restrisiken: Eine hängende Quelle blockiert den Inject-Worker bis zu ihrer Rückkehr (Quit beendet trotzdem), Speicherspitze ≈ 2 × 128 MiB, Drittanbieter-Clipboard-Manager ignorieren ggf. den Verlaufsausschluss. `output.mode = "type"` ist ein bewusster Breaking Change (Fatal statt stillem Paste). Plan `docs/clipboard-restore-plan.md`, Review `docs/reviews/plan-clipboard-restore-sol.md` (Ralf, 2026-09-25). |

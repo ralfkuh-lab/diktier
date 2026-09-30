@@ -4,6 +4,13 @@
 //! dem Monitor des fokussierten Fensters eine kleine dunkle Karte: Mikrofon-
 //! Glyphe, scrollende Waveform-Historie und ein Pegelmeter mit Peak-Hold.
 //!
+//! **Hinweiskarte (SPEC v1.8).** Dieselbe Karte zeigt nach dem Diktat für
+//! 3 s einen zweizeiligen Hinweis mit Warn-Glyphe, wenn der vorherige Inhalt
+//! der Zwischenablage ganz oder teilweise weg ist oder das Transkript nicht
+//! eingefügt wurde. Den Text rastert GDI in eine eigene Graustufenmaske
+//! (`windows::render_notice_text`); gemischt wird er hier über
+//! [`Canvas::blend_mask`]. Scheitert der Text, steht nur die Glyphe.
+//!
 //! **Fokusregel §4.2, nicht verhandelbar.** Das Fenster ist `WS_EX_NOACTIVATE`
 //! + `WS_EX_TRANSPARENT`, wird mit `SW_SHOWNOACTIVATE` gezeigt, beantwortet
 //! `WM_NCHITTEST` mit `HTTRANSPARENT` und ruft **nie** `SetForegroundWindow`
@@ -50,6 +57,15 @@ pub const BAR_GAP: i32 = 2;
 pub const METER_H: i32 = 5;
 /// Abstand zwischen Waveform und Meter.
 pub const METER_GAP: i32 = 8;
+/// Hinweiskarte: Breite der Warn-Glyphe (quadratische Fläche).
+pub const NOTICE_GLYPH_W: i32 = 24;
+/// Hinweiskarte: Zeilenhöhe von Zeile 1 und Zeile 2 und ihr Abstand.
+pub const NOTICE_TITLE_H: i32 = 20;
+pub const NOTICE_DETAIL_H: i32 = 18;
+pub const NOTICE_LINE_GAP: i32 = 2;
+/// Hinweiskarte: Schriftgröße (Zeichenhöhe in px bei 96 dpi) je Zeile.
+pub const NOTICE_TITLE_PX: i32 = 14;
+pub const NOTICE_DETAIL_PX: i32 = 13;
 
 // ------------------------------------------------------------------- Farben
 
@@ -65,6 +81,13 @@ pub const WAVE_IDLE_COLOR: Color = Color::rgb(78, 84, 96);
 pub const METER_TRACK_COLOR: Color = Color::rgba(255, 255, 255, 38);
 pub const METER_FILL_COLOR: Color = Color::rgb(88, 200, 160);
 pub const PEAK_COLOR: Color = Color::rgb(238, 240, 245);
+/// Hinweistext. Die Maske trägt die Deckung; Zeile 2 ist darin dunkler
+/// gerastert (`NOTICE_DETAIL_LEVEL`) und wirkt so gedämpft.
+pub const NOTICE_TEXT_COLOR: Color = Color::rgb(238, 240, 245);
+/// Grauwert, mit dem GDI Zeile 2 in die Maske schreibt (Zeile 1: 255).
+pub const NOTICE_DETAIL_LEVEL: u8 = 178;
+/// Ausrufezeichen in der Warn-Glyphe: die Kartenfarbe, deckend.
+pub const NOTICE_MARK_COLOR: Color = Color::rgb(22, 22, 26);
 /// Ab dieser Balkenhöhe gilt der Pegel als heiß.
 const HOT_LEVEL: f32 = 0.85;
 
@@ -342,6 +365,28 @@ impl<'a> Canvas<'a> {
         }
         self.pixels[idx + 3] = new_a as u8;
     }
+
+    /// Eine Deckungsmaske (ein Byte je Pixel, top-down, genau
+    /// `width × height`) in `color` über das Gezeichnete legen — Source-over,
+    /// premultipliziert, mit derselben Klemmung wie [`Canvas::blend`]: die
+    /// Invariante `B, G, R ≤ A` hält für jedes Pixel. Unter Text **steigt** die
+    /// Deckung (auch über der halbtransparenten Karte), das ist gewollt.
+    ///
+    /// `false` (und nichts gezeichnet), wenn die Maske nicht exakt passt.
+    pub fn blend_mask(&mut self, mask: &[u8], color: Color) -> bool {
+        let width = self.width as usize;
+        if mask.len() != width * self.height as usize {
+            return false;
+        }
+        for (index, &coverage) in mask.iter().enumerate() {
+            if coverage == 0 {
+                continue;
+            }
+            let (x, y) = ((index % width) as i32, (index / width) as i32);
+            self.blend(x, y, color, f32::from(coverage) / 255.0);
+        }
+        true
+    }
 }
 
 pub fn fill_rect(canvas: &mut Canvas, rect: Rect, color: Color) {
@@ -530,6 +575,151 @@ pub fn draw_meter(canvas: &mut Canvas, area: Rect, level: f32, peak: f32) {
             Rect::new(left, area.top, (left + mark_w).min(area.right), area.bottom),
             PEAK_COLOR,
         );
+    }
+}
+
+// ------------------------------------------------------------ Hinweiskarte
+
+/// Wo auf der Hinweiskarte was liegt — in Puffer-Koordinaten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoticeLayout {
+    pub card: Rect,
+    pub glyph: Rect,
+    /// Zeile 1 (halbfett) und Zeile 2. Feste Breite: GDI kürzt mit Ellipse.
+    pub title: Rect,
+    pub detail: Rect,
+}
+
+/// `rect` auf `bounds` beschneiden; was herausfällt, wird ein leeres Rechteck
+/// am Rand statt eines negativen.
+fn clip(rect: Rect, bounds: Rect) -> Rect {
+    let left = rect.left.clamp(bounds.left, bounds.right);
+    let top = rect.top.clamp(bounds.top, bounds.bottom);
+    let right = rect.right.clamp(left, bounds.right);
+    let bottom = rect.bottom.clamp(top, bounds.bottom);
+    Rect::new(left, top, right, bottom)
+}
+
+/// Layout der Hinweiskarte: links die Warn-Glyphe, rechts zwei Textzeilen,
+/// als Block vertikal zentriert. Alles bleibt innerhalb der Karte, auch wenn
+/// sie auf einer winzigen Arbeitsfläche geklemmt wurde.
+pub fn notice_layout(width: i32, height: i32, dpi: u32) -> NoticeLayout {
+    let card = Rect::new(0, 0, width.max(0), height.max(0));
+    let pad = scale(CARD_PADDING, dpi);
+    let glyph_w = scale(NOTICE_GLYPH_W, dpi);
+    let glyph_top = (height - glyph_w) / 2;
+    let glyph = clip(
+        Rect::new(pad, glyph_top, pad + glyph_w, glyph_top + glyph_w),
+        card,
+    );
+
+    let text_left = pad + glyph_w + scale(GLYPH_GAP, dpi);
+    let text_right = (width - pad).max(text_left);
+    let title_h = scale(NOTICE_TITLE_H, dpi);
+    let gap = scale(NOTICE_LINE_GAP, dpi);
+    let detail_h = scale(NOTICE_DETAIL_H, dpi);
+    let top = ((height - (title_h + gap + detail_h)) / 2).max(0);
+    let title = clip(Rect::new(text_left, top, text_right, top + title_h), card);
+    let detail_top = top + title_h + gap;
+    let detail = clip(
+        Rect::new(text_left, detail_top, text_right, detail_top + detail_h),
+        card,
+    );
+    NoticeLayout {
+        card,
+        glyph,
+        title,
+        detail,
+    }
+}
+
+/// Deckung eines Pixels im Dreieck `a, b, c`, per 4×4-Überabtastung.
+fn triangle_coverage(px: f32, py: f32, a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> f32 {
+    let edge = |p: (f32, f32), q: (f32, f32), x: f32, y: f32| {
+        (q.0 - p.0) * (y - p.1) - (q.1 - p.1) * (x - p.0)
+    };
+    let mut inside = 0u32;
+    for sy in 0..4 {
+        for sx in 0..4 {
+            let x = px + (sx as f32 + 0.5) / 4.0;
+            let y = py + (sy as f32 + 0.5) / 4.0;
+            let (e0, e1, e2) = (edge(a, b, x, y), edge(b, c, x, y), edge(c, a, x, y));
+            let all_pos = e0 >= 0.0 && e1 >= 0.0 && e2 >= 0.0;
+            let all_neg = e0 <= 0.0 && e1 <= 0.0 && e2 <= 0.0;
+            if all_pos || all_neg {
+                inside += 1;
+            }
+        }
+    }
+    inside as f32 / 16.0
+}
+
+/// Warn-Glyphe aus Primitiven: gleichseitiges Dreieck in `color` mit
+/// ausgespartem Ausrufezeichen. Kein GDI — die Glyphe steht auch dann, wenn
+/// der Textaufbau scheitert (§4.5 Fallback).
+pub fn draw_warning_glyph(canvas: &mut Canvas, area: Rect, color: Color) {
+    if area.is_empty() {
+        return;
+    }
+    let width = area.width() as f32;
+    let height = area.height() as f32;
+    let side = width.min(height / 0.866);
+    if side < 2.0 {
+        return;
+    }
+    let tri_h = side * 0.866;
+    let center_x = area.left as f32 + width / 2.0;
+    let top = area.top as f32 + (height - tri_h) / 2.0;
+    let apex = (center_x, top);
+    let left = (center_x - side / 2.0, top + tri_h);
+    let right = (center_x + side / 2.0, top + tri_h);
+
+    let x0 = left.0.floor() as i32;
+    let x1 = right.0.ceil() as i32;
+    let y0 = top.floor() as i32;
+    let y1 = (top + tri_h).ceil() as i32;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let coverage = triangle_coverage(x as f32, y as f32, apex, left, right);
+            if coverage > 0.0 {
+                canvas.blend(x, y, color, coverage);
+            }
+        }
+    }
+
+    // Ausrufezeichen: Strich und Punkt in der Kartenfarbe.
+    let stroke = (side * 0.13).max(1.0);
+    let half = stroke / 2.0;
+    let bar = Rect::new(
+        (center_x - half).round() as i32,
+        (top + tri_h * 0.36).round() as i32,
+        (center_x + half)
+            .round()
+            .max((center_x - half).round() + 1.0) as i32,
+        (top + tri_h * 0.68).round() as i32,
+    );
+    let radius = (stroke / 2.0).floor() as i32;
+    fill_round_rect(canvas, bar, radius, NOTICE_MARK_COLOR);
+    let dot_top = (top + tri_h * 0.76).round() as i32;
+    let dot = Rect::new(
+        bar.left,
+        dot_top,
+        bar.right,
+        dot_top + (bar.right - bar.left),
+    );
+    fill_round_rect(canvas, dot, radius, NOTICE_MARK_COLOR);
+}
+
+/// Die Hinweiskarte in den Puffer: Karte, Warn-Glyphe in `WAVE_HOT_COLOR`
+/// und — wenn vorhanden — die Textmaske. `text = None` ist der Fallback „nur
+/// Glyphe" (§4.5). Rein, also ohne Fenster testbar.
+pub fn draw_notice_card(canvas: &mut Canvas, dpi: u32, text: Option<&[u8]>) {
+    canvas.clear();
+    let layout = notice_layout(canvas.width(), canvas.height(), dpi);
+    fill_round_rect(canvas, layout.card, scale(CARD_RADIUS, dpi), CARD_COLOR);
+    draw_warning_glyph(canvas, layout.glyph, WAVE_HOT_COLOR);
+    if let Some(mask) = text {
+        canvas.blend_mask(mask, NOTICE_TEXT_COLOR);
     }
 }
 
@@ -982,5 +1172,235 @@ mod tests {
         );
         let mark = canvas.pixel((w as f32 * 0.75) as i32 - 1, y);
         assert!(mark[3] > 200 && mark[0] > 200, "Peak-Marke fehlt: {mark:?}");
+    }
+
+    // ------------------------------------------------------ Hinweiskarte
+
+    fn assert_premultiplied(canvas: &Canvas, what: &str) {
+        for y in 0..canvas.height() {
+            for x in 0..canvas.width() {
+                let [b, g, r, a] = canvas.pixel(x, y);
+                assert!(
+                    b <= a && g <= a && r <= a,
+                    "{what}: Pixel {x}/{y} ist nicht premultipliziert: {b}/{g}/{r} über {a}"
+                );
+            }
+        }
+    }
+
+    /// `blend_mask`: Maske 0 lässt das Pixel stehen, 255 deckt voll,
+    /// Zwischenwerte decken anteilig — bis in die Randpixel, ohne
+    /// Off-by-one. Eine falsch dimensionierte Maske zeichnet gar nichts.
+    #[test]
+    fn blend_mask_applies_coverage_per_pixel_up_to_the_edges() {
+        let (w, h) = (5, 3);
+        let mut buffer = canvas_buffer(w, h);
+        let mut canvas = Canvas::new(&mut buffer, w, h).expect("Puffer passt");
+        let color = Color::rgb(200, 100, 50);
+
+        let mut mask = vec![0u8; (w * h) as usize];
+        mask[0] = 255; // links oben
+        mask[(w * h - 1) as usize] = 255; // rechts unten
+        mask[(w + 2) as usize] = 128; // Mitte, Zwischenwert
+        assert!(canvas.blend_mask(&mask, color));
+
+        assert_eq!(canvas.pixel(0, 0), [50, 100, 200, 255], "volle Deckung");
+        assert_eq!(
+            canvas.pixel(w - 1, h - 1),
+            [50, 100, 200, 255],
+            "letztes Pixel"
+        );
+        let [b, g, r, a] = canvas.pixel(2, 1);
+        assert_eq!(a, 128, "Deckung 128/255");
+        assert!((i32::from(r) - 100).abs() <= 1, "premultipliziert: {r}");
+        assert!((i32::from(g) - 50).abs() <= 1, "premultipliziert: {g}");
+        assert!((i32::from(b) - 25).abs() <= 1, "premultipliziert: {b}");
+        assert_eq!(canvas.pixel(1, 0), [0; 4], "Maske 0 lässt das Pixel stehen");
+        assert_premultiplied(&canvas, "Maske");
+
+        // Falsche Größe (zu kurz, zu lang): nichts gezeichnet.
+        let before = buffer.clone();
+        let mut canvas = Canvas::new(&mut buffer, w, h).expect("Puffer passt");
+        assert!(!canvas.blend_mask(&[255; 14], color));
+        assert!(!canvas.blend_mask(&[255; 16], color));
+        assert_eq!(buffer, before);
+    }
+
+    /// Über der halbtransparenten Karte **steigt** die Deckung unter Text, und
+    /// mehr Maske heißt nie weniger Deckung. Die Invariante `RGB ≤ A` hält für
+    /// jeden Maskenwert.
+    #[test]
+    fn blend_mask_raises_coverage_over_the_card_and_stays_premultiplied() {
+        let w = 256;
+        let mut buffer = canvas_buffer(w, 1);
+        let mut canvas = Canvas::new(&mut buffer, w, 1).expect("Puffer passt");
+        fill_rect(&mut canvas, Rect::new(0, 0, w, 1), CARD_COLOR);
+        let mask: Vec<u8> = (0..=255).collect();
+        assert!(canvas.blend_mask(&mask, NOTICE_TEXT_COLOR));
+
+        assert_eq!(canvas.pixel(0, 0)[3], CARD_COLOR.a, "Maske 0: Karte bleibt");
+        assert_eq!(canvas.pixel(255, 0)[3], 255, "Maske 255: voll deckend");
+        let mut previous = 0;
+        for x in 0..w {
+            let [b, g, r, a] = canvas.pixel(x, 0);
+            assert!(a >= CARD_COLOR.a, "Deckung fällt unter die Karte: {x}");
+            assert!(a >= previous, "Deckung sinkt bei mehr Maske: {x}");
+            assert!(
+                b <= a && g <= a && r <= a,
+                "Maske {x}: {b}/{g}/{r} über {a}"
+            );
+            previous = a;
+        }
+    }
+
+    /// Zwei Zeilen bei 96/144/192 dpi: Glyphe links, Text rechts daneben,
+    /// Zeile 1 über Zeile 2, alles innerhalb der Karte und des Innenabstands.
+    #[test]
+    fn the_notice_layout_has_two_lines_inside_the_card() {
+        for dpi in [96, 144, 192] {
+            let card = card_rect(Rect::new(0, 0, 1920, 1040), dpi);
+            let (w, h) = (card.width(), card.height());
+            let layout = notice_layout(w, h, dpi);
+            let pad = scale(CARD_PADDING, dpi);
+            for (name, rect) in [
+                ("glyph", layout.glyph),
+                ("title", layout.title),
+                ("detail", layout.detail),
+            ] {
+                assert!(!rect.is_empty(), "dpi {dpi}: {name} leer");
+                assert!(
+                    rect.left >= pad && rect.right <= w - pad,
+                    "dpi {dpi}: {name} {rect:?} verletzt den Innenabstand"
+                );
+                assert!(
+                    rect.top >= 0 && rect.bottom <= h,
+                    "dpi {dpi}: {name} {rect:?} verlässt die Karte"
+                );
+            }
+            assert!(layout.glyph.right <= layout.title.left, "dpi {dpi}");
+            assert_eq!(layout.title.left, layout.detail.left, "dpi {dpi}");
+            assert_eq!(layout.title.right, layout.detail.right, "feste Breite");
+            assert!(layout.title.bottom <= layout.detail.top, "dpi {dpi}");
+            assert!(
+                layout.title.height() >= scale(NOTICE_TITLE_PX, dpi)
+                    && layout.detail.height() >= scale(NOTICE_DETAIL_PX, dpi),
+                "dpi {dpi}: Zeilen niedriger als die Schrift"
+            );
+            // Vertikal zentriert: oben und unten gleich viel Luft (±1 px).
+            let above = layout.title.top;
+            let below = h - layout.detail.bottom;
+            assert!((above - below).abs() <= 1, "dpi {dpi}: {above} vs {below}");
+        }
+        assert_eq!(notice_layout(400, 72, 96).title.width(), 400 - 14 - 50);
+    }
+
+    /// Winzige Arbeitsfläche: Die geklemmte Karte ist kleiner als der
+    /// Textblock — die Rechtecke werden beschnitten, nie negativ, nie
+    /// außerhalb. Zeichnen mit voller Maske bleibt im Puffer.
+    #[test]
+    fn the_notice_layout_stays_inside_a_tiny_card() {
+        for (work, dpi) in [
+            (Rect::new(0, 0, 320, 100), 96),
+            (Rect::new(0, 0, 160, 40), 192),
+            (Rect::new(0, 0, 60, 20), 144),
+            (Rect::new(0, 0, 1, 1), 96),
+        ] {
+            let card = card_rect(work, dpi);
+            let (w, h) = (card.width(), card.height());
+            let layout = notice_layout(w, h, dpi);
+            for rect in [layout.glyph, layout.title, layout.detail] {
+                assert!(rect.width() >= 0 && rect.height() >= 0, "{rect:?}");
+                assert!(
+                    rect.left >= 0 && rect.top >= 0 && rect.right <= w && rect.bottom <= h,
+                    "{work:?} @ {dpi}: {rect:?} außerhalb von {w}×{h}"
+                );
+            }
+            let mut buffer = canvas_buffer(w, h);
+            let mut canvas = Canvas::new(&mut buffer, w, h).expect("Puffer passt");
+            let mask = vec![255u8; (w * h) as usize];
+            draw_notice_card(&mut canvas, dpi, Some(&mask));
+            assert_premultiplied(&canvas, "winzige Karte");
+        }
+    }
+
+    /// Fallback ohne Text (§4.5): Karte und Warn-Glyphe in `WAVE_HOT_COLOR`,
+    /// in den Textzeilen steht nur die Karte. Mit Maske steht dort Text.
+    #[test]
+    fn the_glyph_fallback_draws_no_text() {
+        for dpi in [96, 144, 192] {
+            let card = card_rect(Rect::new(0, 0, 1920, 1040), dpi);
+            let (w, h) = (card.width(), card.height());
+            let layout = notice_layout(w, h, dpi);
+            let mut buffer = canvas_buffer(w, h);
+            let mut canvas = Canvas::new(&mut buffer, w, h).expect("Puffer passt");
+            draw_notice_card(&mut canvas, dpi, None);
+            assert_premultiplied(&canvas, "Fallback");
+
+            // Die Glyphe: orange (Rot > Grün > Blau), voll deckend, mitten
+            // im Dreieck unter dem Ausrufezeichen vorbei.
+            let g = layout.glyph;
+            let probe = canvas.pixel(g.left + g.width() / 4 + 1, g.top + g.height() * 3 / 4);
+            let [b, gr, r, a] = probe;
+            assert_eq!(a, 255, "dpi {dpi}: Glyphe nicht deckend: {probe:?}");
+            assert!(
+                r > gr && gr > b,
+                "dpi {dpi}: nicht WAVE_HOT_COLOR: {probe:?}"
+            );
+            // Das Ausrufezeichen in der Kartenfarbe.
+            let mark = canvas.pixel(g.left + g.width() / 2, g.top + g.height() / 2);
+            assert!(mark[2] < 60, "dpi {dpi}: Ausrufezeichen fehlt: {mark:?}");
+
+            // Textzeilen: überall nur die reine Kartenfarbe.
+            let plain = canvas.pixel(w / 2, h / 2);
+            assert_eq!(plain[3], CARD_COLOR.a, "dpi {dpi}");
+            for rect in [layout.title, layout.detail] {
+                for y in rect.top..rect.bottom {
+                    for x in rect.left..rect.right {
+                        assert_eq!(canvas.pixel(x, y), plain, "dpi {dpi}: Text bei {x}/{y}");
+                    }
+                }
+            }
+
+            // Mit Maske (hier: Zeile 1 voll) steht dort etwas anderes.
+            let mut mask = vec![0u8; (w * h) as usize];
+            for y in layout.title.top..layout.title.bottom {
+                for x in layout.title.left..layout.title.right {
+                    mask[(y * w + x) as usize] = 255;
+                }
+            }
+            draw_notice_card(&mut canvas, dpi, Some(&mask));
+            let x = layout.title.left + 1;
+            let y = layout.title.top + 1;
+            assert_eq!(canvas.pixel(x, y)[3], 255, "dpi {dpi}: Text deckt voll");
+            assert_eq!(
+                canvas.pixel(layout.detail.left + 1, layout.detail.top + 1),
+                plain,
+                "dpi {dpi}: Zeile 2 bleibt ohne Maske leer"
+            );
+        }
+    }
+
+    /// Die Warn-Glyphe bleibt in ihrer Fläche und im Puffer — auch am Rand und
+    /// bei entarteten Flächen.
+    #[test]
+    fn the_warning_glyph_stays_inside_its_area() {
+        let (w, h) = (40, 40);
+        let mut buffer = canvas_buffer(w, h);
+        let mut canvas = Canvas::new(&mut buffer, w, h).expect("Puffer passt");
+        let area = Rect::new(8, 8, 32, 32);
+        draw_warning_glyph(&mut canvas, area, WAVE_HOT_COLOR);
+        for y in 0..h {
+            for x in 0..w {
+                let inside = x >= area.left && x < area.right && y >= area.top && y < area.bottom;
+                if !inside {
+                    assert_eq!(canvas.pixel(x, y)[3], 0, "Glyphe malt bei {x}/{y}");
+                }
+            }
+        }
+        assert_premultiplied(&canvas, "Glyphe");
+        draw_warning_glyph(&mut canvas, Rect::new(-30, -30, 5, 5), WAVE_HOT_COLOR);
+        draw_warning_glyph(&mut canvas, Rect::new(10, 10, 10, 30), WAVE_HOT_COLOR);
+        draw_warning_glyph(&mut canvas, Rect::new(35, 35, 90, 90), WAVE_HOT_COLOR);
+        assert_premultiplied(&canvas, "Glyphe am Rand");
     }
 }

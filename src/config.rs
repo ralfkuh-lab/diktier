@@ -24,7 +24,7 @@ model = "parakeet-tdt-0.6b-v3-int8"
 threads = 0             # 0 = Runtime-Default
 
 [output]
-mode = "paste"          # "paste" | "type"
+mode = "paste"          # v1 nur dieser Wert
 paste_shortcut = "auto"
 leading_space = true
 restore_clipboard = true
@@ -36,6 +36,10 @@ show_notifications_on_error = true
 [overlay]
 enabled = true          # Aufnahme-Overlay (§4.5), Windows-only
 "#;
+
+/// Meldung für das frühere `output.mode = "type"` (Plan Leitentscheidung 10).
+const REMOVED_TYPE_MODE: &str =
+    r#"output.mode "type" gibt es nicht mehr — bitte "paste" eintragen oder die Zeile löschen"#;
 
 const HOTKEY_KEYS: &[&str] = &["key", "modifiers", "mode"];
 const AUDIO_KEYS: &[&str] = &["device", "sample_rate", "max_duration_secs"];
@@ -157,7 +161,6 @@ pub struct OutputConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
     Paste,
-    Type,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,12 +464,14 @@ fn validate_and_clamp(raw: RawConfig, warnings: &mut Vec<String>) -> Result<Conf
         )));
     }
 
+    // §7.5/§8 (v1.8): `"type"` wurde bis 0.3.0 gelesen, aber nie ausgewertet —
+    // jetzt Fatal mit eigener Meldung statt stillem Paste.
     let output_mode = match raw.output.mode.as_str() {
         "paste" => OutputMode::Paste,
-        "type" => OutputMode::Type,
+        "type" => return Err(ConfigError::Fatal(REMOVED_TYPE_MODE.into())),
         other => {
             return Err(ConfigError::Fatal(format!(
-                "ungültiges output.mode {other:?}"
+                "ungültiges output.mode {other:?} (v1 nur paste)"
             )));
         }
     };
@@ -816,6 +821,60 @@ mode = "clipboard"
             ConfigError::Fatal(msg) => assert!(msg.contains("output.mode"), "{msg}"),
             other => panic!("expected Fatal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn removed_type_mode_is_fatal_with_migration_hint() {
+        let err = parse_toml(
+            "[output]
+mode = \"type\"
+",
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::Fatal(msg) => assert_eq!(
+                msg,
+                r#"output.mode "type" gibt es nicht mehr — bitte "paste" eintragen oder die Zeile löschen"#
+            ),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paste_mode_is_accepted() {
+        let loaded = parse_toml(
+            "[output]
+mode = \"paste\"
+",
+        )
+        .unwrap();
+        assert_eq!(loaded.config.output.mode, OutputMode::Paste);
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    }
+
+    #[test]
+    fn missing_output_mode_means_paste() {
+        let loaded = parse_toml(
+            "[output]
+leading_space = false
+",
+        )
+        .unwrap();
+        assert_eq!(loaded.config.output.mode, OutputMode::Paste);
+        let loaded = parse_toml("").unwrap();
+        assert_eq!(loaded.config.output.mode, OutputMode::Paste);
+    }
+
+    #[test]
+    fn default_file_documents_the_single_output_mode() {
+        let line = DEFAULT_TOML
+            .lines()
+            .find(|l| l.starts_with("mode = \"paste\""))
+            .expect("output.mode in der Default-Datei");
+        assert!(line.ends_with("# v1 nur dieser Wert"), "{line}");
+        assert!(!DEFAULT_TOML.contains("\"type\""), "{DEFAULT_TOML}");
+        let loaded = parse_toml(DEFAULT_TOML).unwrap();
+        assert_eq!(loaded.config.output.mode, OutputMode::Paste);
     }
 
     #[test]

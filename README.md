@@ -6,7 +6,7 @@ Parakeet (TDT 0.6B v3), kein Cloud-Dienst, kein Konto.
 
 Status: **läuft auf Windows 11** (Hotkey, Tray, Einfügen am Cursor,
 Modell-Download, Autostart, Aufnahme-Overlay mit Mikrofonpegel).
-Aktuelle Version: [v0.3.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.3.0).
+Aktuelle Version: [v0.4.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.4.0).
 Privates Werkzeug, bewusst klein gehalten.
 
 Linux (Mint/X11) war die Ausgangsplattform; der Linux-Code ist inzwischen
@@ -104,8 +104,16 @@ laufenden Daemon, `-SkipInstaller` lässt das Setup weg. Das Exe-Icon kommt aus
    kleine Karte unten am Bildschirm den Mikrofonpegel (siehe
    [Aufnahme-Overlay](#aufnahme-overlay)) — bewegt sich die Wellenform
    beim Sprechen, kommt auch etwas an.
-4. Der Text wird über die Zwischenablage eingefügt; der vorherige
-   Clipboard-Inhalt wird direkt danach wiederhergestellt.
+4. Der Text wird über die Zwischenablage eingefügt. Nach einem bedienten
+   Clipboard-Read und der Mindestwartezeit schreibt Diktier den vorherigen
+   Clipboard-Inhalt zurück (Voreinstellung `restore_clipboard = true`). Der
+   Read ist kein Beweis für erfolgreiches Einfügen — auch ein
+   Clipboard-Manager kann ihn auslösen. Seit 0.4.0 kommen dabei auch
+   Bilder, Dateien und formatierter Text zurück, nicht nur reiner Text. Geht
+   dabei etwas verloren, meldet es eine Hinweiskarte (siehe
+   [Zwischenablage](#zwischenablage)). Im Windows-Verlauf (Win+V) erscheinen
+   weder das Diktat noch die Wiederherstellung, sofern Diktier den
+   Verlaufsausschluss setzen konnte (sonst steht es im Log).
 
 Diktier öffnet beim Diktieren kein Fenster und wechselt den Fokus nie.
 Wechselst du während der Aufnahme das Fenster, wird **nicht** eingefügt —
@@ -169,10 +177,41 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
 
 Änderungen gelten nach einem Neustart von Diktier.
 
+### `output.mode`: nur noch `"paste"` (Breaking Change in 0.4.0)
+
+`output.mode` kennt nur noch den Wert `"paste"`. Das frühere `"type"` wurde
+bis 0.3.0 zwar gelesen, aber nie ausgewertet — Diktier hat trotzdem über die
+Zwischenablage eingefügt. Seit 0.4.0 ist `"type"` ein Konfigurationsfehler:
+Tray `error`, kein Hotkey, keine Aufnahme; Tooltip und Log melden
+
+```
+output.mode "type" gibt es nicht mehr — bitte "paste" eintragen oder die Zeile löschen
+```
+
+Migration: in `config.toml` unter `[output]` `mode = "paste"` eintragen oder
+die Zeile `mode = …` löschen (fehlt sie, gilt `"paste"`), dann Diktier neu
+starten. Configs mit `"paste"` oder ohne den Schlüssel sind nicht betroffen.
+
 ## Wenn etwas nicht klappt
 
 - **Text erscheint nicht, liegt aber in der Zwischenablage.** Fokus hat
   gewechselt, oder das Zielprogramm läuft als Administrator. Strg+V drücken.
+- **Nächstes Diktat wird erst nach ein paar Sekunden eingefügt.** Kommt nach
+  dem Einfügen kein bedienter Clipboard-Read, wartet Diktier bis zu
+  5 Sekunden darauf, bevor es den Text endgültig in die Zwischenablage legt —
+  auch mit `restore_clipboard = false` oder wenn sich nichts sichern ließ.
+  Ein in dieser Zeit fertiges Diktat kommt danach dran, ebenso ein Beenden.
+  Kommt der Read früher, entfällt der Rest der Wartezeit; ein Beweis für
+  erfolgreiches Einfügen ist er nicht.
+- **Tray `error` mit „Zwischenablage leer — Transkript verloren“.** Windows
+  hat das Setzen des Transkripts verweigert, nachdem die Zwischenablage schon
+  geleert war (selten). Das kann auch einige Sekunden nach dem Diktat
+  passieren, wenn ein späterer Versuch scheitert; läuft dann schon das
+  nächste Diktat, steht es nur im Log. Das Diktat ist weg; neu diktieren.
+- **Log-Warnung „Transkript beim Beenden nicht gesichert — Zwischenablage
+  kann leer sein“.** Beim Beenden ließ sich das zuletzt diktierte Transkript
+  nicht endgültig in die Zwischenablage legen (Grund in Klammern). Danach
+  kann sie leer sein.
 - **Nichts wird erkannt.** Mikrofon gemutet (Headset-Taste) oder das
   falsche Gerät aktiv — das Overlay zeigt es sofort: flache Linie trotz
   Sprechens. Genauer nachmessen: Das Log schreibt zu **jeder** Aufnahme
@@ -195,7 +234,8 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
   über den absoluten Schwellen von B3 und B2 sowie die Laufdauern bei
   +10/+12/+15 dB Marge. Aufnahmen zum Nachrechnen liefert
   `--foreground --record-test 10` (Text auf stdout, Gate-Report auf
-  stderr) oder der Daemon mit `DIKTIER_DEBUG_WAV=1`.
+  stderr) oder der Daemon mit `DIKTIER_DEBUG_WAV=1` (siehe
+  [Debug-WAV](#debug-wav)).
 - **Overlay ist weg, obwohl das Log „Overlay sichtbar" meldet.** Windows
   hat das Fenster aus dem Topmost-Band genommen, es liegt unter dem
   Zielfenster. Seit 0.2.1 behauptet Diktier die Position bei jedem
@@ -204,8 +244,130 @@ dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
   Taste eintragen, neu starten. Linksklick im Tray geht immer.
 - **„läuft bereits".** Es läuft schon eine Instanz (Autostart). Der zweite
   Start endet absichtlich mit Exit 0.
+- **`output.mode "type" gibt es nicht mehr`** im Log, Tray `error`: siehe
+  [`output.mode`](#outputmode-nur-noch-paste-breaking-change-in-040).
 - **Log:** `%LOCALAPPDATA%\diktier\diktier.log` (rotiert bei 2 MiB). Dort
-  stehen nie Transkripte oder Clipboard-Inhalte.
+  stehen nie Transkripte oder Clipboard-Inhalte, nur Metadaten wie
+  Format-IDs, Größen und Dauern.
+
+### Zwischenablage
+
+Vor dem Einfügen sichert Diktier den Inhalt der Zwischenablage. Zurück
+schreibt es ihn nur mit `restore_clipboard = true` (Voreinstellung) und erst
+nach einem bedienten Clipboard-Read des Transkripts und der Mindestwartezeit
+(`restore_clipboard_delay_ms`). Der Read ist eine Heuristik, kein Beweis für
+erfolgreiches Einfügen: Auch ein Clipboard-Manager kann ihn auslösen. Kommt
+innerhalb von 5 Sekunden keiner, bleibt das Transkript in der
+Zwischenablage. Gesichert werden seit
+0.4.0 **alle Formate, die Windows auslesen lässt**, Byte für Byte und in der
+ursprünglichen Reihenfolge: reiner und formatierter Text (RTF, HTML), Bilder
+und Screenshots (DIB, PNG, EMF), im Explorer kopierte oder ausgeschnittene
+Dateien samt Kopieren/Verschieben-Kennung und die privaten Formate der
+Anwendungen. Lässt sich davon etwas nicht sichern oder zurückschreiben, ist
+die Wiederherstellung nur teilweise — dann erscheint die Hinweiskarte.
+
+Das Transkript und der wiederhergestellte Inhalt sind vom Windows-Verlauf
+(Win+V) und von der Cloud-Zwischenablage ausgeschlossen, sofern Diktier den
+Ausschluss-Marker setzen konnte: Diktate und Wiederherstellungen erscheinen
+dort dann nicht, das Original steht vom ursprünglichen Kopieren schon drin.
+Gelingt der Marker nicht, steht im Log `Verlauf ausgeschlossen: nein` bzw.
+eine Warnung `Verlaufsausschluss nicht …` — dieses Diktat kann dann im
+Verlauf landen. Für Clipboard-Manager anderer Hersteller (Ditto u. a.) gibt
+es keine Zusage.
+
+Grenzen — das geht auch bei „vollständig“ nicht mit:
+
+- **OLE-Objekte.** Was eine Anwendung als lebendes Objekt anbietet, ist nach
+  dem Zurückschreiben nur noch Daten. Typisch sind kopierte
+  **Outlook-Elemente** (Mails, Termine): Sie kommen nur teilweise oder gar
+  nicht zurück, dann erscheint die Hinweiskarte. „Verknüpfung einfügen“,
+  virtuelle Dateien und Rückmeldungen an die Quelle nach dem Einfügen
+  entfallen ebenfalls; bei im Explorer **ausgeschnittenen** Dateien kann das
+  Verschieben deshalb anders ausgehen als ohne Diktat.
+- **Excels Kopierrahmen.** Die Zellen sind wieder in der Zwischenablage, aber
+  Excel ist nicht mehr ihr Besitzer: Der laufende Rahmen um den kopierten
+  Bereich verschwindet.
+- **Synthetisch ersetzte Bildformate.** `CF_BITMAP`, `CF_PALETTE` und
+  `CF_METAFILEPICT` sichert Diktier nicht selbst; Windows erzeugt sie aus dem
+  gesicherten DIB bzw. EMF neu. Nur wenn eine Quelle darin andere Daten als
+  im DIB/EMF angeboten hat, bekommt die einfügende Anwendung die erzeugte
+  Variante. Das Log nennt die Formate, einen Hinweis gibt es dafür nicht.
+
+**Hinweiskarte.** Ist der vorherige Inhalt ganz oder teilweise weg, zeigt
+die [Overlay-Karte](#aufnahme-overlay) nach dem Einfügen für 3 Sekunden
+einen Hinweis mit Warnzeichen. Auch sie nimmt nie den Fokus.
+
+| Zeile 1 | Zeile 2 | Bedeutung |
+|---|---|---|
+| Zwischenablage nicht gesichert | Vorheriger Inhalt wurde überschrieben | nichts Einfügbares ließ sich sichern |
+| Zwischenablage nicht wiederhergestellt | Vorheriger Inhalt wurde überschrieben | Zurückschreiben gescheitert, das Transkript liegt in der Zwischenablage |
+| Zwischenablage teilweise wiederhergestellt | Nicht alle Formate ließen sich sichern | einzelne Formate schon beim Sichern verloren |
+| Zwischenablage teilweise wiederhergestellt | Nicht alle Formate ließen sich zurückschreiben | einzelne Formate beim Zurückschreiben verloren |
+| Einfügen nicht bestätigt | Text liegt in der Zwischenablage | innerhalb von 5 s kein Clipboard-Read (z. B. Programm als Administrator) |
+| Fokus gewechselt – nicht eingefügt | Text liegt in der Zwischenablage | Fenster während des Diktats gewechselt |
+| Text liegt in der Zwischenablage | Mit Strg+V einfügen | Diktat per Linksklick im Tray |
+
+Kein Hinweis erscheint bei vollständiger Wiederherstellung (auch wenn
+OLE-Verweise entfallen oder Bildformate ersetzt wurden), wenn während des
+Diktats jemand anderes kopiert hat, bei `restore_clipboard = false` und bei
+leerem Transkript. Ist das Overlay abgeschaltet oder ausgefallen, steht der
+Hinweis nur im Log (`Hinweis: …`).
+
+**Nachsehen, was gesichert würde:**
+
+```powershell
+.\diktier.exe --clipboard-check
+```
+
+listet jedes Format der aktuellen Zwischenablage mit ID, Name, Klasse
+(gesichert, synthetisch ersetzt, OLE-Verweis entfällt, Verlust samt Grund)
+und Größe, nie Inhalte. Es ist nur lesend, darf also neben dem laufenden
+Daemon laufen; es kann aber bei der Quelle das verzögerte Erzeugen eines
+Formats anstoßen. Exitcode `0` = alles Auslesbare sicherbar, `3` = Verluste
+oder nichts sicherbar, `1` = Fehler.
+
+```powershell
+.\diktier.exe --clipboard-check --roundtrip
+```
+
+> **Achtung:** `--roundtrip` **überschreibt die Zwischenablage** kurz mit
+> einem Testtext und schreibt dann den gesicherten Inhalt zurück. Er startet
+> nur, wenn Diktier nicht läuft (vorher Tray → Beenden). Danach vergleicht
+> er IDs, Reihenfolge und Bytes. „Byte-identisch“ sagt nichts über
+> OLE-Objekte, virtuelle Dateien oder den Besitzer (Excels Rahmen) — die
+> gehen beim Zurückschreiben wie oben beschrieben verloren. Wer nicht
+> riskieren will, den aktuellen Inhalt zu verlieren, nimmt nur
+> `--clipboard-check`.
+
+### Debug-WAV
+
+Mit der Umgebungsvariable `DIKTIER_DEBUG_WAV=1` speichert der Daemon jede
+Aufnahme als 16-kHz-Mono-WAV:
+
+```
+%TEMP%\diktier\rec_<UTC-Zeit bis Millisekunde>_lauf-<N>.wav
+z. B. rec_2026-09-25T14-47-13-512Z_lauf-703.wav
+```
+
+Die Zeit ist UTC wie im Log, `<N>` ist die Laufnummer aus den Logzeilen
+`Lauf N: …`; jeder Dump steht dort zusätzlich als eine Zeile
+`DIKTIER_DEBUG_WAV: <pfad>`. Ist der Name schon belegt (etwa nach einem
+Neustart mit gleicher Laufnummer), hängt Diktier `-2`, `-3` … an
+(`rec_…_lauf-703-2.wav`); eine vorhandene Datei wird nie überschrieben.
+Diktier behält die **zehn jüngsten** Dateien dieses Musters und löscht
+ältere; liegengebliebene `.part`-Reste eines abgebrochenen Dumps entfernt es
+erst, wenn sie **älter als eine Stunde** sind. Andere Dateien im Ordner fasst
+es nicht an. Die frühere `last_recording.wav` (bis 0.3.0) wird beim ersten
+Dump entfernt.
+
+Einschalten als Benutzervariable, danach Diktier neu starten:
+
+```powershell
+[Environment]::SetEnvironmentVariable("DIKTIER_DEBUG_WAV", "1", "User")
+```
+
+Ausschalten: denselben Befehl mit `$null` statt `"1"`. Die Aufnahmen
+enthalten, was du gesagt hast — nicht weitergeben.
 
 ## Technik in einem Absatz
 

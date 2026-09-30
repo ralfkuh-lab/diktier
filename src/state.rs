@@ -34,6 +34,9 @@ pub const DEFAULT_CAP: Duration = Duration::from_secs(60);
 /// Kürzere Aufnahmen gehen nicht in die Engine (§6.4).
 pub const MIN_CAPTURE: Duration = Duration::from_millis(250);
 
+/// Standzeit der Hinweiskarte im Overlay (§4.5 „Hinweiskarte", v1.8).
+pub const NOTICE_DURATION: Duration = Duration::from_secs(3);
+
 /// Untergrenze des Transcribing-Watchdogs (§5.2 / §18 #5).
 pub const WATCHDOG_MIN: Duration = Duration::from_secs(30);
 
@@ -171,6 +174,10 @@ pub struct Runtime {
     pub cap_deadline: Option<Duration>,
     /// Fällig-Zeitpunkt des Transcribing-Watchdogs, solange transkribiert wird.
     pub watchdog_deadline: Option<Duration>,
+    /// §4.5: Hinweis nach dem Diktat samt Ablaufzeitpunkt auf der Kern-Uhr.
+    /// Gesetzt nur beim `InjectFinished` des aktuellen Laufs, gelöscht bei
+    /// Ablauf, Aufnahmestart, Pause an/aus, Quit, `error` und neuem Lauf.
+    pub notice: Option<(Notice, Duration)>,
 }
 
 impl Default for Runtime {
@@ -186,6 +193,7 @@ impl Default for Runtime {
             cap: DEFAULT_CAP,
             cap_deadline: None,
             watchdog_deadline: None,
+            notice: None,
         }
     }
 }
@@ -269,12 +277,97 @@ pub enum CopyReason {
     FocusUnknown,
 }
 
+/// Hinweiskarte im Overlay nach dem Diktat (§4.5, Tabelle „Hinweiskarte").
+///
+/// Ein Hinweis entsteht nur, wenn der vorherige Inhalt der Zwischenablage ganz
+/// oder teilweise weg ist oder das Transkript nicht eingefügt wurde. Kein
+/// Hinweis bei vollständigem Restore, fremder Änderung, `restore_clipboard =
+/// false` und leerem Transkript; Inject-Fehler bleiben Tray `error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notice {
+    /// `Unrestorable` (§7.1 Punkt 2): kein Restore-Versprechen.
+    ClipboardNotSaved,
+    /// `RestoreFailed`: kein Nutzformat zurückgeschrieben.
+    ClipboardNotRestored,
+    /// `RestoredPartial`, verloren nur beim Sichern.
+    PartialSave,
+    /// `RestoredPartial`, auch beim Zurückschreiben verloren.
+    PartialRestore,
+    /// `NoReadTimeout` (§7.1 Punkt 7).
+    PasteUnconfirmed,
+    /// `CopyOnly` wegen Fokuswechsel oder nicht ermittelbarem Fokus (§7.3).
+    FocusChanged,
+    /// `CopyOnly` auf dem TrayClick-Pfad (§4.3).
+    TrayCopy,
+}
+
+impl Notice {
+    pub const ALL: [Notice; 7] = [
+        Self::ClipboardNotSaved,
+        Self::ClipboardNotRestored,
+        Self::PartialSave,
+        Self::PartialRestore,
+        Self::PasteUnconfirmed,
+        Self::FocusChanged,
+        Self::TrayCopy,
+    ];
+
+    /// §4.3/§7.3: Jeder `copy_only`-Ausgang zeigt einen Hinweis.
+    pub fn for_copy(reason: CopyReason) -> Self {
+        match reason {
+            CopyReason::TrayClickPath => Self::TrayCopy,
+            CopyReason::FocusChanged | CopyReason::FocusUnknown => Self::FocusChanged,
+        }
+    }
+
+    /// Zeile 1 der Karte (§4.5), wörtlich aus der Tabelle.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::ClipboardNotSaved => "Zwischenablage nicht gesichert",
+            Self::ClipboardNotRestored => "Zwischenablage nicht wiederhergestellt",
+            Self::PartialSave | Self::PartialRestore => {
+                "Zwischenablage teilweise wiederhergestellt"
+            }
+            Self::PasteUnconfirmed => "Einfügen nicht bestätigt",
+            Self::FocusChanged => "Fokus gewechselt – nicht eingefügt",
+            Self::TrayCopy => "Text liegt in der Zwischenablage",
+        }
+    }
+
+    /// Zeile 2 der Karte (§4.5), wörtlich aus der Tabelle.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::ClipboardNotSaved | Self::ClipboardNotRestored => {
+                "Vorheriger Inhalt wurde überschrieben"
+            }
+            Self::PartialSave => "Nicht alle Formate ließen sich sichern",
+            Self::PartialRestore => "Nicht alle Formate ließen sich zurückschreiben",
+            Self::PasteUnconfirmed | Self::FocusChanged => "Text liegt in der Zwischenablage",
+            Self::TrayCopy => "Mit Strg+V einfügen",
+        }
+    }
+
+    /// Kurzname des Falls für die Logzeile `Hinweis: <Fall>` (Plan H9).
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::ClipboardNotSaved => "unrestorable",
+            Self::ClipboardNotRestored => "restore-failed",
+            Self::PartialSave => "restored-partial(sichern)",
+            Self::PartialRestore => "restored-partial(zurückschreiben)",
+            Self::PasteUnconfirmed => "no-read-timeout",
+            Self::FocusChanged => "copy-only(fokus)",
+            Self::TrayCopy => "copy-only(tray-click)",
+        }
+    }
+}
+
 /// Ergebnis des Ausgabepfads. Kern-Abstraktion über `inject::InjectOutcome`
 /// plus dem Fehlerfall aus §7.1 („Paste-API-Fehler oder UIPI").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InjectReport {
-    /// Paste am Cursor gelaufen (Restore-Details interessieren den Kern nicht).
-    Pasted,
+    /// Paste am Cursor gelaufen. `notice` leitet der Inject-Worker aus dem
+    /// Restore-Ausgang ab (§4.5); `None` = kein Hinweis.
+    Pasted { notice: Option<Notice> },
     /// Transkript liegt im Clipboard, kein Paste-Key gesendet.
     CopyOnly { reason: CopyReason },
     /// §7.1: Transkript bleibt im Clipboard, Tray `error`, Hotkey bleibt scharf.
@@ -316,6 +409,11 @@ pub enum LogEvent {
     CopyOnlyNotice {
         reason: CopyReason,
     },
+    /// §4.5: Hinweiskarte gesetzt. Auch ohne (funktionsfähiges) Overlay
+    /// bleibt so die Logzeile `Hinweis: <Fall>`.
+    Notice {
+        notice: Notice,
+    },
     /// §10: Fehlerklasse betreten.
     Failure {
         kind: ErrorKind,
@@ -330,6 +428,13 @@ pub enum LogEvent {
     },
     /// Nach `Quit` nimmt der Kern nichts mehr an.
     IgnoredAfterQuit,
+    /// Final-Review Nachkontrolle, Blocker 1: Ein schon abgeschlossener Lauf
+    /// hat sein Transkript nachträglich verloren (Idle-Retry), aber der Kern
+    /// arbeitet gerade (`state`) — kein Wechsel nach `error`, nur diese Zeile.
+    TranscriptLostWhileBusy {
+        run: RunId,
+        state: AppState,
+    },
 }
 
 /// Alles, was von außen in den Kern zeigt. Asynchrone Antworten tragen die
@@ -396,6 +501,15 @@ pub enum Event {
     InjectFinished {
         run: RunId,
         report: InjectReport,
+    },
+    /// Final-Review Nachkontrolle, Blocker 1: Der Idle-Retry des
+    /// Inject-Workers hat das Transkript des schon abgeschlossenen Laufs `run`
+    /// verloren (Zwischenablage leer). Nur aus `idle` geht der Kern nach
+    /// `error` (`ErrorKind::Inject`, Hotkey bleibt scharf); ein inzwischen
+    /// laufender neuer Lauf wird nicht unterbrochen.
+    TranscriptLost {
+        run: RunId,
+        message: String,
     },
     /// Fataler Fehler von außen (Config, Hotkey-Registrierung, Tray) — §8, §4.4, §10.
     FatalError {
@@ -587,6 +701,8 @@ pub fn transition(runtime: &mut Runtime, event: Event) -> Vec<Effect> {
         // ------------------------------------------------------- Pause (§5.2)
         Event::PauseToggle => {
             runtime.paused = !runtime.paused;
+            // §4.5: Pause an **und** aus löscht den Hinweis.
+            runtime.notice = None;
             // Pause **aktivieren** verwirft eine laufende Aufnahme; das Aufheben
             // der Pause lässt eine Tray-Click-Aufnahme laufen.
             if runtime.paused && matches!(runtime.state, AppState::Recording { .. }) {
@@ -680,10 +796,14 @@ pub fn transition(runtime: &mut Runtime, event: Event) -> Vec<Effect> {
         // ----------------------------------------------- Ausgabepfad (§7)
         Event::InjectFinished { run, report } => match runtime.state {
             AppState::Injecting { .. } if run == runtime.run => match report {
-                InjectReport::Pasted => finish_run(runtime),
+                InjectReport::Pasted { notice } => {
+                    finish_run(runtime);
+                    set_notice(runtime, notice, &mut out);
+                }
                 InjectReport::CopyOnly { reason } => {
                     out.push(Effect::Log(LogEvent::CopyOnlyNotice { reason }));
                     finish_run(runtime);
+                    set_notice(runtime, Some(Notice::for_copy(reason)), &mut out);
                 }
                 // §7.1: Transkript bleibt im Clipboard, Tray `error`,
                 // §10: Hotkey bleibt scharf, Retry ist das nächste Diktat.
@@ -692,6 +812,17 @@ pub fn transition(runtime: &mut Runtime, event: Event) -> Vec<Effect> {
                 }
             },
             _ => stale(&mut out, "inject-finished", run, runtime.run),
+        },
+
+        // `finish_run` hat die Laufnummer schon weitergezählt — `run` ist
+        // deshalb nie mehr `runtime.run`; entscheidend ist nur, dass gerade
+        // nichts läuft.
+        Event::TranscriptLost { run, message } => match runtime.state {
+            AppState::Idle => enter_error(runtime, ErrorKind::Inject, message, &mut out),
+            state => out.push(Effect::Log(LogEvent::TranscriptLostWhileBusy {
+                run,
+                state,
+            })),
         },
 
         // ------------------------------------------------ Fehler, Retry, Quit
@@ -704,6 +835,7 @@ pub fn transition(runtime: &mut Runtime, event: Event) -> Vec<Effect> {
             AppState::Error => {
                 runtime.run = runtime.run.next();
                 runtime.error = None;
+                runtime.notice = None;
                 runtime.state = AppState::Starting;
                 out.push(Effect::CheckArtifacts { run: runtime.run });
                 force_tray = true;
@@ -721,6 +853,7 @@ pub fn transition(runtime: &mut Runtime, event: Event) -> Vec<Effect> {
             runtime.run = runtime.run.next();
             runtime.cap_deadline = None;
             runtime.watchdog_deadline = None;
+            runtime.notice = None;
             runtime.quitting = true;
             quit = true;
         }
@@ -728,6 +861,14 @@ pub fn transition(runtime: &mut Runtime, event: Event) -> Vec<Effect> {
         // ------------------------------------------------------ Zeit (§5.2)
         Event::Tick { elapsed } => {
             runtime.now += elapsed;
+            // §4.5: Der Hinweis läuft nach `NOTICE_DURATION` ab — über die
+            // Kern-Uhr, nicht über einen Timer im Overlay.
+            if runtime
+                .notice
+                .is_some_and(|(_, until)| runtime.now >= until)
+            {
+                runtime.notice = None;
+            }
             match runtime.state {
                 AppState::Recording { source } if runtime.due(runtime.cap_deadline) => {
                     stop_recording(runtime, source, &mut out);
@@ -761,6 +902,9 @@ fn stale(out: &mut Vec<Effect>, what: &'static str, got: RunId, current: RunId) 
 fn start_recording(runtime: &mut Runtime, source: RecordingSource, out: &mut Vec<Effect>) {
     runtime.run = runtime.run.next();
     runtime.error = None;
+    // §4.5: Jeder akzeptierte Aufnahmestart (Hotkey wie TrayClick) löscht den
+    // Hinweis — die Pegelkarte ersetzt ihn.
+    runtime.notice = None;
     runtime.state = AppState::Recording { source };
     runtime.cap_deadline = Some(runtime.now + runtime.cap);
     out.push(Effect::StartCapture {
@@ -780,12 +924,24 @@ fn stop_recording(runtime: &mut Runtime, source: RecordingSource, out: &mut Vec<
     });
 }
 
-/// Lauf regulär abgeschlossen: zurück nach `idle`, neue Generation.
+/// Lauf regulär abgeschlossen: zurück nach `idle`, neue Generation. Der neue
+/// Lauf löscht den Hinweis; gesetzt wird er erst danach und nur vom
+/// `InjectFinished` ([`set_notice`]) — ein leeres Transkript setzt nichts.
 fn finish_run(runtime: &mut Runtime) {
     runtime.run = runtime.run.next();
     runtime.cap_deadline = None;
     runtime.watchdog_deadline = None;
+    runtime.notice = None;
     runtime.state = AppState::Idle;
+}
+
+/// §4.5: Hinweis für `NOTICE_DURATION` auf der Kern-Uhr setzen, samt
+/// Logzeile. `None` setzt nichts.
+fn set_notice(runtime: &mut Runtime, notice: Option<Notice>, out: &mut Vec<Effect>) {
+    if let Some(notice) = notice {
+        runtime.notice = Some((notice, runtime.now + NOTICE_DURATION));
+        out.push(Effect::Log(LogEvent::Notice { notice }));
+    }
 }
 
 fn disarm_watchdog(runtime: &mut Runtime, out: &mut Vec<Effect>) {
@@ -831,6 +987,7 @@ fn enter_error(runtime: &mut Runtime, kind: ErrorKind, message: String, out: &mu
     runtime.run = runtime.run.next();
     runtime.cap_deadline = None;
     runtime.watchdog_deadline = None;
+    runtime.notice = None;
     runtime.error = Some(ErrorInfo { kind, message });
     runtime.state = AppState::Error;
 }
@@ -1255,7 +1412,7 @@ mod tests {
                 },
                 Event::InjectFinished {
                     run,
-                    report: InjectReport::Pasted,
+                    report: InjectReport::Pasted { notice: None },
                 },
             ],
         );
@@ -1289,7 +1446,7 @@ mod tests {
             &mut rt,
             Event::InjectFinished {
                 run,
-                report: InjectReport::Pasted,
+                report: InjectReport::Pasted { notice: None },
             },
         ));
         assert_eq!(rt.state, AppState::Idle);
@@ -2042,7 +2199,7 @@ mod tests {
                 },
                 Event::InjectFinished {
                     run,
-                    report: InjectReport::Pasted,
+                    report: InjectReport::Pasted { notice: None },
                 },
             ],
         );
@@ -2184,6 +2341,9 @@ mod tests {
             vec![
                 Effect::Log(LogEvent::CopyOnlyNotice {
                     reason: CopyReason::FocusChanged
+                }),
+                Effect::Log(LogEvent::Notice {
+                    notice: Notice::FocusChanged
                 }),
                 tray(AppState::Idle, false),
             ]
@@ -2722,5 +2882,488 @@ mod tests {
             source: RecordingSource::TrayClick,
         };
         assert!(runtime.paused);
+    }
+
+    // ------------------------------------------ L. Hinweiskarte (§4.5, v1.8)
+
+    /// Läuft bis `injecting(source)` mit nicht leerem Transkript.
+    fn injecting(source: RecordingSource) -> Runtime {
+        let mut rt = transcribing(source, 3_000);
+        let run = rt.run;
+        transition(
+            &mut rt,
+            Event::TranscriptionDone {
+                run,
+                text: "Text".into(),
+            },
+        );
+        rt
+    }
+
+    /// `InjectFinished` des **aktuellen** Laufs.
+    fn finish_inject(rt: &mut Runtime, report: InjectReport) -> Vec<Effect> {
+        let run = rt.run;
+        transition(rt, Event::InjectFinished { run, report })
+    }
+
+    /// Idle mit stehendem Hinweis (Hotkey-Diktat, `NoReadTimeout`).
+    fn idle_with_notice() -> Runtime {
+        let mut rt = injecting(RecordingSource::Hotkey);
+        finish_inject(
+            &mut rt,
+            InjectReport::Pasted {
+                notice: Some(Notice::PasteUnconfirmed),
+            },
+        );
+        assert!(rt.notice.is_some());
+        rt
+    }
+
+    fn tick(rt: &mut Runtime, millis: u64) -> Vec<Effect> {
+        transition(
+            rt,
+            Event::Tick {
+                elapsed: Duration::from_millis(millis),
+            },
+        )
+    }
+
+    /// 71 — Jede Tabellenzeile aus §4.5 erzeugt ihren Hinweis, mit Ablauf
+    /// `now + 3 s` und genau einer Logzeile.
+    #[test]
+    fn every_table_row_sets_its_notice() {
+        use RecordingSource::{Hotkey, TrayClick};
+        let cases = [
+            (
+                Hotkey,
+                InjectReport::Pasted {
+                    notice: Some(Notice::ClipboardNotSaved),
+                },
+                Notice::ClipboardNotSaved,
+            ),
+            (
+                Hotkey,
+                InjectReport::Pasted {
+                    notice: Some(Notice::ClipboardNotRestored),
+                },
+                Notice::ClipboardNotRestored,
+            ),
+            (
+                Hotkey,
+                InjectReport::Pasted {
+                    notice: Some(Notice::PartialSave),
+                },
+                Notice::PartialSave,
+            ),
+            (
+                Hotkey,
+                InjectReport::Pasted {
+                    notice: Some(Notice::PartialRestore),
+                },
+                Notice::PartialRestore,
+            ),
+            (
+                Hotkey,
+                InjectReport::Pasted {
+                    notice: Some(Notice::PasteUnconfirmed),
+                },
+                Notice::PasteUnconfirmed,
+            ),
+            (
+                Hotkey,
+                InjectReport::CopyOnly {
+                    reason: CopyReason::FocusChanged,
+                },
+                Notice::FocusChanged,
+            ),
+            (
+                Hotkey,
+                InjectReport::CopyOnly {
+                    reason: CopyReason::FocusUnknown,
+                },
+                Notice::FocusChanged,
+            ),
+            (
+                TrayClick,
+                InjectReport::CopyOnly {
+                    reason: CopyReason::TrayClickPath,
+                },
+                Notice::TrayCopy,
+            ),
+        ];
+        for (source, report, expected) in cases {
+            let mut rt = injecting(source);
+            rt.now = Duration::from_millis(12_345);
+            let fx = finish_inject(&mut rt, report.clone());
+            assert_eq!(rt.state, AppState::Idle, "{report:?}");
+            assert_eq!(
+                rt.notice,
+                Some((expected, Duration::from_millis(12_345) + NOTICE_DURATION)),
+                "{report:?}"
+            );
+            let logs = fx
+                .iter()
+                .filter(|e| matches!(e, Effect::Log(LogEvent::Notice { .. })))
+                .count();
+            assert_eq!(logs, 1, "{report:?}: genau eine Hinweis-Logzeile");
+            assert!(fx.contains(&Effect::Log(LogEvent::Notice { notice: expected })));
+            assert_eq!(
+                fx.last(),
+                Some(&tray(AppState::Idle, false)),
+                "UpdateTray bleibt der letzte Effekt"
+            );
+        }
+        assert_eq!(NOTICE_DURATION, Duration::from_secs(3));
+    }
+
+    /// 72 — Die Kartentexte stehen wörtlich wie in §4.5.
+    #[test]
+    fn notice_texts_match_the_spec_table() {
+        let table = [
+            (
+                Notice::ClipboardNotSaved,
+                "Zwischenablage nicht gesichert",
+                "Vorheriger Inhalt wurde überschrieben",
+            ),
+            (
+                Notice::ClipboardNotRestored,
+                "Zwischenablage nicht wiederhergestellt",
+                "Vorheriger Inhalt wurde überschrieben",
+            ),
+            (
+                Notice::PartialSave,
+                "Zwischenablage teilweise wiederhergestellt",
+                "Nicht alle Formate ließen sich sichern",
+            ),
+            (
+                Notice::PartialRestore,
+                "Zwischenablage teilweise wiederhergestellt",
+                "Nicht alle Formate ließen sich zurückschreiben",
+            ),
+            (
+                Notice::PasteUnconfirmed,
+                "Einfügen nicht bestätigt",
+                "Text liegt in der Zwischenablage",
+            ),
+            (
+                Notice::FocusChanged,
+                "Fokus gewechselt – nicht eingefügt",
+                "Text liegt in der Zwischenablage",
+            ),
+            (
+                Notice::TrayCopy,
+                "Text liegt in der Zwischenablage",
+                "Mit Strg+V einfügen",
+            ),
+        ];
+        assert_eq!(table.len(), Notice::ALL.len());
+        for (notice, title, detail) in table {
+            assert_eq!(notice.title(), title);
+            assert_eq!(notice.detail(), detail);
+            assert!(!notice.key().is_empty());
+        }
+    }
+
+    /// 73 — Kein Hinweis ohne Hinweispflicht: vollständiger Restore, fremde
+    /// Änderung, `Disabled` (alle als `Pasted { notice: None }`), leeres und
+    /// zu kurzes Transkript, Inject-Fehler.
+    #[test]
+    fn no_notice_without_an_obligation() {
+        let mut rt = injecting(RecordingSource::Hotkey);
+        let fx = finish_inject(&mut rt, InjectReport::Pasted { notice: None });
+        assert_eq!(rt.notice, None);
+        assert_eq!(fx, vec![tray(AppState::Idle, false)]);
+
+        // Leeres Transkript: `finish_run` ohne Inject setzt nichts.
+        for source in [RecordingSource::Hotkey, RecordingSource::TrayClick] {
+            let mut rt = transcribing(source, 3_000);
+            let run = rt.run;
+            transition(
+                &mut rt,
+                Event::TranscriptionDone {
+                    run,
+                    text: "   ".into(),
+                },
+            );
+            assert_eq!(rt.state, AppState::Idle);
+            assert_eq!(rt.notice, None, "{source:?}");
+        }
+
+        // Zu kurze Aufnahme.
+        let mut rt = recording_hotkey();
+        let run = rt.run;
+        feed(
+            &mut rt,
+            vec![
+                Event::HotkeyRelease,
+                Event::AudioReady {
+                    run,
+                    audio: AudioInfo::from_millis(120),
+                },
+            ],
+        );
+        assert_eq!(rt.state, AppState::Idle);
+        assert_eq!(rt.notice, None);
+
+        // Inject-Fehler bleibt Tray `error`, ohne Hinweis.
+        let mut rt = injecting(RecordingSource::Hotkey);
+        let fx = finish_inject(
+            &mut rt,
+            InjectReport::Failed {
+                message: "leer".into(),
+            },
+        );
+        assert_eq!(rt.state, AppState::Error);
+        assert_eq!(rt.notice, None);
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::Log(LogEvent::Notice { .. })))
+        );
+    }
+
+    /// 74 — Nach 3 s läuft der Hinweis per `Tick` ab — ohne Tray-Update.
+    #[test]
+    fn the_notice_expires_after_three_seconds_of_ticks() {
+        let mut rt = idle_with_notice();
+        let fx = tick(&mut rt, 2_999);
+        assert!(rt.notice.is_some(), "vor Ablauf steht er noch");
+        assert!(fx.is_empty(), "{fx:?}");
+        let fx = tick(&mut rt, 1);
+        assert_eq!(rt.notice, None, "genau bei now + 3 s ist er weg");
+        assert!(fx.is_empty(), "kein Tray-Update, kein Log: {fx:?}");
+        assert_eq!(rt.state, AppState::Idle);
+    }
+
+    /// 75 — Ein akzeptierter Hotkey-Press löscht den Hinweis, ein ignorierter
+    /// nicht.
+    #[test]
+    fn a_hotkey_press_clears_the_notice() {
+        let mut rt = idle_with_notice();
+        transition(&mut rt, Event::HotkeyPress);
+        assert_eq!(rt.state, hotkey_rec());
+        assert_eq!(rt.notice, None);
+
+        // Ignorierter Press (pausiert) lässt den Kern unberührt — Pause selbst
+        // hat den Hinweis aber schon gelöscht, deshalb von Hand gesetzt.
+        let mut rt = booted();
+        rt.paused = true;
+        rt.notice = Some((Notice::TrayCopy, rt.now + NOTICE_DURATION));
+        transition(&mut rt, Event::HotkeyPress);
+        assert!(
+            rt.notice.is_some(),
+            "ignorierter Press ist kein Aufnahmestart"
+        );
+    }
+
+    /// 76 — Der TrayClick-Start löscht den Hinweis, auch während der Pause
+    /// (§4.3: Tray-Click bleibt aktiv).
+    #[test]
+    fn a_tray_click_start_clears_the_notice_even_while_paused() {
+        let mut rt = idle_with_notice();
+        transition(&mut rt, Event::TrayClickToggle);
+        assert_eq!(rt.state, tray_rec());
+        assert_eq!(rt.notice, None);
+
+        // Tray-Diktat während der Pause: der Hinweis entsteht pausiert …
+        let mut rt = booted();
+        transition(&mut rt, Event::PauseToggle);
+        let run = {
+            transition(&mut rt, Event::TrayClickToggle);
+            rt.run
+        };
+        feed(
+            &mut rt,
+            vec![
+                Event::TrayClickToggle,
+                Event::AudioReady {
+                    run,
+                    audio: AudioInfo::from_millis(3_000),
+                },
+                Event::TranscriptionDone {
+                    run,
+                    text: "Klick".into(),
+                },
+                Event::InjectFinished {
+                    run,
+                    report: InjectReport::CopyOnly {
+                        reason: CopyReason::TrayClickPath,
+                    },
+                },
+            ],
+        );
+        assert!(rt.paused);
+        assert_eq!(rt.notice.map(|(n, _)| n), Some(Notice::TrayCopy));
+        // … und der nächste Tray-Start löscht ihn.
+        transition(&mut rt, Event::TrayClickToggle);
+        assert_eq!(rt.state, tray_rec());
+        assert_eq!(rt.notice, None);
+    }
+
+    /// 77 — Pause an **und** aus löscht den Hinweis.
+    #[test]
+    fn pause_toggle_clears_the_notice_in_both_directions() {
+        let mut rt = idle_with_notice();
+        transition(&mut rt, Event::PauseToggle);
+        assert!(rt.paused);
+        assert_eq!(rt.notice, None, "Pause an");
+
+        rt.notice = Some((Notice::TrayCopy, rt.now + NOTICE_DURATION));
+        transition(&mut rt, Event::PauseToggle);
+        assert!(!rt.paused);
+        assert_eq!(rt.notice, None, "Pause aus");
+    }
+
+    /// 78 — Quit und `error` löschen den Hinweis.
+    #[test]
+    fn quit_and_error_clear_the_notice() {
+        let mut rt = idle_with_notice();
+        transition(&mut rt, Event::QuitRequested);
+        assert!(rt.quitting);
+        assert_eq!(rt.notice, None);
+
+        let mut rt = idle_with_notice();
+        transition(
+            &mut rt,
+            Event::FatalError {
+                kind: ErrorKind::HotkeyRegistration,
+                message: "F9 belegt".into(),
+            },
+        );
+        assert_eq!(rt.state, AppState::Error);
+        assert_eq!(rt.notice, None);
+    }
+
+    /// 79 — Jeder neue Lauf löscht den Hinweis: auch der nächste Lauf, der
+    /// selbst keinen setzt, erbt ihn nicht.
+    #[test]
+    fn a_new_run_never_inherits_the_notice() {
+        let mut rt = idle_with_notice();
+        feed(&mut rt, vec![Event::HotkeyPress]);
+        let run = rt.run;
+        feed(
+            &mut rt,
+            vec![
+                Event::HotkeyRelease,
+                Event::AudioReady {
+                    run,
+                    audio: AudioInfo::from_millis(3_000),
+                },
+                Event::TranscriptionDone {
+                    run,
+                    text: "Text".into(),
+                },
+                Event::InjectFinished {
+                    run,
+                    report: InjectReport::Pasted { notice: None },
+                },
+            ],
+        );
+        assert_eq!(rt.state, AppState::Idle);
+        assert_eq!(rt.notice, None);
+    }
+
+    /// 80 — Ein verspätetes `InjectFinished` eines alten Laufs setzt keinen
+    /// Hinweis (§5.2: Antworten verworfener Läufe wirken nicht).
+    #[test]
+    fn a_stale_inject_finished_sets_no_notice() {
+        let mut rt = injecting(RecordingSource::Hotkey);
+        let old = rt.run;
+        finish_inject(&mut rt, InjectReport::Pasted { notice: None });
+        let fx = transition(
+            &mut rt,
+            Event::InjectFinished {
+                run: old,
+                report: InjectReport::Pasted {
+                    notice: Some(Notice::ClipboardNotSaved),
+                },
+            },
+        );
+        assert_eq!(rt.notice, None);
+        assert_eq!(
+            fx,
+            vec![Effect::Log(LogEvent::StaleRun {
+                what: "inject-finished",
+                got: old,
+                current: rt.run,
+            })]
+        );
+
+        // Dasselbe mitten in der nächsten Aufnahme: die Karte gehört ihr.
+        let mut rt = injecting(RecordingSource::Hotkey);
+        let old = rt.run;
+        finish_inject(&mut rt, InjectReport::Pasted { notice: None });
+        transition(&mut rt, Event::HotkeyPress);
+        transition(
+            &mut rt,
+            Event::InjectFinished {
+                run: old,
+                report: InjectReport::CopyOnly {
+                    reason: CopyReason::FocusChanged,
+                },
+            },
+        );
+        assert_eq!(rt.state, hotkey_rec());
+        assert_eq!(rt.notice, None);
+    }
+
+    // ------------------------ Final-Review Nachkontrolle: TranscriptLost
+
+    fn lost(run: RunId) -> Event {
+        Event::TranscriptLost {
+            run,
+            message: "Zwischenablage leer — Transkript verloren (SetClipboardData)".into(),
+        }
+    }
+
+    /// Blocker 1: aus `idle` nach `error` (Inject), Hotkey bleibt scharf,
+    /// die Meldung steht im Tray.
+    #[test]
+    fn transcript_lost_while_idle_enters_inject_error() {
+        let mut rt = booted();
+        let old = RunId(rt.run.0.saturating_sub(1));
+        let fx = transition(&mut rt, lost(old));
+        assert_eq!(rt.state, AppState::Error);
+        let error = rt.error.clone().expect("Fehler gesetzt");
+        assert_eq!(error.kind, ErrorKind::Inject);
+        assert!(
+            error
+                .message
+                .starts_with("Zwischenablage leer — Transkript verloren"),
+            "{error:?}"
+        );
+        assert!(rt.hotkey_armed(), "§10: Hotkey bleibt an");
+        assert_eq!(
+            fx,
+            vec![
+                Effect::Log(LogEvent::Failure {
+                    kind: ErrorKind::Inject
+                }),
+                tray(AppState::Error, false),
+            ]
+        );
+        // Das nächste Diktat läuft normal an.
+        transition(&mut rt, Event::HotkeyPress);
+        assert_eq!(rt.state, hotkey_rec());
+    }
+
+    /// Blocker 1: Läuft schon ein neuer Lauf, wird er nicht unterbrochen —
+    /// nur eine Logzeile.
+    #[test]
+    fn transcript_lost_while_recording_only_logs() {
+        let mut rt = booted();
+        let old = RunId(rt.run.0.saturating_sub(1));
+        transition(&mut rt, Event::HotkeyPress);
+        let current = rt.run;
+        let fx = transition(&mut rt, lost(old));
+        assert_eq!(rt.state, hotkey_rec());
+        assert_eq!(rt.run, current);
+        assert_eq!(rt.error, None);
+        assert_eq!(
+            fx,
+            vec![Effect::Log(LogEvent::TranscriptLostWhileBusy {
+                run: old,
+                state: hotkey_rec(),
+            })]
+        );
     }
 }

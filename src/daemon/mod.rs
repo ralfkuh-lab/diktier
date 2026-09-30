@@ -36,11 +36,10 @@ use crate::download::{self, ArtifactManifest, load_manifest};
 use crate::hotkey::HotkeySpec;
 #[cfg(windows)]
 use crate::hotkey_dialog::{self, DialogOutcome};
-use crate::inject::ClipboardSave;
 use crate::paths;
 use crate::single_instance::{self, InstanceAcquire};
 use crate::state::{
-    AppState, AudioInfo, CopyReason, ErrorInfo, ErrorKind, Event, LogEvent, RunId, Runtime,
+    AppState, AudioInfo, CopyReason, ErrorInfo, ErrorKind, Event, LogEvent, Notice, RunId, Runtime,
 };
 use crate::tray;
 
@@ -328,7 +327,7 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
         #[cfg(windows)]
         overlay,
         #[cfg(windows)]
-        overlay_shown: false,
+        overlay_shown: OverlayView::Hidden,
         hotkey,
         hotkey_grabbed: true,
         #[cfg(windows)]
@@ -366,7 +365,7 @@ struct Daemon {
     overlay: Option<OverlayWorker>,
     /// Was das Overlay zuletzt zeigen sollte (nur bei Wechsel senden).
     #[cfg(windows)]
-    overlay_shown: bool,
+    overlay_shown: OverlayView,
     hotkey: HotkeyWorker,
     /// §4.4: Hält der Hotkey-Worker die Taste gerade gegriffen?
     hotkey_grabbed: bool,
@@ -411,23 +410,53 @@ enum AudioIntent {
     Released,
 }
 
-/// §4.5: Steht die Overlay-Karte in diesem Zustand?
+/// §4.5: Was die Overlay-Karte zeigt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum OverlayView {
+    Hidden,
+    /// Mikrofonpegel (Waveform + Meter).
+    Level,
+    /// Hinweiskarte nach dem Diktat.
+    Notice(Notice),
+}
+
+/// §4.5: Welche Ansicht verlangt der Kernzustand? Feste Priorität:
+///
+/// 1. `quitting` → verborgen
+/// 2. `error` → verborgen
+/// 3. `recording`/`transcribing`/`injecting` → Pegel — **auch pausiert**:
+///    Eine Tray-Click-Aufnahme läuft während der Pause weiter (§4.3), und
+///    §4.5 verspricht den Pegel für die ganze Aufnahme.
+/// 4. `idle` mit Hinweis → Hinweis — **auch pausiert**: Pause an/aus löscht
+///    einen alten Hinweis ohnehin (Kern), ein neuer entsteht in der Pause nur
+///    aus einem Tray-Diktat, und dessen „Mit Strg+V einfügen" soll man sehen.
+/// 5. sonst verborgen
 ///
 /// **Inklusive `Injecting`** (Sol Major 5): Der Vertrag ist „sichtbar bis
 /// `idle`" — nach der Inferenz läuft noch der Paste-/copy_only-Pfad, der
-/// Sekunden dauern kann. Verschwände die Karte schon mit dem Ergebnis, wäre
-/// das Feedback vor dem Ende weg.
+/// Sekunden dauern kann. Danach übernimmt ohne Lücke der Hinweis.
 ///
 /// Weil der Abgleich **zustands**- und nicht ereignisgetrieben ist (Design
-/// „agy B5"), deckt er Release, Tray-Klick, 60-s-Cap, Pause-Discard und
-/// FatalError von selbst ab. `QuitRequested` läuft bewusst **nicht** hierüber
-/// (es lässt den Zustand unverändert), sondern über den Worker-Shutdown.
+/// „agy B5"), deckt er Release, Tray-Klick, 60-s-Cap, Pause-Discard,
+/// FatalError und den Ablauf des Hinweises von selbst ab. Der Quit räumt die
+/// Karte zusätzlich über den Worker-Shutdown ab.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn overlay_visible(runtime: &Runtime) -> bool {
-    matches!(
-        runtime.state,
-        AppState::Recording { .. } | AppState::Transcribing { .. } | AppState::Injecting { .. }
-    )
+fn overlay_view(runtime: &Runtime) -> OverlayView {
+    if runtime.quitting {
+        return OverlayView::Hidden;
+    }
+    match runtime.state {
+        AppState::Error => OverlayView::Hidden,
+        AppState::Recording { .. } | AppState::Transcribing { .. } | AppState::Injecting { .. } => {
+            OverlayView::Level
+        }
+        AppState::Idle => match runtime.notice {
+            Some((notice, _)) => OverlayView::Notice(notice),
+            None => OverlayView::Hidden,
+        },
+        AppState::Starting | AppState::Downloading | AppState::Loading => OverlayView::Hidden,
+    }
 }
 
 /// Was soll mit dem Aufnahmegerät geschehen? `None` = nicht anfassen
@@ -468,13 +497,13 @@ impl Daemon {
 
         // §4.5: Die Karte hängt am Kernzustand — genau wie Tray und Gerät.
         // Gesendet wird nur bei einem Wechsel; der Worker koalesziert
-        // zusätzlich auf den letzten Wunsch einer Runde.
+        // zusätzlich auf die letzte Ansicht einer Runde.
         #[cfg(windows)]
         if let Some(overlay) = &self.overlay {
-            let visible = overlay_visible(runtime);
-            if self.overlay_shown != visible {
-                overlay.set_visible(visible);
-                self.overlay_shown = visible;
+            let view = overlay_view(runtime);
+            if self.overlay_shown != view {
+                overlay.set_view(view);
+                self.overlay_shown = view;
             }
         }
 
@@ -635,15 +664,16 @@ impl Daemon {
         // Ohne diesen Schritt stirbt ein noch offenes Delayed-Rendering-
         // Versprechen mit dem Prozess und der Clipboard-Inhalt wäre weg
         // (`inject::windows::save_to_clipboard_manager` rendert eager).
+        // Final-Review Blocker 2: Jeder nicht gesicherte oder ungeklärte
+        // Ausgang (Timeout, Fehler, fremd überschriebenes Versprechen) ist
+        // eine Warnung, `NotOwner` ohne offenes Versprechen bleibt Info.
         let budget = remaining(deadline).min(SAVE_TARGETS_TIMEOUT);
         if !budget.is_zero() {
-            match self.inject.save_targets(budget) {
-                ClipboardSave::Saved => self
-                    .log
-                    .info("Clipboard an den Clipboard-Manager übergeben"),
-                other => self
-                    .log
-                    .info(format!("Clipboard beim Beenden: {}", other.as_str())),
+            let (warn, line) = workers::quit_save_log(&self.inject.save_targets(budget));
+            if warn {
+                self.log.warn(line);
+            } else {
+                self.log.info(line);
             }
         }
 
@@ -1063,43 +1093,263 @@ mod tests {
         }
     }
 
-    /// §4.5: Die Karte steht in `recording`, `transcribing` **und**
-    /// `injecting` — und sonst nirgends. Geprüft über **alle**
-    /// `AppState`-Varianten, damit ein neuer Zustand hier auffällt.
+    /// Die Prioritätsliste aus §4.5 als Erwartung, unabhängig vom Code
+    /// formuliert: `quitting` → `error` → aktive Zustände → Hinweis in
+    /// `idle` → verborgen. `paused` spielt keine Rolle.
+    fn expected_view(
+        state: AppState,
+        notice: Option<Notice>,
+        _paused: bool,
+        quitting: bool,
+    ) -> OverlayView {
+        let active = matches!(
+            state,
+            AppState::Recording { .. } | AppState::Transcribing { .. } | AppState::Injecting { .. }
+        );
+        if quitting || state == AppState::Error {
+            OverlayView::Hidden
+        } else if active {
+            OverlayView::Level
+        } else if let (AppState::Idle, Some(notice)) = (state, notice) {
+            OverlayView::Notice(notice)
+        } else {
+            OverlayView::Hidden
+        }
+    }
+
+    /// §4.5: `overlay_view` über **alle** `AppState`-Varianten × Hinweis ×
+    /// paused × quitting — damit ein neuer Zustand hier auffällt.
     #[test]
-    fn the_overlay_is_visible_from_recording_until_idle() {
+    fn the_overlay_view_follows_the_priority_list() {
         use crate::state::RecordingSource::{Hotkey, TrayClick};
 
-        for source in [Hotkey, TrayClick] {
-            for state in [
-                AppState::Recording { source },
-                AppState::Transcribing { source },
-                AppState::Injecting { source },
-            ] {
-                assert!(
-                    overlay_visible(&runtime_in(state, false)),
-                    "{state:?} muss die Karte zeigen"
-                );
-                // Der Pausezustand ändert daran nichts: eine laufende
-                // Aufnahme wird davon nicht unsichtbar.
-                assert!(overlay_visible(&runtime_in(state, true)));
-            }
-        }
-
-        for state in [
+        let mut states = vec![
             AppState::Starting,
             AppState::Downloading,
             AppState::Loading,
             AppState::Idle,
             AppState::Error,
-        ] {
-            for paused in [false, true] {
-                assert!(
-                    !overlay_visible(&runtime_in(state, paused)),
-                    "{state:?} darf keine Karte zeigen"
-                );
+        ];
+        for source in [Hotkey, TrayClick] {
+            states.push(AppState::Recording { source });
+            states.push(AppState::Transcribing { source });
+            states.push(AppState::Injecting { source });
+        }
+        let notices = std::iter::once(None).chain(Notice::ALL.into_iter().map(Some));
+
+        let mut checked = 0;
+        for notice in notices {
+            for &state in &states {
+                for paused in [false, true] {
+                    for quitting in [false, true] {
+                        let runtime = Runtime {
+                            quitting,
+                            notice: notice.map(|n| (n, Duration::from_secs(3))),
+                            ..runtime_in(state, paused)
+                        };
+                        assert_eq!(
+                            overlay_view(&runtime),
+                            expected_view(state, notice, paused, quitting),
+                            "{state:?}, Hinweis {notice:?}, paused {paused}, quitting {quitting}"
+                        );
+                        checked += 1;
+                    }
+                }
             }
         }
+        assert_eq!(checked, 8 * 11 * 2 * 2);
+
+        // Die Eckpunkte ausdrücklich: die Aufnahme zeigt den Pegel, auch
+        // pausiert (Tray-Click-Aufnahme, §4.3) und auch mit altem Hinweis;
+        // `idle` zeigt den Hinweis auch pausiert.
+        let recording = AppState::Recording { source: TrayClick };
+        assert_eq!(
+            overlay_view(&runtime_in(recording, true)),
+            OverlayView::Level
+        );
+        let with_notice = |state, paused| Runtime {
+            notice: Some((Notice::TrayCopy, Duration::from_secs(3))),
+            ..runtime_in(state, paused)
+        };
+        assert_eq!(
+            overlay_view(&with_notice(AppState::Idle, false)),
+            OverlayView::Notice(Notice::TrayCopy)
+        );
+        assert_eq!(
+            overlay_view(&with_notice(AppState::Idle, true)),
+            OverlayView::Notice(Notice::TrayCopy)
+        );
+        assert_eq!(
+            overlay_view(&with_notice(AppState::Error, false)),
+            OverlayView::Hidden
+        );
+        assert_eq!(
+            overlay_view(&runtime_in(AppState::Idle, false)),
+            OverlayView::Hidden
+        );
+    }
+
+    /// §4.5 über den echten Kern: Pegel bis `idle`, dann ohne Lücke der
+    /// Hinweis, nach 3 s verborgen — und ein neuer Press holt den Pegel
+    /// zurück, ohne dazwischen zu verbergen.
+    #[test]
+    fn the_core_drives_level_then_notice_then_hidden() {
+        use crate::state::{AudioInfo, Event, InjectReport, NOTICE_DURATION, RunId, transition};
+
+        let mut rt = Runtime::default();
+        for event in [
+            Event::Startup,
+            Event::ArtifactsChecked {
+                run: RunId(0),
+                complete: true,
+            },
+            Event::ModelLoaded { run: RunId(0) },
+        ] {
+            transition(&mut rt, event);
+        }
+        let mut views = vec![overlay_view(&rt)];
+        let mut step = |rt: &mut Runtime, event: Event| {
+            transition(rt, event);
+            let view = overlay_view(rt);
+            if views.last() != Some(&view) {
+                views.push(view);
+            }
+        };
+        step(&mut rt, Event::HotkeyPress);
+        let run = rt.run;
+        step(&mut rt, Event::HotkeyRelease);
+        step(
+            &mut rt,
+            Event::AudioReady {
+                run,
+                audio: AudioInfo::from_millis(2_000),
+            },
+        );
+        step(
+            &mut rt,
+            Event::TranscriptionDone {
+                run,
+                text: "Text".into(),
+            },
+        );
+        step(
+            &mut rt,
+            Event::InjectFinished {
+                run,
+                report: InjectReport::Pasted {
+                    notice: Some(Notice::PartialSave),
+                },
+            },
+        );
+        step(&mut rt, Event::HotkeyPress);
+        let run = rt.run;
+        step(&mut rt, Event::HotkeyRelease);
+        step(
+            &mut rt,
+            Event::AudioReady {
+                run,
+                audio: AudioInfo::from_millis(2_000),
+            },
+        );
+        step(
+            &mut rt,
+            Event::TranscriptionDone {
+                run,
+                text: "Text".into(),
+            },
+        );
+        step(
+            &mut rt,
+            Event::InjectFinished {
+                run,
+                report: InjectReport::CopyOnly {
+                    reason: crate::state::CopyReason::FocusChanged,
+                },
+            },
+        );
+        step(
+            &mut rt,
+            Event::Tick {
+                elapsed: NOTICE_DURATION,
+            },
+        );
+        assert_eq!(
+            views,
+            vec![
+                OverlayView::Hidden,
+                OverlayView::Level,
+                OverlayView::Notice(Notice::PartialSave),
+                OverlayView::Level,
+                OverlayView::Notice(Notice::FocusChanged),
+                OverlayView::Hidden,
+            ]
+        );
+    }
+
+    /// §4.3/§4.5: Ein Tray-Diktat während der Pause zeigt erst den Pegel und
+    /// danach den Hinweis „Mit Strg+V einfügen" — die Pause verbirgt ihn nicht.
+    /// Pause aus löscht ihn wieder.
+    #[test]
+    fn a_tray_dictation_while_paused_shows_its_notice() {
+        use crate::state::{
+            AudioInfo, CopyReason, Event, InjectReport, RecordingSource, RunId, transition,
+        };
+
+        let mut rt = Runtime::default();
+        for event in [
+            Event::Startup,
+            Event::ArtifactsChecked {
+                run: RunId(0),
+                complete: true,
+            },
+            Event::ModelLoaded { run: RunId(0) },
+            Event::PauseToggle,
+        ] {
+            transition(&mut rt, event);
+        }
+        assert!(rt.paused);
+        assert_eq!(overlay_view(&rt), OverlayView::Hidden);
+
+        transition(&mut rt, Event::TrayClickToggle);
+        assert_eq!(
+            rt.state,
+            AppState::Recording {
+                source: RecordingSource::TrayClick
+            }
+        );
+        assert_eq!(overlay_view(&rt), OverlayView::Level);
+        let run = rt.run;
+        transition(&mut rt, Event::TrayClickToggle);
+        transition(
+            &mut rt,
+            Event::AudioReady {
+                run,
+                audio: AudioInfo::from_millis(2_000),
+            },
+        );
+        transition(
+            &mut rt,
+            Event::TranscriptionDone {
+                run,
+                text: "Text".into(),
+            },
+        );
+        transition(
+            &mut rt,
+            Event::InjectFinished {
+                run,
+                report: InjectReport::CopyOnly {
+                    reason: CopyReason::TrayClickPath,
+                },
+            },
+        );
+        assert!(rt.paused);
+        assert_eq!(rt.state, AppState::Idle);
+        assert_eq!(overlay_view(&rt), OverlayView::Notice(Notice::TrayCopy));
+
+        transition(&mut rt, Event::PauseToggle);
+        assert!(!rt.paused);
+        assert_eq!(overlay_view(&rt), OverlayView::Hidden);
     }
 
     /// agy B5: Der Gerätezustand hängt am Kernzustand, nicht am Tray-Effekt.

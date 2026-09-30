@@ -36,10 +36,13 @@ use windows_sys::Win32::Foundation::{
     WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetMonitorInfoW,
-    HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
-    MONITORINFO, MonitorFromPoint, MonitorFromWindow, SelectObject,
+    AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+    BLENDFUNCTION, CLIP_DEFAULT_PRECIS, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, FF_SWISS, FW_NORMAL, FW_SEMIBOLD,
+    GdiFlush, GetMonitorInfoW, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, OUT_DEFAULT_PRECIS,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::{
@@ -55,7 +58,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-use super::{Canvas, OverlayState, Rect, card_rect, draw_card, history_capacity};
+use super::{
+    Canvas, NOTICE_DETAIL_LEVEL, NOTICE_DETAIL_PX, NOTICE_TITLE_PX, OverlayState, Rect, card_rect,
+    draw_card, draw_notice_card, history_capacity, notice_layout, scale,
+};
 
 /// Fensterklasse. Prozessweit eindeutig, wie `DiktierTrayOwner` und
 /// `DiktierHotkeyDialog`.
@@ -403,7 +409,230 @@ impl Drop for Surface {
     }
 }
 
+// ------------------------------------------------------------ Hinweistext
+
+/// Schrift der Hinweiskarte. Zeile 1 halbfett: GDI führt „Segoe UI
+/// Semibold" als eigene Familie, mit `FW_SEMIBOLD` trifft der Mapper genau
+/// diese Datei statt einen künstlichen Fettdruck zu rechnen.
+const TITLE_FACE: &str = "Segoe UI Semibold";
+const DETAIL_FACE: &str = "Segoe UI";
+
+/// `CLR_INVALID` aus `wingdi.h` — Fehlerwert von `SetTextColor`. Dieselbe
+/// Begründung wie bei [`HGDI_ERROR`].
+const CLR_INVALID: u32 = 0xFFFF_FFFF;
+
+/// Eigenes GDI-Font-Handle, freigegeben im `Drop`.
+struct Font(HFONT);
+
+impl Font {
+    /// `px` ist die Zeichenhöhe in Geräte-Pixeln (negativer `cHeight`, also
+    /// ohne Zeilenabstand) — die DPI-Skalierung ist schon eingerechnet.
+    fn new(face: &str, px: i32, weight: u32) -> Result<Self, OverlayError> {
+        let face = wide(face);
+        // SAFETY: `face` ist ein lebender, NUL-terminierter UTF-16-Puffer; alle
+        // anderen Parameter sind Werte. `ANTIALIASED_QUALITY` heißt Graustufen
+        // ohne ClearType — die Luminanz wird unten zur Deckungsmaske.
+        let font = unsafe {
+            CreateFontW(
+                -px.max(1),
+                0,
+                0,
+                0,
+                weight as i32,
+                0,
+                0,
+                0,
+                u32::from(DEFAULT_CHARSET),
+                u32::from(OUT_DEFAULT_PRECIS),
+                u32::from(CLIP_DEFAULT_PRECIS),
+                u32::from(ANTIALIASED_QUALITY),
+                u32::from(DEFAULT_PITCH | FF_SWISS),
+                face.as_ptr(),
+            )
+        };
+        if font.is_null() {
+            return Err(failed(format!(
+                "Schrift nicht erzeugbar: Win32-Fehler {}",
+                last_error()
+            )));
+        }
+        Ok(Self(font))
+    }
+}
+
+impl Drop for Font {
+    fn drop(&mut self) {
+        // SAFETY: eigenes GDI-Objekt; `FontSelection` hat es vorher aus dem
+        // DC genommen (sie wird vor den Fonts abgebaut).
+        let deleted = unsafe { DeleteObject(self.0) };
+        debug_assert!(deleted != 0, "Overlay: Schrift nicht freigegeben");
+    }
+}
+
+/// Merkt sich den Font, der vor unserem im DC stand, und selektiert ihn im
+/// `Drop` zurück — auf **jedem** Pfad, auch nach einem frühen Fehler. Sonst
+/// scheiterte das `DeleteObject` der eigenen Schrift.
+struct FontSelection {
+    dc: HDC,
+    previous: Option<HGDIOBJ>,
+}
+
+impl FontSelection {
+    fn select(&mut self, font: &Font) -> Result<(), OverlayError> {
+        // SAFETY: eigener Memory-DC dieses Threads, eigenes Font-Handle.
+        let previous = unsafe { SelectObject(self.dc, font.0) };
+        if previous.is_null() || previous as isize == HGDI_ERROR {
+            return Err(failed(format!(
+                "Schrift nicht selektierbar: Win32-Fehler {}",
+                last_error()
+            )));
+        }
+        // Nur der **erste** Vorgänger ist der Default-Font des DC.
+        self.previous.get_or_insert(previous);
+        Ok(())
+    }
+}
+
+impl Drop for FontSelection {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            // SAFETY: eigener DC; `previous` stammt aus `SelectObject` auf ihm.
+            unsafe { SelectObject(self.dc, previous) };
+        }
+    }
+}
+
+/// Eine Zeile per `DrawTextW` in den DC: einzeilig, feste Rechteckbreite,
+/// Ellipse am Ende, kein `&`-Präfix.
+fn draw_text_line(
+    selection: &mut FontSelection,
+    font: &Font,
+    text: &str,
+    rect: Rect,
+    gray: u8,
+) -> Result<(), OverlayError> {
+    if rect.is_empty() {
+        return Ok(());
+    }
+    selection.select(font)?;
+    let color = u32::from(gray) * 0x0001_0101;
+    // SAFETY: eigener DC dieses Threads, `color` ist ein `COLORREF`-Wert.
+    if unsafe { SetTextColor(selection.dc, color) } == CLR_INVALID {
+        return Err(failed(format!(
+            "Textfarbe nicht setzbar: Win32-Fehler {}",
+            last_error()
+        )));
+    }
+    let text: Vec<u16> = text.encode_utf16().collect();
+    let mut raw = RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    // SAFETY: `text` lebt über den Aufruf und wird mit Länge übergeben (ohne
+    // NUL, kein `DT_MODIFYSTRING` → GDI schreibt nicht hinein); `raw` ist ein
+    // gültiger `RECT`.
+    let drawn = unsafe {
+        DrawTextW(
+            selection.dc,
+            text.as_ptr(),
+            text.len() as i32,
+            &mut raw,
+            DT_SINGLELINE | DT_END_ELLIPSIS | DT_LEFT | DT_VCENTER | DT_NOPREFIX,
+        )
+    };
+    if drawn == 0 {
+        return Err(failed(format!(
+            "DrawTextW fehlgeschlagen: Win32-Fehler {}",
+            last_error()
+        )));
+    }
+    Ok(())
+}
+
+/// Rastert beide Hinweiszeilen per GDI und liefert die Deckungsmaske der
+/// Karte: ein Byte je Pixel, `width × height`, top-down.
+///
+/// Eigenes Top-down-32-bpp-DIB, **schwarz initialisiert**; GDI schreibt Zeile 1
+/// weiß (Segoe UI Semibold), Zeile 2 in `NOTICE_DETAIL_LEVEL`-Grau, beide mit
+/// `ANTIALIASED_QUALITY` (Graustufen, kein ClearType) und DPI-skalierter
+/// Größe. Die Luminanz ist die Deckung. Das Layout-DIB des Fensters wird dabei
+/// nicht angefasst, und ein Fenster braucht es nicht — deshalb auch ohne
+/// Overlay testbar.
+pub fn render_notice_text(
+    width: i32,
+    height: i32,
+    dpi: u32,
+    title: &str,
+    detail: &str,
+) -> Result<Vec<u8>, OverlayError> {
+    let mut surface = Surface::new(width, height)?;
+    surface.pixels().fill(0);
+    let layout = notice_layout(width, height, dpi);
+    let title_font = Font::new(TITLE_FACE, scale(NOTICE_TITLE_PX, dpi), FW_SEMIBOLD)?;
+    let detail_font = Font::new(DETAIL_FACE, scale(NOTICE_DETAIL_PX, dpi), FW_NORMAL)?;
+    {
+        // Nach den Fonts angelegt → vor ihnen abgebaut (Drop in umgekehrter
+        // Reihenfolge): erst zurückselektieren, dann löschen.
+        let mut selection = FontSelection {
+            dc: surface.dc,
+            previous: None,
+        };
+        // SAFETY: eigener DC; `TRANSPARENT` lässt den schwarzen Grund stehen.
+        if unsafe { SetBkMode(selection.dc, TRANSPARENT as i32) } == 0 {
+            return Err(failed(format!(
+                "Hintergrundmodus nicht setzbar: Win32-Fehler {}",
+                last_error()
+            )));
+        }
+        draw_text_line(&mut selection, &title_font, title, layout.title, 255)?;
+        draw_text_line(
+            &mut selection,
+            &detail_font,
+            detail,
+            layout.detail,
+            NOTICE_DETAIL_LEVEL,
+        )?;
+    }
+    // GDI puffert Zeichenaufrufe; vor dem Lesen der Bits muss alles im DIB
+    // stehen. Scheitert der Flush, ist der Text womöglich unvollständig — dann
+    // lieber der Glyphen-Fallback mit Warnung (Final-Review).
+    // SAFETY: parameterlos.
+    if unsafe { GdiFlush() } == 0 {
+        return Err(failed(format!(
+            "GdiFlush fehlgeschlagen: Win32-Fehler {}",
+            last_error()
+        )));
+    }
+
+    let pixels = surface.pixels();
+    let mask = pixels
+        .chunks_exact(4)
+        .map(|bgra| {
+            let (b, g, r) = (u32::from(bgra[0]), u32::from(bgra[1]), u32::from(bgra[2]));
+            // Luminanz (Rec. 601, ganzzahlig); bei Graustufen ist sie der Grauwert.
+            ((r * 77 + g * 150 + b * 29) >> 8) as u8
+        })
+        .collect();
+    Ok(mask)
+}
+
 // ------------------------------------------------------------------ Fenster
+
+/// Was die Karte gerade zeigt. Der Wechsel tauscht nur den Inhalt — das
+/// Fenster bleibt dabei sichtbar und wird nie aktiviert (§4.5).
+enum Content {
+    /// Mikrofonpegel, jeder Frame neu gezeichnet.
+    Level,
+    /// Hinweis. `mask` ist die GDI-Textmaske zur aktuellen Größe; `None` =
+    /// Textaufbau gescheitert → nur die Warn-Glyphe (§4.5 Fallback).
+    Notice {
+        title: &'static str,
+        detail: &'static str,
+        mask: Option<Vec<u8>>,
+    },
+}
 
 pub struct OverlayWindow {
     hwnd: HWND,
@@ -419,6 +648,10 @@ pub struct OverlayWindow {
     rect: Rect,
     dpi: u32,
     visible: bool,
+    content: Content,
+    /// Grund, wenn der Hinweistext nicht aufgebaut werden konnte — der Worker
+    /// holt ihn ab und loggt ihn ([`OverlayWindow::take_text_warning`]).
+    text_warning: Option<String>,
     render: OverlayState,
     last_frame: Instant,
 }
@@ -525,6 +758,8 @@ impl OverlayWindow {
             rect: Rect::new(0, 0, 0, 0),
             dpi: DEFAULT_DPI,
             visible: false,
+            content: Content::Level,
+            text_warning: None,
             render: OverlayState::new(),
             last_frame: Instant::now(),
         })
@@ -546,29 +781,97 @@ impl OverlayWindow {
         )
     }
 
-    /// Karte auf dem Monitor des fokussierten Fensters einblenden.
+    /// Pegelkarte zeigen.
     ///
-    /// Reihenfolge nach Leitentscheidung 4 und Sol-Impl-Review Blocker 1:
-    /// Zielmonitor bestimmen, das noch **versteckte** Fenster dorthin
-    /// schieben, dessen DPI messen, damit Layout und DIB rechnen, den ersten
-    /// Frame präsentieren — und erst danach `SW_SHOWNOACTIVATE`. Sonst blitzte
-    /// ein leeres oder falsch skaliertes Fenster auf.
-    pub fn show(&mut self) -> Result<(), OverlayError> {
-        if self.visible {
+    /// Unsichtbar: auf dem Monitor des fokussierten Fensters einblenden
+    /// ([`Self::appear`]). Steht gerade der Hinweis, wird nur der Inhalt
+    /// getauscht — kein Ausblenden, kein Umpositionieren, keine Aktivierung
+    /// (§4.5); die Waveform fängt leer an.
+    pub fn show_level(&mut self) -> Result<(), OverlayError> {
+        let was_notice = matches!(self.content, Content::Notice { .. });
+        if self.visible && !was_notice {
             return Ok(());
         }
-        let work = monitor_work_area(foreground_monitor()).unwrap_or_else(primary_screen_fallback);
-        let dpi = self.probe_dpi_in(work)?;
+        self.content = Content::Level;
         self.render.clear();
-        self.apply_layout(card_rect(work, dpi), dpi)?;
         self.last_frame = Instant::now();
         self.render.push(0.0, Duration::ZERO);
+        if self.visible {
+            return self.present();
+        }
+        self.appear()
+    }
+
+    /// Hinweiskarte zeigen (§4.5). Aus der Pegelkarte heraus tauscht das nur
+    /// den Inhalt; ist die Karte nicht sichtbar, blendet sie wie beim Pegel
+    /// auf dem Monitor des Vordergrundfensters ein.
+    ///
+    /// Scheitert der Text, ist das **kein** Fehler: Die Karte steht mit der
+    /// Warn-Glyphe allein, den Grund liefert [`Self::take_text_warning`].
+    pub fn show_notice(
+        &mut self,
+        title: &'static str,
+        detail: &'static str,
+    ) -> Result<(), OverlayError> {
+        self.content = Content::Notice {
+            title,
+            detail,
+            mask: None,
+        };
+        self.render.clear();
+        if self.visible {
+            self.rebuild_notice_text();
+            return self.present();
+        }
+        self.appear()
+    }
+
+    /// Einblenden. Reihenfolge nach Leitentscheidung 4 und Sol-Impl-Review
+    /// Blocker 1: Zielmonitor bestimmen, das noch **versteckte** Fenster
+    /// dorthin schieben, dessen DPI messen, damit Layout und DIB rechnen, den
+    /// ersten Frame präsentieren — und erst danach `SW_SHOWNOACTIVATE`. Sonst
+    /// blitzte ein leeres oder falsch skaliertes Fenster auf.
+    fn appear(&mut self) -> Result<(), OverlayError> {
+        let work = monitor_work_area(foreground_monitor()).unwrap_or_else(primary_screen_fallback);
+        let dpi = self.probe_dpi_in(work)?;
+        self.apply_layout(card_rect(work, dpi), dpi)?;
+        self.rebuild_notice_text();
         self.present()?;
         // SAFETY: eigenes Fenster dieses Threads. `SW_SHOWNOACTIVATE` — das
         // Fenster nimmt keinen Fokus (§4.2).
         unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
         self.visible = true;
         Ok(())
+    }
+
+    /// Den letzten Grund abholen, aus dem der Hinweistext nicht aufgebaut
+    /// werden konnte (einmalig je Fehlschlag).
+    pub fn take_text_warning(&mut self) -> Option<String> {
+        self.text_warning.take()
+    }
+
+    /// Textmaske zur aktuellen Größe und DPI neu rastern — nur im
+    /// Hinweis-Modus. Ein Fehler lässt `mask = None` (nur Glyphe) und merkt
+    /// sich den Grund.
+    fn rebuild_notice_text(&mut self) {
+        let (width, height, dpi) = match &self.surface {
+            Some(surface) => (surface.width, surface.height, self.dpi),
+            None => return,
+        };
+        if let Content::Notice {
+            title,
+            detail,
+            mask,
+        } = &mut self.content
+        {
+            *mask = match render_notice_text(width, height, dpi, title, detail) {
+                Ok(text) => Some(text),
+                Err(err) => {
+                    self.text_warning = Some(err.to_string());
+                    None
+                }
+            };
+        }
     }
 
     /// Karte ausblenden. Die Historie leert sich dabei: das nächste Diktat
@@ -584,12 +887,20 @@ impl OverlayWindow {
     }
 
     /// Ein Frame: Pegel einhängen, Karte neu zeichnen, anzeigen. Unsichtbar
-    /// passiert nichts.
+    /// passiert nichts. Der Hinweis ist statisch — er wird nur nach einer
+    /// Layoutänderung (DPI, Monitor, Arbeitsfläche) neu gerastert und gezeigt.
     pub fn frame(&mut self, level: f32) -> Result<(), OverlayError> {
         if !self.visible {
             return Ok(());
         }
-        self.apply_pending_layout()?;
+        let relayout = self.apply_pending_layout()?;
+        if matches!(self.content, Content::Notice { .. }) {
+            if relayout {
+                self.rebuild_notice_text();
+                return self.present();
+            }
+            return Ok(());
+        }
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_frame);
         self.last_frame = now;
@@ -663,13 +974,14 @@ impl OverlayWindow {
     }
 
     /// Was der `WndProc` hinterlassen hat, in Layout umsetzen (Sol Major 9).
-    fn apply_pending_layout(&mut self) -> Result<(), OverlayError> {
+    /// `true`, wenn sich das Layout geändert haben kann.
+    fn apply_pending_layout(&mut self) -> Result<bool, OverlayError> {
         let (dpi_changed, display_changed) = match self.pending.try_borrow_mut() {
             Ok(mut pending) => (
                 pending.dpi_changed.take(),
                 std::mem::take(&mut pending.display_changed),
             ),
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(false),
         };
 
         if let Some((dpi, suggested)) = dpi_changed {
@@ -680,7 +992,8 @@ impl OverlayWindow {
             // aus `card_rect`.
             let work = monitor_work_area(monitor_from_rect(suggested))
                 .unwrap_or_else(primary_screen_fallback);
-            return self.apply_layout(card_rect(work, dpi), dpi);
+            self.apply_layout(card_rect(work, dpi), dpi)?;
+            return Ok(true);
         }
         if display_changed {
             // SAFETY: eigenes Fenster; `MONITOR_DEFAULTTONEAREST` klemmt auf
@@ -694,9 +1007,10 @@ impl OverlayWindow {
                 0 => self.dpi,
                 dpi => dpi,
             };
-            return self.apply_layout(card_rect(work, dpi), dpi);
+            self.apply_layout(card_rect(work, dpi), dpi)?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Kartenrechteck übernehmen und, wenn sich die Größe geändert hat, DIB
@@ -729,6 +1043,7 @@ impl OverlayWindow {
             rect,
             dpi,
             render,
+            content,
             ..
         } = self;
         let Some(surface) = surface.as_mut() else {
@@ -739,7 +1054,12 @@ impl OverlayWindow {
             let pixels = surface.pixels();
             let mut canvas = Canvas::new(pixels, width, height)
                 .ok_or_else(|| failed("Overlay-Puffer zu klein"))?;
-            draw_card(&mut canvas, *dpi, render);
+            match content {
+                Content::Level => draw_card(&mut canvas, *dpi, render),
+                Content::Notice { mask, .. } => {
+                    draw_notice_card(&mut canvas, *dpi, mask.as_deref());
+                }
+            }
         }
 
         let position = POINT {
@@ -803,6 +1123,146 @@ impl Drop for OverlayWindow {
             // SAFETY: eigene Klasse, ihr einziges Fenster ist zerstört.
             unsafe { UnregisterClassW(self.class_name.as_ptr(), self.instance) };
             self.owns_class = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::overlay::{NOTICE_DETAIL_LEVEL, card_rect};
+    use crate::state::Notice;
+
+    /// Karte in Kartengröße der Arbeitsfläche 1920×1040 bei `dpi`.
+    fn card_size(dpi: u32) -> (i32, i32) {
+        let card = card_rect(Rect::new(0, 0, 1920, 1040), dpi);
+        (card.width(), card.height())
+    }
+
+    /// Die GDI-Maske (ohne Fenster): Text steht nur in den beiden
+    /// Zeilenrechtecken, Zeile 1 erreicht volle Deckung, Zeile 2 höchstens
+    /// ihr Grau. Außerhalb bleibt alles schwarz (schwarz initialisiert).
+    #[test]
+    fn notice_text_lands_only_inside_its_two_lines() {
+        for dpi in [96, 144, 192] {
+            let (w, h) = card_size(dpi);
+            let notice = Notice::PartialRestore;
+            let mask = render_notice_text(w, h, dpi, notice.title(), notice.detail())
+                .expect("GDI-Text rastert");
+            assert_eq!(mask.len(), (w * h) as usize);
+            let layout = notice_layout(w, h, dpi);
+            let inside = |rect: Rect, x: i32, y: i32| {
+                x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+            };
+            let (mut title_max, mut detail_max, mut inked) = (0u8, 0u8, 0usize);
+            for y in 0..h {
+                for x in 0..w {
+                    let value = mask[(y * w + x) as usize];
+                    if inside(layout.title, x, y) {
+                        title_max = title_max.max(value);
+                    } else if inside(layout.detail, x, y) {
+                        detail_max = detail_max.max(value);
+                    } else {
+                        assert_eq!(value, 0, "dpi {dpi}: Text außerhalb bei {x}/{y}");
+                    }
+                    if value > 0 {
+                        inked += 1;
+                    }
+                }
+            }
+            assert!(
+                title_max >= 250,
+                "dpi {dpi}: Zeile 1 zu blass ({title_max})"
+            );
+            assert!(detail_max > 0, "dpi {dpi}: Zeile 2 fehlt");
+            assert!(
+                detail_max <= NOTICE_DETAIL_LEVEL + 1,
+                "dpi {dpi}: Zeile 2 heller als ihr Grau ({detail_max})"
+            );
+            // Graustufen-Kantenglättung: es gibt Zwischenwerte, nicht nur 0/255.
+            assert!(
+                mask.iter().any(|&v| v > 0 && v < 200),
+                "dpi {dpi}: keine geglätteten Kanten"
+            );
+            assert!(inked > 100, "dpi {dpi}: kaum Text ({inked} Pixel)");
+        }
+    }
+
+    /// Ein überlanger Text wird am Zeilenende gekürzt (`DT_END_ELLIPSIS`),
+    /// nie über das Rechteck hinaus gezeichnet und nie umgebrochen.
+    #[test]
+    fn overlong_notice_text_is_cut_inside_the_line() {
+        let (w, h) = card_size(96);
+        let long = "Zwischenablage teilweise wiederhergestellt und noch sehr viel mehr Text, \
+                    der niemals in eine Zeile passt";
+        let mask = render_notice_text(w, h, 96, long, long).expect("GDI-Text rastert");
+        let layout = notice_layout(w, h, 96);
+        for y in 0..h {
+            for x in layout.title.right..w {
+                assert_eq!(mask[(y * w + x) as usize], 0, "über den Rand bei {x}/{y}");
+            }
+        }
+    }
+
+    /// Hilfstest für die Sichtprüfung ohne Fenster (clipboard-restore-plan
+    /// WP3): legt alle Hinweiskarten plus den Glyphen-Fallback bei 96/144/192
+    /// dpi als PNG unter `target/overlay-notice/` ab, über einem mittelgrauen
+    /// Grund komponiert. Fasst weder Fenster noch Fokus noch Zwischenablage an.
+    ///
+    /// `cargo test notice_card_png_snapshots -- --ignored`
+    #[test]
+    #[ignore = "Hilfstest: schreibt PNGs nach target/overlay-notice/"]
+    fn notice_card_png_snapshots() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("overlay-notice");
+        std::fs::create_dir_all(&dir).expect("Ausgabeordner");
+        let background = [128u32, 128, 128];
+        for dpi in [96u32, 144, 192] {
+            let (w, h) = card_size(dpi);
+            let gap = scale(8, dpi);
+            let rows = Notice::ALL.len() as i32 + 1;
+            let (out_w, out_h) = (w + 2 * gap, rows * (h + gap) + gap);
+            let mut rgb = vec![0u8; (out_w * out_h * 3) as usize];
+            for pixel in rgb.chunks_exact_mut(3) {
+                pixel.copy_from_slice(&[128, 128, 128]);
+            }
+            for row in 0..rows {
+                let mut buffer = vec![0u8; (w * h * 4) as usize];
+                let mut canvas = Canvas::new(&mut buffer, w, h).expect("Puffer passt");
+                match Notice::ALL.get(row as usize) {
+                    Some(notice) => {
+                        let mask = render_notice_text(w, h, dpi, notice.title(), notice.detail())
+                            .expect("GDI-Text rastert");
+                        draw_notice_card(&mut canvas, dpi, Some(&mask));
+                    }
+                    // Letzte Zeile: Fallback „nur Glyphe".
+                    None => draw_notice_card(&mut canvas, dpi, None),
+                }
+                let top = gap + row * (h + gap);
+                for y in 0..h {
+                    for x in 0..w {
+                        let src = ((y * w + x) * 4) as usize;
+                        let alpha = u32::from(buffer[src + 3]);
+                        let dst = (((top + y) * out_w + gap + x) * 3) as usize;
+                        // Premultipliziert: out = src + bg × (1 − a).
+                        for (channel, offset) in [(0usize, 2usize), (1, 1), (2, 0)] {
+                            let value = u32::from(buffer[src + offset])
+                                + background[channel] * (255 - alpha) / 255;
+                            rgb[dst + channel] = value.min(255) as u8;
+                        }
+                    }
+                }
+            }
+            let path = dir.join(format!("notice-{dpi}dpi.png"));
+            let file = std::fs::File::create(&path).expect("PNG anlegen");
+            let mut encoder =
+                png::Encoder::new(std::io::BufWriter::new(file), out_w as u32, out_h as u32);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("PNG-Kopf");
+            writer.write_image_data(&rgb).expect("PNG-Daten");
+            eprintln!("{}", path.display());
         }
     }
 }

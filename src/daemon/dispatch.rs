@@ -440,7 +440,7 @@ mod tests {
                 },
                 Event::InjectFinished {
                     run,
-                    report: InjectReport::Pasted,
+                    report: InjectReport::Pasted { notice: None },
                 },
             ],
         );

@@ -1,6 +1,6 @@
 [package]
 name = "diktier"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "Lokales Push-to-Talk-Diktiertool"
@@ -130,6 +130,9 @@ ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
 #                                    AttachConsole hängt die Konsole an, setzt
 #                                    aber die Standardhandles eines
 #                                    GUI-Subsystem-Prozesses nicht.
+#                                    Debug-WAV: MoveFileExW ohne
+#                                    MOVEFILE_REPLACE_EXISTING (Finalisieren
+#                                    ohne Ersetzen, Final-Review Blocker 3).
 #
 # WP4 nutzt aus Win32_UI_WindowsAndMessaging zusätzlich: RegisterWindowMessageW,
 # CreatePopupMenu/AppendMenuW/TrackPopupMenu/DestroyMenu, SetForegroundWindow,
@@ -144,9 +147,16 @@ ureq = { version = "=3.4.0", default-features = false, features = ["rustls"] }
 # DPI-Bootstrap), WM_NCHITTEST/HTTRANSPARENT, WM_DPICHANGED, WM_DISPLAYCHANGE,
 # WM_SETTINGCHANGE/SPI_SETWORKAREA — und aus Win32_Foundation POINT/SIZE/RECT.
 #
-# Nicht aufgenommen: Win32_System_Ole, das in 0.61 nur CF_UNICODETEXT liefern
-# würde. Der Wert (13) ist stabile winuser.h-ABI und steht als Konstante in
-# src/inject/windows.rs — ein COM-Feature dafür wäre unverhältnismäßig.
+# Der Mehrformat-Snapshot (clipboard-restore-plan WP1, §7.1.1) kommt ohne neues
+# Feature aus: EnumClipboardFormats, GetClipboardFormatNameW und
+# RegisterClipboardFormatW stehen in Win32_System_DataExchange,
+# GetEnhMetaFileBits/SetEnhMetaFileBits/DeleteEnhMetaFile in Win32_Graphics_Gdi
+# (die Live-Tests zusätzlich CreateEnhMetaFileW/CloseEnhMetaFile/Rectangle),
+# SetLastError und ERROR_SUCCESS in Win32_Foundation.
+#
+# Nicht aufgenommen: Win32_System_Ole, das in 0.61 nur die CF_*-Konstanten
+# liefern würde. Die Werte sind stabile winuser.h-ABI und stehen als Konstanten
+# in src/inject/formats.rs — ein COM-Feature dafür wäre unverhältnismäßig.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
@@ -166,6 +176,11 @@ windows-sys = { version = "=0.61.2", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# clipboard-restore-plan WP3: Der ignorierte Hilfstest
+# `overlay::windows::tests::notice_card_png_snapshots` legt die Hinweiskarte bei
+# 96/144/192 dpi als PNG unter target/overlay-notice/ ab (Sichtprüfung ohne
+# Fenster). Nur Testcode, nicht im Release-Binary.
+png = "0.18"
 
 # Phase 5, Paket F: Exe-Icon und Versionsressource (build.rs).
 # winresource 0.1.31 ist ein reiner Wrapper um `rc.exe` aus dem Windows SDK

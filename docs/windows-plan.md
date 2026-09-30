@@ -300,6 +300,11 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   (SPEC §6.4, Regel D) und ergänzt Regel B3 für leises Sprechen ohne
   Pause — die Kalibrierung mit echten Jabra-Aufnahmen steht in
   [SPIKES.md](SPIKES.md).
+  0.4.0 stellt die Zwischenablage nach dem Diktat mit allen auslesbaren
+  Formaten wieder her (Bilder, Dateien, formatierter Text), zeigt verlorene
+  Inhalte als Hinweiskarte im Overlay, streicht `output.mode = "type"`
+  (Breaking Change) und hält `DIKTIER_DEBUG_WAV` als Ring der letzten zehn
+  Aufnahmen (SPEC v1.8, [clipboard-restore-plan.md](clipboard-restore-plan.md)).
 - Gate am 2026-08-31 gefahren: 0.2.0-Zip in leeren Ordner **mit
   Leerzeichen im Pfad** entpackt, `--version` und `--transcribe-wav`
   (Modell-Load 2,2 s, Transkript korrekt, Exit 0).

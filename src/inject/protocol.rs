@@ -1,11 +1,13 @@
 //! Plattformneutrales Inject-Protokoll (Spec §7). Kein Win32.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::{OutputConfig, PasteShortcut};
 
+use super::formats::{LostFormat, SnapshotKind, SnapshotReport};
 use super::{
-    CaptureContext, CopyOnlyReason, InjectError, InjectOutcome, PasteKey, RestoreDecision, WindowId,
+    CaptureContext, ClipboardReport, ClipboardSave, CopyOnlyReason, InjectError, InjectOutcome,
+    PasteKey, RestoreDecision, TranscriptState, WindowId,
 };
 
 /// 5-s-Fenster für den ersten Clipboard-Read (Spec §7.1 Punkt 7).
@@ -31,12 +33,57 @@ impl ResolvedShortcut {
     }
 }
 
+/// Snapshot nach Spec §7.1.1 (Leitentscheidung 4). Die Rohdaten bleiben im
+/// Host; das Protokoll sieht nur den Ausgang und den Report (Zähler, Größen,
+/// Verlustlisten).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClipboardSnapshot {
-    /// Unicode-Text, ggf. leer (kein Owner). Restore-Versprechen.
-    Text(String),
-    /// Kein Unicode-Text (Bild, HTML, Dateien, …). Kein Restore-Versprechen.
-    NonText,
+pub struct ClipboardSnapshot {
+    pub kind: SnapshotKind,
+    pub report: SnapshotReport,
+}
+
+impl ClipboardSnapshot {
+    pub fn new(kind: SnapshotKind, report: SnapshotReport) -> Self {
+        Self { kind, report }
+    }
+
+    /// Nacharbeit WP1: Der Snapshot selbst scheiterte (Win32-Code). Kein
+    /// Abbruch des Paste, sondern `Unrestorable` ohne Restore-Versprechen.
+    pub fn failed(code: u32, duration: std::time::Duration) -> Self {
+        Self::new(
+            SnapshotKind::Unrestorable,
+            SnapshotReport::failed(code, duration),
+        )
+    }
+
+    /// `Empty` und `Formats` tragen ein Restore-Versprechen, `Unrestorable`
+    /// nicht (§7.1 Punkt 2).
+    pub fn has_promise(&self) -> bool {
+        self.kind != SnapshotKind::Unrestorable
+    }
+}
+
+/// Ergebnis von [`ClipboardHost::restore_snapshot`] (Leitentscheidung 5).
+#[derive(Debug)]
+pub enum RestoreResult {
+    /// Alles Gesicherte ist platziert, und beim Sichern ging nichts verloren.
+    Restored,
+    /// Mindestens ein Nutzformat platziert, aber Verluste beim Sichern
+    /// und/oder beim Zurückschreiben.
+    RestoredPartial {
+        lost_save: Vec<LostFormat>,
+        lost_restore: Vec<LostFormat>,
+    },
+    /// Kein Nutzformat platziert; das Transkript liegt (wieder) in der
+    /// Zwischenablage.
+    RestoreFailed { lost_restore: Vec<LostFormat> },
+    /// Owner oder Sequenz stimmten im geöffneten Clipboard nicht mehr. Nichts
+    /// angefasst (§7.1 Punkt 5).
+    Foreign,
+    /// Auch das Transkript-Fallback ließ sich nicht setzen, bzw. der Zustand
+    /// nach einem gescheiterten `EmptyClipboard` ist unbekannt →
+    /// Inject-Fehler, Tray `error`.
+    Failed(InjectError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -78,7 +125,7 @@ pub struct PumpEvents {
 /// Restore-Zustandsmaschine, Spec §7.1 Punkte 5–8.
 #[derive(Debug, Clone)]
 pub struct RestoreSession {
-    snapshot: Option<String>,
+    promise: bool,
     reads: u32,
     delay: Duration,
     enabled: bool,
@@ -86,13 +133,9 @@ pub struct RestoreSession {
 }
 
 impl RestoreSession {
-    pub fn new(snapshot: ClipboardSnapshot, delay: Duration, enabled: bool) -> Self {
-        let snapshot = match snapshot {
-            ClipboardSnapshot::Text(text) => Some(text),
-            ClipboardSnapshot::NonText => None,
-        };
+    pub fn new(snapshot: &ClipboardSnapshot, delay: Duration, enabled: bool) -> Self {
         Self {
-            snapshot,
+            promise: snapshot.has_promise(),
             reads: 0,
             delay,
             enabled,
@@ -121,10 +164,6 @@ impl RestoreSession {
         self.reads
     }
 
-    pub fn snapshot_text(&self) -> Option<&str> {
-        self.snapshot.as_deref()
-    }
-
     pub fn delay(&self) -> Duration {
         self.delay
     }
@@ -133,7 +172,7 @@ impl RestoreSession {
         if !self.enabled {
             return RestoreDecision::Disabled;
         }
-        if self.snapshot.is_none() {
+        if !self.promise {
             return RestoreDecision::NoPromise;
         }
         if self.foreign {
@@ -276,11 +315,43 @@ pub trait ClipboardHost {
     fn elapsed(&self) -> Duration;
     fn current_window(&self) -> Option<WindowId>;
     fn wm_class(&self, window: WindowId) -> Option<(String, String)>;
+    /// Snapshot nach §7.1.1. Die Rohdaten behält der Host bis zum
+    /// `restore_snapshot` bzw. `discard_snapshot`.
     fn snapshot_clipboard(&mut self) -> Result<ClipboardSnapshot, InjectError>;
+    /// Transkript als Delayed-Rendering-Versprechen setzen — nur für Paste,
+    /// wo der bediente Read (P7) gebraucht wird.
     fn become_owner(&mut self, text: String) -> Result<(), InjectError>;
+    /// Transkript direkt **eager** setzen (`CopyOnly`-Pfade): dort wird kein
+    /// Read gebraucht, und ein offenes Versprechen könnte beim Beenden
+    /// verloren gehen (Sol-Impl-Review Blocker 2). `Ok(PromiseOpen)`: das
+    /// eager Setzen scheiterte nach `EmptyClipboard`, das Transkript liegt
+    /// als Versprechen. Ist gar nichts mehr zu retten, `Err` mit
+    /// [`TranscriptState::LOST`].
+    fn copy_transcript(&mut self, text: String) -> Result<TranscriptState, InjectError>;
+    /// Ein noch offenes Versprechen des eigenen Transkripts sofort eager
+    /// hinterlegen (mit Marker und Sequenzprüfung). `Secured`, wenn Diktier
+    /// nicht mehr Owner ist, schon eager, oder ein fremder Copy dazwischen
+    /// kam (der bleibt unberührt). Final-Review Blocker 1: Ein Fehlschlag
+    /// ohne Mutation behält Eigentum und Versprechen (`PromiseOpen`); scheitert
+    /// nach `EmptyClipboard` das eager Setzen, wird noch im geöffneten
+    /// Clipboard neu versprochen (`PromiseOpen`); gelingt auch das nicht,
+    /// `Lost`.
+    fn materialize_transcript(&mut self) -> TranscriptState;
+    /// Trägt der eigene Clipboard-Inhalt den Verlaufsausschluss
+    /// (Leitentscheidung 7)? Ohne eigenen Inhalt (fremd, leer) `true`.
+    fn history_excluded(&mut self) -> bool;
+    /// Nach eigener Buchführung liegt ein offenes Versprechen (ohne
+    /// Owner-/Sequenzabfrage). Der Quit-Pfad unterscheidet damit ein normales
+    /// `NotOwner` von einem Versprechen, das fremd überschrieben wurde.
+    fn promise_recorded(&self) -> bool;
     fn still_owner(&mut self) -> Result<bool, InjectError>;
-    fn set_serve_text(&mut self, text: String);
-    fn release_ownership(&mut self) -> Result<(), InjectError>;
+    /// Leitentscheidung 5: den zuletzt gesicherten Inhalt zurückschreiben.
+    /// `transcript` ist das Fallback, falls kein Nutzformat platziert werden
+    /// kann.
+    fn restore_snapshot(&mut self, snapshot: &ClipboardSnapshot, transcript: &str)
+    -> RestoreResult;
+    /// Gesicherte Rohdaten verwerfen (kein Restore mehr fällig).
+    fn discard_snapshot(&mut self);
     fn query_modifiers(&self) -> Result<ModifierState, InjectError>;
     fn key_down(&mut self, key: PasteKey) -> Result<(), InjectError>;
     fn key_up(&mut self, key: PasteKey) -> Result<(), InjectError>;
@@ -301,12 +372,28 @@ pub fn inject_paste<H: ClipboardHost>(
     ctx: &CaptureContext,
     output: &OutputConfig,
 ) -> Result<InjectOutcome, InjectError> {
+    let result = inject_paste_inner(host, text, ctx, output);
+    // Auf jedem Pfad: die gesicherten Rohdaten (bis 128 MiB) nicht bis zum
+    // nächsten Snapshot festhalten. Nach einem Restore ist der Stash schon leer.
+    host.discard_snapshot();
+    result
+}
+
+fn inject_paste_inner<H: ClipboardHost>(
+    host: &mut H,
+    text: &str,
+    ctx: &CaptureContext,
+    output: &OutputConfig,
+) -> Result<InjectOutcome, InjectError> {
     let text = apply_leading_space(text, output.leading_space);
     let current = host.current_window();
     if !focus_allows_inject(ctx, current) {
-        host.become_owner(text)?;
+        let transcript = host.copy_transcript(text)?;
         return Ok(InjectOutcome::CopyOnly {
             reason: copy_only_reason(ctx, current),
+            history_excluded: host.history_excluded(),
+            snapshot: None,
+            transcript,
         });
     }
     let window = current.expect("focus_allows_inject garantiert Some");
@@ -319,49 +406,149 @@ pub fn inject_paste<H: ClipboardHost>(
     );
 
     let snapshot = host.snapshot_clipboard()?;
-    // Finale Fokusprüfung unmittelbar vor dem ersten Key-Event (codex H2).
-    // Snapshot darf davor liegen (INCR/ConvertSelection).
+    // Fokusprüfung nach dem Snapshot (codex H2). Der Snapshot kann seit v1.8
+    // merklich dauern (alle Formate, §7.1.1).
     let current_now = host.current_window();
     if !focus_allows_inject(ctx, current_now) {
-        host.become_owner(text)?;
+        host.discard_snapshot();
+        let transcript = host.copy_transcript(text)?;
         return Ok(InjectOutcome::CopyOnly {
             reason: copy_only_reason(ctx, current_now),
+            history_excluded: host.history_excluded(),
+            snapshot: Some(snapshot.report),
+            transcript,
         });
     }
     let mut session = RestoreSession::new(
-        snapshot,
+        &snapshot,
         Duration::from_millis(u64::from(output.restore_clipboard_delay_ms)),
         output.restore_clipboard,
     );
-    host.become_owner(text)?;
+    host.become_owner(text.clone())?;
+    let owned = Owned {
+        text,
+        shortcut,
+        window,
+        wm_class,
+        snapshot,
+    };
+    match paste_as_owner(host, ctx, owned, &mut session) {
+        Ok(outcome) => Ok(outcome),
+        // Final-Review Blocker 2: Nach `become_owner` liegt ein Versprechen.
+        // Jeder Fehlerausgang (Shortcut, Pump, Owner-Abfrage) versucht es vor
+        // der Rückgabe eager zu machen; der ursprüngliche Fehler bleibt der
+        // Ausgang. Bleibt es offen, holt es der Idle-Retry des Workers nach.
+        Err(err) => Err(match host.materialize_transcript() {
+            TranscriptState::Lost(detail) => {
+                InjectError::Failed(format!("{err}; {}", TranscriptState::lost_message(&detail)))
+            }
+            TranscriptState::Secured | TranscriptState::PromiseOpen(_) => err,
+        }),
+    }
+}
+
+/// Was nach `become_owner` feststeht.
+struct Owned {
+    text: String,
+    shortcut: ResolvedShortcut,
+    window: WindowId,
+    wm_class: Option<(String, String)>,
+    snapshot: ClipboardSnapshot,
+}
+
+/// Der Teil nach `become_owner`: ab hier liegt das Transkript als Versprechen
+/// im Clipboard.
+fn paste_as_owner<H: ClipboardHost>(
+    host: &mut H,
+    ctx: &CaptureContext,
+    owned: Owned,
+    session: &mut RestoreSession,
+) -> Result<InjectOutcome, InjectError> {
+    let Owned {
+        text,
+        shortcut,
+        window,
+        wm_class,
+        snapshot,
+    } = owned;
+    // §7.3 (v1.8, Plan B6): letzte Prüfung unmittelbar vor dem ersten
+    // Key-Event, nach dem Setzen des Transkripts. Bei Wechsel kein Chord und
+    // keine Fensteraktivierung — das Transkript liegt schon im Clipboard.
+    let before_chord = host.current_window();
+    if !focus_allows_inject(ctx, before_chord) {
+        // Kein Chord, also auch kein Read zu erwarten: das Versprechen
+        // sofort eager machen (Blocker 2).
+        let transcript = host.materialize_transcript();
+        return Ok(InjectOutcome::CopyOnly {
+            reason: copy_only_reason(ctx, before_chord),
+            history_excluded: host.history_excluded(),
+            snapshot: Some(snapshot.report),
+            transcript,
+        });
+    }
     send_paste_shortcut(host, shortcut)?;
     host.mark_start();
 
-    let decision = wait_for_restore(host, &mut session)?;
-    let ours = host.still_owner()?;
-    if decision == RestoreDecision::Restore && ours {
-        match session.snapshot_text() {
-            Some("") => host.release_ownership()?,
-            Some(old) => host.set_serve_text(old.to_string()),
-            None => {}
+    let decision = wait_for_restore(host, session)?;
+    let mut lost_restore = Vec::new();
+    let decision = if decision == RestoreDecision::Restore {
+        if host.still_owner()? {
+            match host.restore_snapshot(&snapshot, &text) {
+                RestoreResult::Restored => RestoreDecision::Restored,
+                RestoreResult::RestoredPartial {
+                    lost_restore: lost, ..
+                } => {
+                    let lost_on_restore = !lost.is_empty();
+                    lost_restore = lost;
+                    RestoreDecision::RestoredPartial { lost_on_restore }
+                }
+                RestoreResult::RestoreFailed { lost_restore: lost } => {
+                    lost_restore = lost;
+                    RestoreDecision::RestoreFailed
+                }
+                RestoreResult::Foreign => RestoreDecision::ForeignOwner,
+                RestoreResult::Failed(err) => return Err(err),
+            }
+        } else {
+            RestoreDecision::ForeignOwner
         }
-    } else if decision == RestoreDecision::Restore && !ours {
-        session.note_foreign();
-    }
-
-    let decision = if !host.still_owner()? && decision == RestoreDecision::Restore {
-        RestoreDecision::ForeignOwner
     } else {
         decision
     };
 
+    // Sol-Impl-Review Blocker 2: Ohne Restore bleibt das Transkript liegen.
+    // Ein offenes Delayed-Rendering-Versprechen darf dann nicht länger leben
+    // als nötig — sonst gehen beim Beenden Original **und** Transkript
+    // verloren, wenn das Rendern scheitert. `NoPromise` und `Disabled` enden
+    // schon vor dem ersten Read; eager zu setzen, während das Ziel gerade
+    // einfügt, würde dessen `OpenClipboard` stören. Deshalb dort erst den
+    // ersten Read (der rendert ohnehin eager) oder das 5-s-Fenster abwarten.
+    let transcript = match decision {
+        RestoreDecision::NoPromise | RestoreDecision::Disabled => {
+            wait_for_first_read(host, session)?;
+            if host.still_owner()? {
+                host.materialize_transcript()
+            } else {
+                TranscriptState::Secured
+            }
+        }
+        RestoreDecision::NoReadTimeout if host.still_owner()? => host.materialize_transcript(),
+        _ => TranscriptState::Secured,
+    };
+
     Ok(InjectOutcome::Pasted {
-        restored: decision == RestoreDecision::Restore,
+        restored: decision.is_restored(),
         shortcut,
         window,
         wm_class,
         reads: session.reads(),
         restore: decision,
+        clipboard: ClipboardReport {
+            snapshot: snapshot.report,
+            lost_restore,
+            history_excluded: host.history_excluded(),
+        },
+        transcript,
     })
 }
 
@@ -396,6 +583,93 @@ pub fn serve_restored_until_read<H: ClipboardHost>(
         remaining = remaining.saturating_sub(slice);
     }
     Ok(reads)
+}
+
+/// Längste Pause zwischen zwei Sicherungsversuchen im Quit-Pfad.
+pub const QUIT_RETRY_SLICE: Duration = Duration::from_millis(100);
+
+/// Quit-Pfad (§7.1 Punkt 8, Final-Review Blocker 2): ein offenes eigenes
+/// Versprechen eager hinterlegen, bei blockiertem Clipboard erneut, bis zur
+/// absoluten, monotonen `deadline` (Nachkontrolle Blocker 2). Nach **jedem**
+/// Versuch und jedem Pump wird die Uhr neu gelesen; nach Ablauf beginnt kein
+/// weiterer Versuch und kein weiteres Warten. Der erste Versuch läuft auch
+/// dann, wenn die Frist beim Eintreffen schon verstrichen ist — er ist die
+/// letzte Chance vor dem Fensterabbau. Überziehen kann die Frist deshalb
+/// höchstens um die Dauer **eines** Versuchs (Win32: bis zu
+/// `OPEN_RETRIES` × `OPEN_RETRY_WAIT` für ein blockiertes `OpenClipboard`).
+///
+/// - `NotOwner`: kein eigenes Versprechen (normal).
+/// - `PromiseForeign`: das Versprechen war offen, das Clipboard ist inzwischen
+///   fremd — ungeklärt, Warnung.
+/// - `Saved`: der Text liegt eager.
+/// - `Err`: nicht gesichert (weiter blockiert oder Zwischenablage leer).
+pub fn save_transcript_on_quit<H: ClipboardHost>(
+    host: &mut H,
+    deadline: Instant,
+) -> Result<ClipboardSave, InjectError> {
+    let had_promise = host.promise_recorded();
+    if !host.still_owner()? {
+        return Ok(if had_promise {
+            ClipboardSave::PromiseForeign
+        } else {
+            ClipboardSave::NotOwner
+        });
+    }
+    if !had_promise {
+        // Schon eager im Clipboard (Restore, Render oder Materialisierung).
+        return Ok(ClipboardSave::Saved);
+    }
+    loop {
+        let detail = match host.materialize_transcript() {
+            TranscriptState::Secured => return settled(host),
+            TranscriptState::Lost(detail) => {
+                return Err(InjectError::Failed(TranscriptState::lost_message(&detail)));
+            }
+            TranscriptState::PromiseOpen(detail) => detail,
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(InjectError::Failed(detail));
+        }
+        // Ein Read während des Pumpens rendert eager — dann ist es gesichert.
+        host.pump(QUIT_RETRY_SLICE.min(deadline - now))?;
+        if !host.promise_recorded() {
+            return settled(host);
+        }
+        if Instant::now() >= deadline {
+            return Err(InjectError::Failed(detail));
+        }
+    }
+}
+
+/// Kein offenes Versprechen mehr: eigen und eager (`Saved`) oder fremd.
+fn settled<H: ClipboardHost>(host: &mut H) -> Result<ClipboardSave, InjectError> {
+    Ok(if host.still_owner()? {
+        ClipboardSave::Saved
+    } else {
+        ClipboardSave::PromiseForeign
+    })
+}
+
+/// Für `NoPromise`/`Disabled`: bis zum ersten bedienten Read, zu einem
+/// fremden Copy oder zum Ende des 5-s-Fensters pumpen. Die Entscheidung
+/// selbst ändert sich dadurch nicht.
+fn wait_for_first_read<H: ClipboardHost>(
+    host: &mut H,
+    session: &mut RestoreSession,
+) -> Result<(), InjectError> {
+    while session.reads() == 0 {
+        let remaining = READ_TIMEOUT.saturating_sub(host.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let events = host.pump(remaining.min(Duration::from_millis(50)))?;
+        session.apply_pump(events);
+        if !host.still_owner()? {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn wait_for_restore<H: ClipboardHost>(

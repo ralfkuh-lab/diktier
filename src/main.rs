@@ -80,6 +80,37 @@ struct Cli {
     )]
     gate_analyze: Vec<PathBuf>,
 
+    /// Zwischenablage diagnostizieren (nur lesend): je Format ID, Name, Klasse
+    /// und Größe, nie Inhalte.
+    ///
+    /// Zeigt, was Diktier vor einem Diktat sichern und danach zurückschreiben
+    /// würde (Spec §7.1.1): gesichert (Nutz-/Begleitformat), synthetisch
+    /// ersetzt, OLE-Verweis entfällt oder Verlust mit Grund. Exitcode 0 = alle
+    /// Formate gesichert (oder leer), 3 = teilweise bzw. nicht sicherbar,
+    /// 1 = Fehler.
+    ///
+    /// Hinweis: Das Lesen kann bei der Quelle verzögert gerenderte Formate
+    /// anstoßen (Office, Browser); bei großen Inhalten dauert es entsprechend.
+    /// Nicht während eines laufenden Diktats ausführen — der Daemon könnte das
+    /// Lesen seines Transkripts für ein Einfügen halten (§7.1 Punkt 7).
+    #[arg(
+        long,
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "gate_analyze", "inject_test", "hotkey_test", "record_test", "tray_test", "hotkey_dialog_test", "overlay_test"]
+    )]
+    clipboard_check: bool,
+
+    /// Nur mit --clipboard-check: ÜBERSCHREIBT die Zwischenablage kurzzeitig.
+    ///
+    /// Snapshot → Testtext setzen → Restore → erneut lesen und vergleichen
+    /// (IDs, Reihenfolge, Bytes je gesichertem Format). Verweigert den Start,
+    /// solange der Daemon läuft. „Nutzdaten byte-identisch“ ist keine Aussage
+    /// über OLE-Objekte, Paste-Link, virtuelle Dateien oder den Owner (z. B.
+    /// Excels Laufrahmen) — die gehen beim Restore grundsätzlich verloren.
+    /// Nicht sicherbare Inhalte werden nicht angefasst. Exitcode 0 =
+    /// byte-identisch, 3 = teilweise, 1 = Fehler oder verweigert.
+    #[arg(long, requires = "clipboard_check")]
+    roundtrip: bool,
+
     /// SPIKE: nach 3s den kompletten Inject-Pfad ausführen (nur mit --foreground).
     #[arg(
         long,
@@ -237,6 +268,13 @@ where
     }
     if !cli.gate_analyze.is_empty() {
         return gate_analyze(&cli.gate_analyze);
+    }
+    if cli.clipboard_check {
+        return if cli.roundtrip {
+            clipboard_roundtrip()
+        } else {
+            clipboard_check()
+        };
     }
     if cli.inject_test.is_some() && !cli.foreground {
         eprintln!("diktier: --inject-test nur mit --foreground (SPIKE)");
@@ -458,6 +496,208 @@ fn gate_analyze(paths: &[PathBuf]) -> u8 {
     code
 }
 
+/// Exitcodes von `--clipboard-check` (clipboard-restore-plan WP2).
+const CLIPBOARD_PARTIAL: u8 = 3;
+
+/// Eine Tabellenzeile je Format. Standard-IDs mit Konstantennamen,
+/// registrierte mit bereinigtem Namen in Anführungszeichen (§10).
+fn print_snapshot(snapshot: &inject::ClipboardSnapshot) {
+    use inject::formats::{self, RowOutcome, SnapshotKind};
+
+    let report = &snapshot.report;
+    let lost = report.lost();
+    let verdict = match snapshot.kind {
+        SnapshotKind::Empty => "leer".to_string(),
+        SnapshotKind::Formats if lost.is_empty() => {
+            "alle auslesbaren Nutzdaten gesichert".to_string()
+        }
+        SnapshotKind::Formats => format!("teilweise ({} verloren)", lost.len()),
+        SnapshotKind::Unrestorable => "nicht sicherbar (kein Nutzformat)".to_string(),
+    };
+    println!("Zwischenablage: {} Formate · {verdict}", report.rows.len());
+    if report.rows.is_empty() {
+        return;
+    }
+    println!("   #  ID      {:<42}  {:<28}  Größe", "Name", "Klasse");
+    for (index, row) in report.rows.iter().enumerate() {
+        let name = match (&row.format.name, formats::standard_name(row.format.id)) {
+            (Some(name), _) => format!("\"{name}\""),
+            (None, Some(name)) => name.to_string(),
+            (None, None) => "?".to_string(),
+        };
+        let (class, size) = match row.outcome {
+            RowOutcome::Saved { bytes, useful } => (
+                if useful {
+                    "gesichert (Nutzformat)".to_string()
+                } else {
+                    "gesichert (Begleitformat)".to_string()
+                },
+                formats::format_bytes(bytes),
+            ),
+            RowOutcome::Replaced => ("synthetisch ersetzt".to_string(), "—".to_string()),
+            RowOutcome::OleDropped => ("OLE-Verweis entfällt".to_string(), "—".to_string()),
+            RowOutcome::Lost(reason) => (format!("Verlust: {}", reason.as_str()), "—".to_string()),
+        };
+        println!(
+            "  {:>2}  0x{:04X}  {name:<42}  {class:<28}  {size}",
+            index + 1,
+            row.format.id
+        );
+    }
+    println!(
+        "Gesichert: {} in {} Formaten, {} ms",
+        formats::format_bytes(report.saved_bytes()),
+        report.saved_count(),
+        report.duration.as_millis()
+    );
+}
+
+fn snapshot_exit_code(snapshot: &inject::ClipboardSnapshot) -> u8 {
+    use inject::formats::SnapshotKind;
+    // Ein gescheiterter Snapshot ist im Daemon `Unrestorable`, für die
+    // Diagnose aber ein Fehler (Exit 1).
+    if snapshot.report.failure().is_some() {
+        return 1;
+    }
+    match snapshot.kind {
+        SnapshotKind::Empty => 0,
+        SnapshotKind::Formats if snapshot.report.lost().is_empty() => 0,
+        SnapshotKind::Formats | SnapshotKind::Unrestorable => CLIPBOARD_PARTIAL,
+    }
+}
+
+/// WP2, Default: nur lesend. §10: CLI-Modi schreiben nie in `diktier.log`.
+fn clipboard_check() -> u8 {
+    match inject::clipboard_check() {
+        Ok(snapshot) => {
+            print_snapshot(&snapshot);
+            snapshot_exit_code(&snapshot)
+        }
+        Err(err) => {
+            eprintln!("diktier: {err}");
+            1
+        }
+    }
+}
+
+/// WP2, `--roundtrip`: nur ohne laufenden Daemon. Die Single-Instance-Sperre
+/// aus §5.3 wird dafür nur **angefragt**: Hält der Daemon sie, schließt
+/// `CreateMutexW` das eigene Handle sofort wieder, und der Daemon bleibt
+/// unberührt. Sonst hält der Roundtrip sie bis zum Ende, damit kein Daemon
+/// mitten hinein startet.
+fn clipboard_roundtrip() -> u8 {
+    use inject::RoundtripRestore;
+    use single_instance::InstanceAcquire;
+
+    let _lock = match single_instance::acquire_instance_lock(&mut |_| {}) {
+        Ok(InstanceAcquire::Held(lock)) => lock,
+        Ok(InstanceAcquire::Busy) => {
+            eprintln!(
+                "diktier: --roundtrip verweigert: der Daemon läuft. Erst Diktier beenden \
+                 (Tray → Beenden), dann erneut starten."
+            );
+            return 1;
+        }
+        Err(err) => {
+            eprintln!("diktier: {err}");
+            return 1;
+        }
+    };
+    eprintln!("Achtung: --roundtrip überschreibt die Zwischenablage kurzzeitig.");
+
+    let roundtrip = match inject::clipboard_roundtrip() {
+        Ok(roundtrip) => roundtrip,
+        Err(err) => {
+            eprintln!("diktier: {err}");
+            return 1;
+        }
+    };
+    print_snapshot(&roundtrip.before);
+    // Sol-Impl-Review Blocker 3: Die Nachprüfung scheiterte. Dann wenigstens
+    // sagen, was platziert wurde, und dass der aktuelle Inhalt unbekannt ist.
+    if let Some(error) = &roundtrip.after_error {
+        println!(
+            "Roundtrip: {} — aktueller Inhalt nicht abfragbar: {error}",
+            roundtrip_placement(&roundtrip.restore)
+        );
+        return 1;
+    }
+    let after = roundtrip
+        .after
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match &roundtrip.restore {
+        RoundtripRestore::NotAttempted => {
+            println!("Roundtrip: nicht ausgeführt — nichts sicherbar, Zwischenablage unverändert");
+            snapshot_exit_code(&roundtrip.before)
+        }
+        RoundtripRestore::Restored | RoundtripRestore::RestoredPartial => {
+            if !roundtrip.lost_restore.is_empty() {
+                println!(
+                    "Beim Zurückschreiben verloren: {}",
+                    inject::formats::lost_list(&roundtrip.lost_restore)
+                );
+            }
+            for mismatch in &roundtrip.mismatches {
+                println!("Abweichung: {mismatch}");
+            }
+            // Budget erschöpft ist keine Abweichung, aber auch kein Beleg.
+            for format in &roundtrip.unchecked {
+                println!("Nicht geprüft (Budget erschöpft): {format}");
+            }
+            let identical = roundtrip.mismatches.is_empty() && roundtrip.unchecked.is_empty();
+            if identical {
+                println!("Roundtrip: Nutzdaten byte-identisch (gesicherte Formate)");
+            } else if roundtrip.mismatches.is_empty() {
+                println!("Roundtrip: keine Abweichung, aber nicht alle Formate geprüft");
+            }
+            println!("Keine Aussage über OLE-Objekte, virtuelle Dateien oder den Owner.");
+            if identical
+                && roundtrip.lost_restore.is_empty()
+                && snapshot_exit_code(&roundtrip.before) == 0
+            {
+                0
+            } else {
+                CLIPBOARD_PARTIAL
+            }
+        }
+        RoundtripRestore::RestoreFailed => {
+            println!("Roundtrip: nicht wiederhergestellt — im Clipboard liegt jetzt: {after}");
+            1
+        }
+        RoundtripRestore::Foreign => {
+            println!("Roundtrip: fremder Copy dazwischen — dessen Inhalt bleibt: {after}");
+            1
+        }
+        RoundtripRestore::Failed(message) => {
+            println!("Roundtrip abgebrochen: {message}");
+            println!(
+                "Im Clipboard liegt jetzt: {}",
+                if after.is_empty() { "nichts" } else { &after }
+            );
+            1
+        }
+    }
+}
+
+/// Was der Restore im Roundtrip platziert hat — auch dann, wenn die
+/// Nachprüfung danach scheitert.
+fn roundtrip_placement(restore: &inject::RoundtripRestore) -> String {
+    use inject::RoundtripRestore;
+    match restore {
+        RoundtripRestore::NotAttempted => "nicht ausgeführt, Zwischenablage unverändert".into(),
+        RoundtripRestore::Restored => "vorheriger Inhalt zurückgeschrieben".into(),
+        RoundtripRestore::RestoredPartial => "vorheriger Inhalt teilweise zurückgeschrieben".into(),
+        RoundtripRestore::RestoreFailed => {
+            "nicht wiederhergestellt, der Testtext wurde gesetzt".into()
+        }
+        RoundtripRestore::Foreign => "fremder Copy dazwischen, dessen Inhalt blieb".into(),
+        RoundtripRestore::Failed(message) => format!("abgebrochen ({message})"),
+    }
+}
+
 fn inject_test(text: &str) -> u8 {
     eprintln!("SPIKE --inject-test (kein Produktionspfad)");
     let loaded = match config::load() {
@@ -506,6 +746,9 @@ fn inject_test(text: &str) -> u8 {
         }
     };
     log_inject_outcome(text, start, target, sink.current_window_id(), &outcome);
+    for warning in sink.take_warnings() {
+        eprintln!("SPIKE warnung: {warning}");
+    }
 
     let restored = matches!(&outcome, InjectOutcome::Pasted { restored: true, .. });
     if restored {
@@ -541,6 +784,8 @@ fn log_inject_outcome(
             wm_class,
             reads,
             restore,
+            clipboard,
+            transcript,
         } => {
             let class = match wm_class {
                 Some((instance, class)) => format!("{instance},{class}"),
@@ -551,11 +796,29 @@ fn log_inject_outcome(
             eprintln!("SPIKE wm_class={class}");
             eprintln!("SPIKE shortcut={} (config/auto)", shortcut.as_str());
             eprintln!("SPIKE selection_requests(data)={reads}");
-            eprintln!("SPIKE restored={restored} ({})", restore.as_str());
+            eprintln!(
+                "SPIKE {}",
+                inject::formats::snapshot_log_line(&clipboard.snapshot)
+            );
+            eprintln!(
+                "SPIKE restored={restored} restore {}",
+                inject::restore_log(*restore, clipboard)
+            );
+            eprintln!("SPIKE transkript={}", transcript.describe());
         }
-        InjectOutcome::CopyOnly { reason } => {
+        InjectOutcome::CopyOnly {
+            reason,
+            history_excluded,
+            snapshot,
+            transcript,
+        } => {
             eprintln!("SPIKE pfad=copy_only");
             eprintln!("SPIKE grund={}", reason.as_str());
+            if let Some(snapshot) = snapshot {
+                eprintln!("SPIKE {}", inject::formats::snapshot_log_line(snapshot));
+            }
+            eprintln!("SPIKE verlauf_ausgeschlossen={history_excluded}");
+            eprintln!("SPIKE transkript={}", transcript.describe());
         }
     }
 }
@@ -817,7 +1080,7 @@ fn overlay_test(secs: u32) -> u8 {
             return 1;
         }
     };
-    if let Err(err) = window.show() {
+    if let Err(err) = window.show_level() {
         eprintln!("{err}");
         return 1;
     }
@@ -1118,6 +1381,39 @@ mod tests {
         writer.finalize().unwrap();
         let arg = path.to_str().expect("utf-8 path");
         assert_eq!(cli_main(["diktier", "--gate-analyze", arg, arg]), 0);
+    }
+
+    /// WP2: `--roundtrip` gibt es nur zusammen mit `--clipboard-check`. Der
+    /// Check selbst läuft hier nicht — er läse die echte Zwischenablage.
+    #[test]
+    fn roundtrip_requires_clipboard_check() {
+        assert_eq!(cli_main(["diktier", "--roundtrip"]), 2);
+    }
+
+    #[test]
+    fn clipboard_check_conflicts_with_other_modes() {
+        assert_eq!(
+            cli_main(["diktier", "--clipboard-check", "--transcribe-wav", "a.wav"]),
+            2
+        );
+        assert_eq!(
+            cli_main(["diktier", "--clipboard-check", "--install-autostart"]),
+            2
+        );
+        assert_eq!(
+            cli_main(["diktier", "--clipboard-check", "--gate-analyze", "a.wav"]),
+            2
+        );
+    }
+
+    #[test]
+    fn clipboard_check_help_warns() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd.render_long_help().to_string();
+        assert!(help.contains("--clipboard-check"), "{help}");
+        assert!(help.contains("ÜBERSCHREIBT"), "{help}");
+        assert!(help.contains("verzögert"), "{help}");
     }
 
     #[test]
