@@ -1,4 +1,4 @@
-# Diktier — Spec v1.9
+# Diktier — Spec v1.10
 
 Stand: 2026-09-30. Verbindlich für die Implementierung. Änderungen nur über
 diesen Text.
@@ -37,6 +37,12 @@ v1.9 (2026-09-30, Ralf): **Vorlauf-Stille** vor jedem Engine-Aufruf
 Debug-WAV als **32-bit-Float** statt 16-bit (§10), damit ein Fall
 bitgenau nachstellbar ist. Messbelege in `docs/SPIKES.md`
 („Vorlauf-Stille“). §18 #15.
+v1.10 (2026-09-30, Ralf): **Zweiter Modellschlüssel für den Alltagstest**
+(§6.2, §6.3): `parakeet-ultra-0.6b-int8-pc` neben dem Default v3, Artefakte
+aus einem immutable GitHub-Release; Batch-Transkription für den Vergleich
+(§9); Debug-WAV-Ring mit einstellbarer Größe und Verzeichnis (§10);
+`versions.toml` je Modell (§11). Plan `docs/ultra-alltagstest-plan.md`,
+Review `docs/reviews/plan-ultra-alltagstest-sol.md`. §18 #16.
 
 ## 1. Ziel
 
@@ -379,14 +385,19 @@ Qualitätsgate. Phase 1 startet nur mit `parakeet-rs`.
 
 ### 6.2 Freigegebenes Modell (v1)
 
-Nur ein Schlüssel:
+Zwei Schlüssel (v1.10):
 
 | Schlüssel | Rolle |
 |---|---|
-| `parakeet-tdt-0.6b-v3-int8` | Default und einziges v1-Modell, 25 Sprachen, Auto-Detect |
+| `parakeet-tdt-0.6b-v3-int8` | Default, 25 Sprachen, Auto-Detect |
+| `parakeet-ultra-0.6b-int8-pc` | Testmodell für den Alltagstest (`docs/ultra-alltagstest-plan.md`), gleiche Architektur und gleicher Tokenizer, 25 Sprachen, Auto-Detect |
 
 Unbekannter Schlüssel: fataler Configfehler, Tray `error`, kein
-Default-Fallback, kein Hotkey.
+Default-Fallback, kein Hotkey. Der aus `engine.model` gewählte
+Manifesteintrag ist der einzige, den Daemon, Download, Engine, Tray und
+Tests für diesen Lauf verwenden; kein Pfad greift auf ein anderes
+Modell zurück. Umschalten heißt Config ändern und neu starten; die
+Verzeichnisse beider Modelle bestehen nebeneinander.
 
 `language` gibt es in v1 **nicht** in der Config. TDT läuft immer auf
 Auto-Detect. (Eine spätere `language = "de"`-Option braucht nachgewiesen
@@ -415,6 +426,43 @@ Installationsort:
 
 - Linux: `~/.local/share/diktier/models/parakeet-tdt-0.6b-v3-int8/`
 - Windows: `%LOCALAPPDATA%\diktier\models\parakeet-tdt-0.6b-v3-int8\`
+
+#### Ultra-Artefakte (v1.10)
+
+Herkunft: NVIDIA `parakeet-tdt-0.6b-v3` → Moondream `parakeet-ultra`
+(Post-Training) → ONNX-Export `altunenes/parakeet-rs`, Revision
+`4d2a8bc71f5c896ec40faa59732e6716295edaf2`, Ordner `parakeet-ultra/`
+(ohne VAD-Kopf) → eigene Quantisierung int8 per-channel
+(`scripts/quantize-ultra.py`, `onnxruntime.quantization.quantize_dynamic`
+mit `QInt8`, `per_channel=True`, Umgebung gepinnt in
+`scripts/quantize-ultra.requirements.txt`). Das Skript reproduziert die
+Dateien bitgleich; weicht ein Hash ab, gibt es kein Release.
+
+| Datei | Bytes | SHA-256 |
+|---|---:|---|
+| `encoder-model.int8.onnx` | 700507227 | `2cc01c15a08d6976ca9ebe97739d15890f3088cfedd3a4aa4d969ba7a1702038` |
+| `decoder_joint-model.int8.onnx` | 18300628 | `afcb9459250ab5c2e48e657d852501c233e8b7f5daed1894a2a7101d21165a5e` |
+| `vocab.txt` | 93939 | `d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d` |
+
+Kein `config.json`, parakeet-rs liest es nicht. Hosting: immutable
+GitHub-Release `model-parakeet-ultra-0.6b-int8-pc-r1` im öffentlichen Repo
+`ralfkuh-lab/diktier-models`, kanonische URLs
+`https://github.com/ralfkuh-lab/diktier-models/releases/download/<tag>/<datei>`,
+nie ein Redirect-Ziel. Ein Artefaktvertrag pro Schlüssel: andere Bytes
+bekommen einen neuen Schlüssel. Lizenz CC-BY-4.0 mit Nennung der ganzen
+Kette in `LICENSES/NOTICE-parakeet-ultra.md` und im Release.
+
+**Unveränderliche URL** (v1.10) heißt für alle Modelle: Hugging-Face
+`resolve/<git-commit>/…` oder Asset eines immutable GitHub-Releases.
+Integrität sichern Größe und SHA-256 aus dem Manifest, nicht der Host; ist
+die Quelle nicht erreichbar, gilt der Download-Fehlerpfad, kein Mirror,
+kein „Latest“-Fallback.
+
+**Prüfumfang** (v1.10 klargestellt): Beim Start prüft `check_artifacts`
+nur Existenz und Größe jeder Manifestdatei; `COMPLETE` ist Abschlussmarker,
+kein Integritätsnachweis. Den vollen SHA-256 prüft der Download. Eine
+gleich große beschädigte Datei wird deshalb erst beim Laden auffällig;
+Reparatur heißt das betroffene Modellverzeichnis löschen und neu starten.
 
 Download je Datei nach `<name>.part`, Größe + SHA-256 prüfen, dann atomar
 umbenennen. Zuletzt Marker `COMPLETE` schreiben. Per-user Download-Lock
@@ -720,7 +768,7 @@ sample_rate = 16000     # Engine-Zielrate, nur 16000
 max_duration_secs = 60
 
 [engine]
-model = "parakeet-tdt-0.6b-v3-int8"
+model = "parakeet-tdt-0.6b-v3-int8"   # v1.10 auch "parakeet-ultra-0.6b-int8-pc"
 threads = 0             # 0 = Runtime-Default
 
 [output]
@@ -767,6 +815,24 @@ Quelle anstoßen. `--roundtrip` überschreibt die Zwischenablage kurz und
 verweigert den Start, solange der Daemon läuft. Er vergleicht IDs,
 Reihenfolge und Bytes (Präfix in Originallänge, weil Windows Blöcke
 aufrunden darf); über OLE- oder Owner-Semantik sagt er nichts.
+
+Entwickler-Modi (Text auf stdout, Diagnose textfrei auf stderr, nie in
+`diktier.log`): `--transcribe-wav <datei>` (eine Datei, Config-Modell),
+`--record-test <s>`, `--gate-analyze <datei>…`. Seit v1.10 zusätzlich
+`--transcribe-list <liste>` (eine WAV je Zeile, UTF-8) und
+`--model <schlüssel>` für beide Transkriptionsmodi; `--model` akzeptiert
+nur Manifest-Schlüssel und ändert die Config auf Platte nie. Das Modell
+wird einmal geladen, und nur, wenn mindestens eine Aufnahme den Gate
+passiert. `--transcribe-list` schreibt je Datei eine JSONL-Zeile
+`{"file","status","text","infer_ms","samples"}` mit `status` =
+`text` | `rejected` | `error`; mit `--runs <n>` n Zeilen je Datei mit
+zusätzlichem Feld `run` (1…n, Warmup ungezählt). Exitcode `1`, sobald eine
+Datei `error` hat. `--transcribe-wav` ohne `--model` gibt wie bisher nur den Text aus.
+Seit v1.10 außerdem `--manifest-sha256`: gibt den SHA-256 des eingebauten
+Modellmanifests (`models.toml`, Bytes wie eingebettet) aus und lädt kein
+Modell; das Release-Skript prüft damit das Binary gegen die Quelle.
+Modusabhängige Optionen (`--model`, `--runs`) sind außerhalb ihres Modus
+ein Bedienfehler (Exit 2), bevor irgendeine Aktion läuft.
 
 Install/Remove **idempotent**. Pfad = gequotetes `current_exe()`. Eigenen
 Eintrag aktualisieren, fremde Einträge nie löschen.
@@ -825,6 +891,14 @@ Stunde Alter, fremde Dateien nie. Die frühere `last_recording.wav` wird
 entfernt. Pfad eine Logzeile. Nie
 hochladen.
 
+Seit v1.10 einstellbar, einmal beim Start gelesen:
+`DIKTIER_DEBUG_WAV_KEEP` (ganze Zahl 1–5000, Default 10) und
+`DIKTIER_DEBUG_WAV_DIR` (absoluter Pfad, Default `%TEMP%\diktier`).
+Ungültige Werte: eine Warnzeile und der Default. Ist der Dump an, nennt
+eine Startzeile Verzeichnis und Kapazität, ohne Inhalte. Ist er aus, obwohl
+`_KEEP` oder `_DIR` gesetzt ist, sagt das eine Startzeile; sonst schweigt
+der Daemon.
+
 ## 11. Verteilung
 
 Bundle, nicht „eine Datei“:
@@ -834,8 +908,14 @@ diktier[.exe]
 lib/onnxruntime.dll          # Windows, fester Name
 lib/libonnxruntime.so        # Linux, fester Name, kein Symlink-Zwang
 LICENSES/
-versions.toml                # App, ORT-ABI, Crate-Lock-Hinweis
+versions.toml                # App, ORT-ABI, Crate-Lock-Hinweis, Modelle (v1.10)
 ```
+
+`versions.toml` nennt seit v1.10 `default_model` und je Manifestmodell
+einen eigenen Block (Schlüssel, Quelle, HF-Revision bzw. Release-Tag,
+Dateien mit Größe und SHA-256), strukturiert aus dem Manifest erzeugt,
+nie aus Reihenfolge oder URL-Mustern erraten. Ein Bundle-Gate liest die
+Datei zurück und vergleicht sie mit dem eingebauten Manifest.
 
 Release-Skript kopiert die ORT-Library unter genau diesen Dateinamen.
 Kein `PATH`, kein `LD_LIBRARY_PATH`, kein System-ORT. Laden ausschließlich
@@ -1038,3 +1118,4 @@ Kein Code-Import.
 | 13 | Regel B3 (v1.7) | Absoluter Lauf ≥ 2,0 s über 0,004 zusätzlich zu B1/B2/D — pausenloses leises Diktat (WP0-Aufnahme 07: 4,5 s) gegen Störgeräusche (≤ 1,0 s); akzeptiertes Restrisiko: gleichmäßiges Geräusch 0,004–0,0075 über 2 s geht an die Engine (Ralf, 2026-09-21). |
 | 14 | Mehrformat-Restore, Hinweiskarte (v1.8) | Anlass: 33× „Nicht-Text-Clipboard“ im Log, Screenshots/Dateien/Formatierung gingen verloren, die versprochenen Tooltips erreichten den Nutzer nie (2026-09-25). „Vollständig“ heißt alle Win32-auslesbaren Nutzdaten byte-gleich in Originalreihenfolge; nicht zugesagt: OLE-Objektsemantik, virtuelle Dateien, Owner-Identität, synthetisch ersetzte GDI-Formate. Akzeptierte Restrisiken: Eine hängende Quelle blockiert den Inject-Worker bis zu ihrer Rückkehr (Quit beendet trotzdem), Speicherspitze ≈ 2 × 128 MiB, Drittanbieter-Clipboard-Manager ignorieren ggf. den Verlaufsausschluss. `output.mode = "type"` ist ein bewusster Breaking Change (Fatal statt stillem Paste). Plan `docs/clipboard-restore-plan.md`, Review `docs/reviews/plan-clipboard-restore-sol.md` (Ralf, 2026-09-25). |
 | 15 | Vorlauf-Stille, Float-Debug-WAV (v1.9) | 300 ms digitale Nullen vor jedem Engine-Aufruf nach Messung mit 0/200/300/500 ms an Fixtures, Kalibrierungsaufnahmen und dem WAV-Ring (roh und mit ±1-LSB-Dither): „Herr Präsident“ in der Matrix überall weg, in der Nachprüfung mit 24 Dither-Seeds von Lauf 545 noch 1 von 24 (ohne Stille 8 von 8), WER-Summe 75,2/53,8 → 51,2/51,2 (roh/Dither), 300 ms als einziger Wert gleich stabil in beiden Reihen. Stille statt Abschneiden, weil kein Sprachbeginn geschätzt werden muss. Debug-WAV als f32, weil die 16-bit-Rundung den Fall in Lauf 545 unsichtbar machte. Akzeptiert: seltenes Restauftreten; mehr Stille hätte den Einzelfall gelöst, wäre aber auf ihn optimiert, und 500 ms war in der WER schlechter. Ebenso akzeptiert: einzelne Wortkipper in beide Richtungen, wie sie schon durch den Dither allein entstehen. Ein Modellwechsel (etwa auf Parakeet Ultra) ist davon getrennt (Ralf, 2026-09-30). |
+| 16 | Zweiter Modellschlüssel für den Alltagstest (v1.10) | Anlass: Spike 2026-09-30 (`docs/reviews/spike-parakeet-ultra-notes.md`): `ultra-int8-pc` 2 statt 9 Wortfehler auf den Referenzen, gleiche Latenz, +175 MiB, „Herr Präsident“ nie; Datenbasis klein, auf dem Ring kein klarer Sieger. Deshalb Default v3 unverändert, Ultra nur per Config, verdeckter Alltagstest mit vorab festgelegtem Protokoll und Kriterien im Plan. Hosting als immutable GitHub-Release im eigenen Repo `diktier-models` statt Immutability für das App-Repo. Der Voxtype-Bezug des Golden Set gilt nur für v3. Endgültiger Wechsel ist ein eigenes Paket (Ralf, 2026-09-30). |

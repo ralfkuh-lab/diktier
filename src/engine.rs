@@ -10,7 +10,7 @@ use parakeet_rs::{ExecutionConfig, ParakeetTDT};
 use thiserror::Error;
 
 use crate::audio::ENGINE_RATE;
-use crate::download::{self, ArtifactManifest, DownloadError};
+use crate::download::{DownloadError, SelectedModel};
 
 /// 16 kHz × 250 ms. Kürzer → kein Engine-Aufruf (Spec §6.4).
 pub const MIN_SAMPLES_16KHZ: usize = 16_000 * 250 / 1_000;
@@ -538,17 +538,12 @@ pub struct ParakeetTranscriber {
 }
 
 impl ParakeetTranscriber {
-    pub fn load(model_key: &str, threads: u32) -> Result<Self, EngineError> {
-        let manifest = download::load_manifest().map_err(artifacts_err)?;
-        if manifest.key != model_key {
-            return Err(EngineError::Artifacts(format!(
-                "engine.model {model_key:?} passt nicht zum Manifest {}",
-                manifest.key
-            )));
-        }
+    /// Lädt genau das übergebene Modell (§6.2): Verzeichnis und Dateisatz
+    /// kommen vom Aufrufer, hier wird kein Manifest gewählt.
+    pub fn load(model: &SelectedModel, threads: u32) -> Result<Self, EngineError> {
         ensure_ort_initialized()?;
-        let dir = download::model_dir(model_key).map_err(artifacts_err)?;
-        download::check_artifacts(&dir, &manifest).map_err(artifacts_err)?;
+        model.check().map_err(artifacts_err)?;
+        let dir = model.dir();
 
         let exec = if threads == 0 {
             // 0 = Runtime-Default von parakeet-rs (intra=4, inter=1).
@@ -557,7 +552,7 @@ impl ParakeetTranscriber {
             Some(ExecutionConfig::default().with_intra_threads(threads as usize))
         };
 
-        let inner = ParakeetTDT::from_pretrained(&dir, exec)
+        let inner = ParakeetTDT::from_pretrained(dir, exec)
             .map_err(|e| EngineError::Failed(format!("parakeet-rs: {e}")))?;
         Ok(Self { inner })
     }
@@ -652,17 +647,18 @@ fn ensure_ort_initialized() -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Für Tests und stt-smoke: Artefaktverzeichnis plus Manifest.
-pub fn model_artifacts(model_key: &str) -> Result<(PathBuf, ArtifactManifest), EngineError> {
-    let manifest = download::load_manifest().map_err(artifacts_err)?;
-    let dir = download::model_dir(model_key).map_err(artifacts_err)?;
-    Ok((dir, manifest))
+/// Die Modellauswahl eines Schlüssels (Verzeichnis plus Manifest) für die
+/// CLI-Modi und stt-smoke. Ein unbekannter Schlüssel ist ein Fehler, kein
+/// Ersatzmodell (§6.2).
+pub fn model_artifacts(model_key: &str) -> Result<SelectedModel, EngineError> {
+    SelectedModel::select(model_key).map_err(artifacts_err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::DEFAULT_MODEL;
+    use crate::download;
     use std::time::Instant;
 
     struct CountingStub {
@@ -1543,17 +1539,27 @@ mod tests {
     // ------------------------------------------------------------- Sonstige
 
     #[test]
-    fn load_rejects_unknown_model_key() {
-        let err = match ParakeetTranscriber::load("whisper-medium", 0) {
-            Err(err) => err,
-            Ok(_) => panic!("expected Artifacts error"),
-        };
+    fn model_artifacts_rejects_unknown_model_key() {
+        let err = model_artifacts("whisper-medium").unwrap_err();
         match err {
             EngineError::Artifacts(msg) => {
                 assert!(msg.contains("whisper-medium"), "{msg}");
-                assert!(msg.contains("Manifest"), "{msg}");
+                assert!(msg.contains(DEFAULT_MODEL), "{msg}");
+                assert!(msg.contains("parakeet-ultra-0.6b-int8-pc"), "{msg}");
             }
             other => panic!("expected Artifacts, got {other:?}"),
+        }
+    }
+
+    /// Jeder Schlüssel liefert sein eigenes Verzeichnis und seinen eigenen
+    /// Dateisatz — kein Verbraucher bekommt stillschweigend v3.
+    #[test]
+    fn model_artifacts_selects_the_requested_key() {
+        for key in download::model_keys().unwrap() {
+            let model = model_artifacts(key).unwrap();
+            assert_eq!(model.key(), key);
+            assert_eq!(model.manifest(), &download::load_manifest(key).unwrap());
+            assert_eq!(model.dir(), download::model_dir(key).unwrap());
         }
     }
 
@@ -1602,21 +1608,22 @@ mod tests {
         if let Err(err) = resolve_ort_lib() {
             panic!("ORT-Library fehlt: {err}\nHinweis: scripts/fetch-ort.ps1");
         }
-        let (dir, manifest) = model_artifacts(DEFAULT_MODEL).unwrap_or_else(|e| {
+        // v3-Golden-Set bleibt die Referenz dieses Gates (Plan WP2a, Sol W8).
+        let model = model_artifacts(DEFAULT_MODEL).unwrap_or_else(|e| {
             panic!("Modellpfad/Manifest: {e}");
         });
-        if let Err(err) = download::check_artifacts(&dir, &manifest) {
+        if let Err(err) = model.check() {
             panic!(
                 "Modellartefakte fehlen oder Größe stimmt nicht ({err}). Erwartet in {}",
-                dir.display()
+                model.dir().display()
             );
         }
-        if let Err(err) = download::verify_artifacts_sha256(&dir, &manifest) {
+        if let Err(err) = download::verify_artifacts_sha256(model.dir(), model.manifest()) {
             panic!("SHA-256-Prüfung fehlgeschlagen: {err}");
         }
 
         let mut engine = CountingEngine {
-            inner: ParakeetTranscriber::load(DEFAULT_MODEL, 0).unwrap_or_else(|e| panic!("{e}")),
+            inner: ParakeetTranscriber::load(&model, 0).unwrap_or_else(|e| panic!("{e}")),
             calls: 0,
         };
 

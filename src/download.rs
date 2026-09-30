@@ -1,4 +1,10 @@
-//! Modell-Artefakte (Spec §6.3): Manifest, Prüfung und Download.
+//! Modell-Artefakte (Spec §6.2, §6.3): Manifest, Prüfung und Download.
+//!
+//! `models.toml` beschreibt jeden freigegebenen Modellschlüssel. Ein Lauf
+//! wählt über [`SelectedModel::select`] genau **einen** Eintrag aus
+//! `engine.model`; Daemon, Download, Engine und Tray bekommen diesen Eintrag
+//! durchgereicht und wählen nie selbst (§6.2, kein Fallback auf ein anderes
+//! Modell).
 //!
 //! Download je Datei nach `<name>.part`, Größe **und** SHA-256 gegen das
 //! Manifest, dann atomar umbenennen; zuletzt der Marker `COMPLETE`. Ein
@@ -14,6 +20,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -42,6 +49,8 @@ const PROGRESS_STEP: u64 = 16 * 1024 * 1024;
 pub enum DownloadError {
     #[error("Artefakt-Manifest: {0}")]
     Manifest(String),
+    #[error("Modellschlüssel {key:?} ist unbekannt (erlaubt: {allowed})")]
+    UnknownModel { key: String, allowed: String },
     #[error("Modellpfad: {0}")]
     Path(String),
     #[error("Modellartefakt fehlt: {0}")]
@@ -70,13 +79,16 @@ pub enum DownloadError {
     Lock(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// Was Download, Prüfung und Engine von einem Modell brauchen: Schlüssel und
+/// Dateisatz. Die Herkunft bleibt im Katalog ([`RawModel`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactManifest {
     pub key: String,
     pub files: Vec<Artifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Artifact {
     pub name: String,
     pub bytes: u64,
@@ -85,19 +97,287 @@ pub struct Artifact {
     pub url: String,
 }
 
-pub fn load_manifest() -> Result<ArtifactManifest, DownloadError> {
-    toml::from_str(MANIFEST_TOML).map_err(|e| DownloadError::Manifest(e.to_string()))
+/// Herkunftsart eines Modells (§6.3 „Unveränderliche URL", v1.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ModelSource {
+    /// `https://huggingface.co/<repository>/resolve/<revision>/<datei>`
+    Huggingface,
+    /// `https://github.com/<repository>/releases/download/<release_tag>/<datei>`
+    GithubRelease,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCatalog {
+    default_model: String,
+    models: Vec<RawModel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModel {
+    key: String,
+    source: ModelSource,
+    repository: String,
+    #[serde(default)]
+    revision: Option<String>,
+    #[serde(default)]
+    release_tag: Option<String>,
+    files: Vec<Artifact>,
+}
+
+impl RawModel {
+    fn manifest(&self) -> ArtifactManifest {
+        ArtifactManifest {
+            key: self.key.clone(),
+            files: self.files.clone(),
+        }
+    }
+
+    /// Die einzige URL, die aus der Herkunft folgt. Nichts wird aus der URL
+    /// zurückgeraten — umgekehrt muss die URL hierzu passen.
+    fn expected_url(&self, name: &str) -> Result<String, String> {
+        let key = &self.key;
+        match (self.source, &self.revision, &self.release_tag) {
+            (ModelSource::Huggingface, Some(rev), None) => {
+                if !is_lower_hex(rev, 40) {
+                    return Err(format!(
+                        "{key}: revision muss ein voller Git-Commit sein (40 Hex-Zeichen)"
+                    ));
+                }
+                Ok(format!(
+                    "https://huggingface.co/{}/resolve/{rev}/{name}",
+                    self.repository
+                ))
+            }
+            (ModelSource::GithubRelease, None, Some(tag)) => {
+                if !is_safe_component(tag) {
+                    return Err(format!("{key}: release_tag {tag:?} ist kein sicherer Name"));
+                }
+                Ok(format!(
+                    "https://github.com/{}/releases/download/{tag}/{name}",
+                    self.repository
+                ))
+            }
+            (ModelSource::Huggingface, ..) => Err(format!(
+                "{key}: source huggingface braucht revision und kein release_tag"
+            )),
+            (ModelSource::GithubRelease, ..) => Err(format!(
+                "{key}: source github-release braucht release_tag und keine revision"
+            )),
+        }
+    }
+}
+
+/// Geprüfter Katalog aus `models.toml`.
+#[derive(Debug, Clone)]
+struct Catalog {
+    default_model: String,
+    models: Vec<RawModel>,
+}
+
+fn parse_catalog(text: &str) -> Result<Catalog, String> {
+    let raw: RawCatalog = toml::from_str(text).map_err(|e| e.to_string())?;
+    if raw.models.is_empty() {
+        return Err("keine Modelle".into());
+    }
+    let mut keys: Vec<&str> = Vec::with_capacity(raw.models.len());
+    for model in &raw.models {
+        validate_model(model)?;
+        if keys.contains(&model.key.as_str()) {
+            return Err(format!("Modellschlüssel {:?} doppelt", model.key));
+        }
+        keys.push(&model.key);
+    }
+    if !keys.contains(&raw.default_model.as_str()) {
+        return Err(format!(
+            "default_model {:?} steht nicht unter [[models]]",
+            raw.default_model
+        ));
+    }
+    Ok(Catalog {
+        default_model: raw.default_model,
+        models: raw.models,
+    })
+}
+
+fn validate_model(model: &RawModel) -> Result<(), String> {
+    let key = &model.key;
+    // Der Schlüssel wird zum Verzeichnisnamen unter `models\` (§6.3).
+    if !is_safe_component(key) {
+        return Err(format!(
+            "Modellschlüssel {key:?} ist kein sicherer Verzeichnisname"
+        ));
+    }
+    let repo_ok = model
+        .repository
+        .split_once('/')
+        .is_some_and(|(owner, name)| is_safe_component(owner) && is_safe_component(name));
+    if !repo_ok {
+        return Err(format!(
+            "{key}: repository {:?} muss <owner>/<name> sein",
+            model.repository
+        ));
+    }
+    if model.files.is_empty() {
+        return Err(format!("{key}: keine Dateien"));
+    }
+    let mut names: Vec<&str> = Vec::with_capacity(model.files.len());
+    for file in &model.files {
+        let name = &file.name;
+        if !is_safe_component(name) || name == COMPLETE_MARKER || name.ends_with(PART_SUFFIX) {
+            return Err(format!("{key}: Dateiname {name:?} ist nicht zulässig"));
+        }
+        if names.contains(&name.as_str()) {
+            return Err(format!("{key}: Datei {name:?} doppelt"));
+        }
+        names.push(name);
+        if file.bytes == 0 {
+            return Err(format!("{key}/{name}: bytes = 0"));
+        }
+        if !is_lower_hex(&file.sha256, 64) {
+            return Err(format!("{key}/{name}: sha256 muss 64 Hex-Zeichen haben"));
+        }
+        let expected = model.expected_url(name)?;
+        if file.url != expected {
+            return Err(format!(
+                "{key}/{name}: url {:?} folgt nicht aus der Herkunft (erwartet {expected:?})",
+                file.url
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Ein Pfadbestandteil ohne Trenner, ohne `..`, ohne führenden Punkt.
+fn is_safe_component(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && !text.contains("..")
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Der eingebaute Katalog, einmal geparst und geprüft.
+fn catalog() -> Result<&'static Catalog, DownloadError> {
+    static CATALOG: OnceLock<Result<Catalog, String>> = OnceLock::new();
+    CATALOG
+        .get_or_init(|| parse_catalog(MANIFEST_TOML))
+        .as_ref()
+        .map_err(|e| DownloadError::Manifest(e.clone()))
+}
+
+/// Alle freigegebenen Modellschlüssel in Manifest-Reihenfolge (§6.2).
+pub fn model_keys() -> Result<Vec<&'static str>, DownloadError> {
+    Ok(catalog()?.models.iter().map(|m| m.key.as_str()).collect())
+}
+
+/// `default_model` aus dem Manifest; ein Test hält es gleich `DEFAULT_MODEL`.
+pub fn default_model_key() -> Result<&'static str, DownloadError> {
+    Ok(catalog()?.default_model.as_str())
+}
+
+/// Erlaubte Schlüssel für Fehlermeldungen: `"a", "b"`.
+pub fn allowed_models_hint(keys: &[&str]) -> String {
+    keys.iter()
+        .map(|k| format!("{k:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// SHA-256 (klein, hex) der eingebauten `models.toml`-Bytes, ungeparst
+/// (§9 `--manifest-sha256`): Das Release-Skript vergleicht damit das Binary
+/// mit `src\models.toml`, auch bei `-SkipBuild`.
+pub fn manifest_sha256() -> String {
+    format!("{:x}", Sha256::digest(MANIFEST_TOML.as_bytes()))
+}
+
+/// Manifest eines Schlüssels. Unbekannt ist ein Fehler — es gibt keinen
+/// Ersatz durch ein anderes Modell (§6.2).
+pub fn load_manifest(key: &str) -> Result<ArtifactManifest, DownloadError> {
+    let catalog = catalog()?;
+    match catalog.models.iter().find(|m| m.key == key) {
+        Some(model) => Ok(model.manifest()),
+        None => Err(DownloadError::UnknownModel {
+            key: key.to_string(),
+            allowed: allowed_models_hint(
+                &catalog
+                    .models
+                    .iter()
+                    .map(|m| m.key.as_str())
+                    .collect::<Vec<_>>(),
+            ),
+        }),
+    }
+}
+
+/// `%LOCALAPPDATA%\diktier\models\` — darunter ein Verzeichnis je Schlüssel.
+pub fn models_root() -> Result<PathBuf, DownloadError> {
+    let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+        DownloadError::Path("Umgebungsvariable LOCALAPPDATA ist nicht gesetzt".into())
+    })?;
+    Ok(PathBuf::from(local).join("diktier").join("models"))
 }
 
 /// `%LOCALAPPDATA%\diktier\models\<key>\`.
 pub fn model_dir(key: &str) -> Result<PathBuf, DownloadError> {
-    let local = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
-        DownloadError::Path("Umgebungsvariable LOCALAPPDATA ist nicht gesetzt".into())
-    })?;
-    Ok(PathBuf::from(local)
-        .join("diktier")
-        .join("models")
-        .join(key))
+    Ok(models_root()?.join(key))
+}
+
+/// Der für diesen Lauf gewählte Manifesteintrag samt Verzeichnis (§6.2).
+///
+/// Entsteht einmal aus `engine.model` und wird von dort an durchgereicht:
+/// Daemon, Download-Worker, Engine, Tray und stt-smoke lesen Schlüssel,
+/// Dateisatz und Verzeichnis nur hier ab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedModel {
+    manifest: ArtifactManifest,
+    dir: PathBuf,
+}
+
+impl SelectedModel {
+    /// Auswahl unter `%LOCALAPPDATA%\diktier\models\`.
+    pub fn select(key: &str) -> Result<Self, DownloadError> {
+        let manifest = load_manifest(key)?;
+        Ok(Self::new(model_dir(&manifest.key)?, manifest))
+    }
+
+    /// Auswahl unter einem anderen Wurzelverzeichnis (Tests).
+    pub fn select_in(root: &Path, key: &str) -> Result<Self, DownloadError> {
+        let manifest = load_manifest(key)?;
+        Ok(Self::new(root.join(&manifest.key), manifest))
+    }
+
+    /// Frei zusammengesetzt (Fakes mit kleinen Dateien).
+    pub fn new(dir: PathBuf, manifest: ArtifactManifest) -> Self {
+        Self { manifest, dir }
+    }
+
+    pub fn key(&self) -> &str {
+        &self.manifest.key
+    }
+
+    pub fn manifest(&self) -> &ArtifactManifest {
+        &self.manifest
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Startprüfung: Existenz und Größe (§6.3 „Prüfumfang").
+    pub fn check(&self) -> Result<(), DownloadError> {
+        check_artifacts(&self.dir, &self.manifest)
+    }
 }
 
 /// Existenz und Dateigröße gegen das Manifest. SHA-256 nur im Download-Pfad
@@ -250,8 +530,8 @@ pub fn download_model(
         });
     }
 
-    // §6.3: „zuletzt Marker COMPLETE schreiben." Erst wenn wirklich alle vier
-    // Dateien geprüft an ihrem Platz liegen.
+    // §6.3: „zuletzt Marker COMPLETE schreiben." Erst wenn wirklich alle
+    // Dateien dieses Manifests geprüft an ihrem Platz liegen.
     write_marker(dir, &manifest.key)?;
     Ok(())
 }
@@ -420,7 +700,8 @@ fn write_marker(dir: &Path, key: &str) -> Result<(), DownloadError> {
     Ok(())
 }
 
-/// HTTPS-Transport für den echten Download (§6.3: immutable Hugging-Face-URLs).
+/// HTTPS-Transport für den echten Download (§6.3: unveränderliche URLs —
+/// Hugging-Face-Commit oder Asset eines immutable GitHub-Releases).
 pub struct HttpTransport {
     agent: ureq::Agent,
 }
@@ -466,9 +747,26 @@ mod tests {
     use crate::config::DEFAULT_MODEL;
     use sha2::{Digest, Sha256};
 
+    const ULTRA: &str = "parakeet-ultra-0.6b-int8-pc";
+
+    /// §9 `--manifest-sha256`: Digest der eingebetteten Bytes, gleich dem der
+    /// Quelldatei auf Platte (so vergleicht es `release.ps1`), klein und hex.
+    #[test]
+    fn manifest_sha256_matches_source_file() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("models.toml");
+        let on_disk = std::fs::read(path).unwrap();
+        let expected = format!("{:x}", Sha256::digest(&on_disk));
+        assert_eq!(manifest_sha256(), expected);
+        assert!(is_lower_hex(&manifest_sha256(), 64));
+    }
+
+    /// v3 bleibt in allen Werten wie vor dem Mehrmodell-Manifest, URLs
+    /// eingeschlossen (Golden Set, §6.3).
     #[test]
     fn golden_set_matches_spec() {
-        let manifest = load_manifest().unwrap();
+        let manifest = load_manifest(DEFAULT_MODEL).unwrap();
         assert_eq!(manifest.key, DEFAULT_MODEL);
         const REV: &str = "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce";
         const BASE: &str = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve";
@@ -503,10 +801,223 @@ mod tests {
         }
     }
 
+    /// Ultra-Artefakte nach der SPEC-Tabelle (§6.3 „Ultra-Artefakte", v1.10):
+    /// drei Dateien, kein `config.json`, kanonische Release-URLs.
+    #[test]
+    fn ultra_set_matches_spec() {
+        let manifest = load_manifest(ULTRA).unwrap();
+        assert_eq!(manifest.key, ULTRA);
+        const BASE: &str = "https://github.com/ralfkuh-lab/diktier-models/releases/download/model-parakeet-ultra-0.6b-int8-pc-r1";
+        let expected = [
+            (
+                "encoder-model.int8.onnx",
+                700_507_227_u64,
+                "2cc01c15a08d6976ca9ebe97739d15890f3088cfedd3a4aa4d969ba7a1702038",
+            ),
+            (
+                "decoder_joint-model.int8.onnx",
+                18_300_628,
+                "afcb9459250ab5c2e48e657d852501c233e8b7f5daed1894a2a7101d21165a5e",
+            ),
+            (
+                "vocab.txt",
+                93_939,
+                "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
+            ),
+        ];
+        assert_eq!(manifest.files.len(), expected.len());
+        for (file, (name, bytes, sha)) in manifest.files.iter().zip(expected) {
+            assert_eq!(file.name, name);
+            assert_eq!(file.bytes, bytes);
+            assert_eq!(file.sha256, sha);
+            assert_eq!(file.url, format!("{BASE}/{name}"));
+        }
+        assert!(manifest.files.iter().all(|f| f.name != "config.json"));
+    }
+
+    #[test]
+    fn catalog_origin_is_structured_per_model() {
+        let catalog = catalog().unwrap();
+        let v3 = catalog
+            .models
+            .iter()
+            .find(|m| m.key == DEFAULT_MODEL)
+            .unwrap();
+        assert_eq!(v3.source, ModelSource::Huggingface);
+        assert_eq!(v3.repository, "istupakov/parakeet-tdt-0.6b-v3-onnx");
+        assert_eq!(
+            v3.revision.as_deref(),
+            Some("8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce")
+        );
+        assert_eq!(v3.release_tag, None);
+
+        let ultra = catalog.models.iter().find(|m| m.key == ULTRA).unwrap();
+        assert_eq!(ultra.source, ModelSource::GithubRelease);
+        assert_eq!(ultra.repository, "ralfkuh-lab/diktier-models");
+        assert_eq!(ultra.revision, None);
+        assert_eq!(
+            ultra.release_tag.as_deref(),
+            Some("model-parakeet-ultra-0.6b-int8-pc-r1")
+        );
+    }
+
+    /// §6.2: genau zwei Schlüssel, eindeutig, Default = `DEFAULT_MODEL`.
+    #[test]
+    fn catalog_keys_are_unique_and_default_is_v3() {
+        let keys = model_keys().unwrap();
+        assert_eq!(keys, [DEFAULT_MODEL, ULTRA]);
+        assert_eq!(default_model_key().unwrap(), DEFAULT_MODEL);
+    }
+
+    /// Jeder Schlüssel ist ein eigenes, sicheres Verzeichnis direkt unter der
+    /// Modellwurzel; die beiden Verzeichnisse sind verschieden.
+    #[test]
+    fn model_dirs_are_safe_and_separate() {
+        let root = Path::new("C:/root/models");
+        let mut dirs = Vec::new();
+        for key in model_keys().unwrap() {
+            assert!(is_safe_component(key), "{key}");
+            assert!(!key.contains(['/', '\\', ':']), "{key}");
+            let model = SelectedModel::select_in(root, key).unwrap();
+            assert_eq!(model.key(), key);
+            assert_eq!(model.dir().parent(), Some(root));
+            assert_eq!(model.dir().file_name().unwrap(), key);
+            dirs.push(model.dir().to_path_buf());
+        }
+        dirs.dedup();
+        assert_eq!(dirs.len(), 2);
+    }
+
+    #[test]
+    fn unknown_key_is_an_error_naming_the_allowed_keys() {
+        let err = load_manifest("whisper-medium").unwrap_err();
+        match &err {
+            DownloadError::UnknownModel { key, .. } => assert_eq!(key, "whisper-medium"),
+            other => panic!("erwartet UnknownModel, bekam {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("whisper-medium"), "{msg}");
+        assert!(msg.contains(DEFAULT_MODEL), "{msg}");
+        assert!(msg.contains(ULTRA), "{msg}");
+        assert!(SelectedModel::select("whisper-medium").is_err());
+    }
+
+    /// Ein gültiger Mini-Katalog als Grundlage für die Negativfälle.
+    const MINI_HF: &str = r#"[[models]]
+key = "m"
+source = "huggingface"
+repository = "o/r"
+revision = "0123456789abcdef0123456789abcdef01234567"
+
+[[models.files]]
+name = "a.bin"
+bytes = 4
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+url = "https://huggingface.co/o/r/resolve/0123456789abcdef0123456789abcdef01234567/a.bin"
+"#;
+
+    fn mini_catalog(model_block: &str) -> String {
+        format!("default_model = \"m\"\n\n{model_block}")
+    }
+
+    #[test]
+    fn parse_catalog_accepts_the_mini_catalog() {
+        let catalog = parse_catalog(&mini_catalog(MINI_HF)).unwrap();
+        assert_eq!(catalog.models.len(), 1);
+    }
+
+    #[test]
+    fn parse_catalog_rejects_broken_entries() {
+        let key = |to: &str| mini_catalog(&MINI_HF.replace(r#"key = "m""#, to));
+        let name = |to: &str| mini_catalog(&MINI_HF.replace(r#"name = "a.bin""#, to));
+        let cases: Vec<(String, &str)> = vec![
+            (mini_catalog(&format!("{MINI_HF}\n{MINI_HF}")), "doppelt"),
+            (key(r#"key = "../m""#), "Verzeichnis"),
+            (key(r#"key = "a/b""#), "Verzeichnis"),
+            (key(r#"key = "a\\b""#), "Verzeichnis"),
+            (key(r#"key = ".m""#), "Verzeichnis"),
+            (key(r#"key = """#), "Verzeichnis"),
+            (name(r#"name = "../a.bin""#), "nicht zulässig"),
+            (name(r#"name = "sub/a.bin""#), "nicht zulässig"),
+            (name(r#"name = "COMPLETE""#), "nicht zulässig"),
+            (name(r#"name = "a.bin.part""#), "nicht zulässig"),
+            (
+                mini_catalog(&MINI_HF.replace(r#"/a.bin""#, r#"/b.bin""#)),
+                "folgt nicht",
+            ),
+            (
+                mini_catalog(&MINI_HF.replace("revision = ", "release_tag = \"t\"\nrevision = ")),
+                "kein release_tag",
+            ),
+            (
+                mini_catalog(&MINI_HF.replace("0123456789abcdef01234567\"\n", "main\"\n")),
+                "40 Hex",
+            ),
+            (
+                mini_catalog(&MINI_HF.replace(r#""huggingface""#, r#""mirror""#)),
+                "unknown variant",
+            ),
+            (
+                mini_catalog(&MINI_HF.replace("bytes = 4", "bytes = 4\nsize = 4")),
+                "unknown field",
+            ),
+            (
+                mini_catalog(&MINI_HF.replace("bytes = 4", "bytes = 0")),
+                "bytes = 0",
+            ),
+            (
+                mini_catalog(&MINI_HF.replace(r#"repository = "o/r""#, r#"repository = "o""#)),
+                "repository",
+            ),
+            (
+                format!("default_model = \"x\"\n\n{MINI_HF}"),
+                "default_model",
+            ),
+            (
+                String::from("default_model = \"m\"\nmodels = []\n"),
+                "keine Modelle",
+            ),
+        ];
+        for (text, needle) in cases {
+            let err = parse_catalog(&text).unwrap_err();
+            assert!(err.contains(needle), "erwartet {needle:?} in {err:?}");
+        }
+    }
+
+    /// Eine GitHub-Herkunft verlangt `release_tag` und die kanonische
+    /// `releases/download`-Adresse — kein Redirect-Ziel, kein „latest“.
+    #[test]
+    fn github_origin_requires_the_canonical_release_url() {
+        let block = r#"[[models]]
+key = "m"
+source = "github-release"
+repository = "o/r"
+release_tag = "t-1"
+
+[[models.files]]
+name = "a.bin"
+bytes = 4
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+url = "https://github.com/o/r/releases/download/t-1/a.bin"
+"#;
+        parse_catalog(&mini_catalog(block)).unwrap();
+        let redirected = block.replace(
+            "https://github.com/o/r/releases/download/t-1/a.bin",
+            "https://objects.githubusercontent.com/o/r/a.bin",
+        );
+        let err = parse_catalog(&mini_catalog(&redirected)).unwrap_err();
+        assert!(err.contains("folgt nicht"), "{err}");
+        let latest = block.replace("releases/download/t-1/", "releases/latest/download/");
+        assert!(parse_catalog(&mini_catalog(&latest)).is_err());
+        let no_tag = block.replace("release_tag = \"t-1\"\n", "");
+        let err = parse_catalog(&mini_catalog(&no_tag)).unwrap_err();
+        assert!(err.contains("braucht release_tag"), "{err}");
+    }
+
     #[test]
     fn check_artifacts_reports_missing_and_size() {
         let dir = tempfile::tempdir().unwrap();
-        let manifest = load_manifest().unwrap();
+        let manifest = load_manifest(DEFAULT_MODEL).unwrap();
         let err = check_artifacts(dir.path(), &manifest).unwrap_err();
         assert!(matches!(err, DownloadError::Missing(_)));
 
@@ -982,5 +1493,128 @@ mod tests {
             complete_marker(Path::new("/x/models/key")),
             PathBuf::from("/x/models/key/COMPLETE")
         );
+    }
+
+    // ------------------------------------------------ Mehrmodell (v1.10)
+
+    /// Das echte Manifest eines Schlüssels mit kleinen Fake-Inhalten: Schlüssel,
+    /// Dateinamen und URLs bleiben, Größe und Hash passen zu den Fakes.
+    fn shrunk(key: &str) -> (ArtifactManifest, FakeTransport) {
+        let mut manifest = load_manifest(key).unwrap();
+        let mut bodies = Vec::new();
+        for file in &mut manifest.files {
+            let data = format!("{key}/{}", file.name).into_bytes();
+            file.bytes = data.len() as u64;
+            file.sha256 = sha_hex(&data);
+            bodies.push((file.url.clone(), FakeBody::ok(&data)));
+        }
+        let transport = FakeTransport {
+            bodies: bodies.into_iter().collect(),
+            ..FakeTransport::default()
+        };
+        (manifest, transport)
+    }
+
+    /// Drei-Datei-Satz ohne `config.json` (Ultra, §6.3): genau diese drei
+    /// URLs, danach `COMPLETE` mit dem Ultra-Schlüssel.
+    #[test]
+    fn three_file_set_without_config_json_downloads_completely() {
+        let temp = tempfile::tempdir().unwrap();
+        let (manifest, transport) = shrunk(ULTRA);
+        let model = SelectedModel::new(temp.path().join(ULTRA), manifest.clone());
+
+        let cancel = no_cancel();
+        download_model(
+            model.dir(),
+            model.manifest(),
+            &transport,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        let urls: Vec<String> = manifest.files.iter().map(|f| f.url.clone()).collect();
+        assert_eq!(transport.calls(), urls);
+        assert!(
+            urls.iter()
+                .all(|u| u.starts_with("https://github.com/ralfkuh-lab/diktier-models/")),
+            "{urls:?}"
+        );
+        assert_eq!(
+            dir_entries(model.dir()),
+            [
+                "COMPLETE",
+                "decoder_joint-model.int8.onnx",
+                "encoder-model.int8.onnx",
+                "vocab.txt"
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(complete_marker(model.dir())).unwrap(),
+            format!("{ULTRA}\n")
+        );
+        model.check().unwrap();
+        verify_artifacts_sha256(model.dir(), model.manifest()).unwrap();
+    }
+
+    /// Die Download-Sperre bleibt **eine** gemeinsame (Sol W3): Lädt gerade
+    /// v3, bekommt Ultra `Busy`; danach landet jedes Modell in seinem eigenen
+    /// Verzeichnis, keines berührt das andere.
+    #[test]
+    fn shared_download_lock_with_separate_model_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("models");
+        let lock_path = temp.path().join("diktier-download.lock");
+        let (v3_manifest, v3_transport) = shrunk(DEFAULT_MODEL);
+        let (ultra_manifest, ultra_transport) = shrunk(ULTRA);
+        let v3 = SelectedModel::new(root.join(DEFAULT_MODEL), v3_manifest);
+        let ultra = SelectedModel::new(root.join(ULTRA), ultra_manifest);
+        let cancel = no_cancel();
+
+        let held = single_instance::try_lock(&lock_path)
+            .unwrap()
+            .held()
+            .unwrap();
+        let busy = download_model_locked(
+            &lock_path,
+            ultra.dir(),
+            ultra.manifest(),
+            &ultra_transport,
+            &cancel,
+            &mut |_| {},
+        );
+        assert!(matches!(busy.unwrap_err(), DownloadError::Busy(_)));
+        assert!(ultra_transport.calls().is_empty());
+        assert!(!ultra.dir().exists());
+        drop(held);
+
+        download_model_locked(
+            &lock_path,
+            ultra.dir(),
+            ultra.manifest(),
+            &ultra_transport,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(!v3.dir().exists(), "Ultra-Download berührt v3 nicht");
+        assert!(v3_transport.calls().is_empty());
+
+        download_model_locked(
+            &lock_path,
+            v3.dir(),
+            v3.manifest(),
+            &v3_transport,
+            &cancel,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(dir_entries(&root), [DEFAULT_MODEL, ULTRA]);
+        assert_eq!(dir_entries(v3.dir()).len(), 5, "vier Dateien + COMPLETE");
+        assert_eq!(dir_entries(ultra.dir()).len(), 4, "drei Dateien + COMPLETE");
+        v3.check().unwrap();
+        ultra.check().unwrap();
+        // Der Ultra-Satz besteht die v3-Prüfung nicht (anderer Dateisatz).
+        assert!(check_artifacts(ultra.dir(), v3.manifest()).is_err());
     }
 }

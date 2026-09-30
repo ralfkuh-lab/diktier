@@ -7,6 +7,7 @@
 //! blockiert nie auf einem Worker — das ist die Bedingung dafür, dass
 //! `QuitRequested` jederzeit greift (codex H4 zu §7.1 P6).
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::{AudioSource, CpalAudioSource, LevelTap};
 use crate::config::{AudioConfig, OutputConfig};
-use crate::download::{self, ArtifactManifest, DownloadError, HttpTransport, Progress};
+use crate::download::{self, DownloadError, HttpTransport, Progress, SelectedModel, Transport};
 use crate::engine::{ParakeetTranscriber, transcribe_pcm};
 use crate::hotkey::{HotkeyBackend, HotkeyEvent, HotkeySpec, new_backend};
 use crate::inject::{
@@ -220,7 +221,7 @@ pub struct EngineWorker {
 
 impl EngineWorker {
     pub fn spawn(
-        model: String,
+        model: SelectedModel,
         threads: u32,
         out: Sender<Msg>,
         log: Arc<Logger>,
@@ -278,7 +279,13 @@ impl EngineWorker {
     }
 }
 
-fn engine_loop(rx: Receiver<EngineCmd>, out: Sender<Msg>, model: &str, threads: u32, log: &Logger) {
+fn engine_loop(
+    rx: Receiver<EngineCmd>,
+    out: Sender<Msg>,
+    model: &SelectedModel,
+    threads: u32,
+    log: &Logger,
+) {
     let mut engine: Option<ParakeetTranscriber> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -288,8 +295,9 @@ fn engine_loop(rx: Receiver<EngineCmd>, out: Sender<Msg>, model: &str, threads: 
                     Ok(loaded) => {
                         engine = Some(loaded);
                         log.info(format!(
-                            "Modell geladen in {:.3} s ({model})",
-                            t0.elapsed().as_secs_f64()
+                            "Modell geladen in {:.3} s ({})",
+                            t0.elapsed().as_secs_f64(),
+                            model.key()
                         ));
                         let _ = out.send(Msg::Event(Event::ModelLoaded { run }));
                     }
@@ -356,7 +364,7 @@ pub struct DownloadWorker {
 impl DownloadWorker {
     pub fn spawn(
         run: RunId,
-        manifest: ArtifactManifest,
+        model: SelectedModel,
         out: Sender<Msg>,
         log: Arc<Logger>,
     ) -> Result<Self, String> {
@@ -364,7 +372,7 @@ impl DownloadWorker {
         let flag = cancel.clone();
         let join = thread::Builder::new()
             .name("diktier-download".into())
-            .spawn(move || download_loop(run, &manifest, &out, &log, &flag))
+            .spawn(move || download_loop(run, &model, &out, &log, &flag))
             .map_err(|e| format!("Download-Thread: {e}"))?;
         Ok(Self {
             cancel,
@@ -388,40 +396,50 @@ impl DownloadWorker {
 
 fn download_loop(
     run: RunId,
-    manifest: &ArtifactManifest,
+    model: &SelectedModel,
     out: &Sender<Msg>,
     log: &Logger,
     cancel: &AtomicBool,
 ) {
-    let fail = |message: String| {
-        log.error(&message);
-        let _ = out.send(Msg::Event(Event::DownloadFailed { run, message }));
+    let event = match single_instance::download_lock_path() {
+        Ok(lock_path) => run_download(run, model, &HttpTransport::new(), &lock_path, cancel, log),
+        Err(err) => {
+            let message = err.to_string();
+            log.error(&message);
+            Some(Event::DownloadFailed { run, message })
+        }
     };
+    if let Some(event) = event {
+        let _ = out.send(Msg::Event(event));
+    }
+}
 
-    let dir = match download::model_dir(&manifest.key) {
-        Ok(dir) => dir,
-        Err(err) => return fail(err.to_string()),
-    };
-    let lock_path = match single_instance::download_lock_path() {
-        Ok(path) => path,
-        Err(err) => return fail(err.to_string()),
-    };
-
+/// Download des gewählten Modells in **sein** Verzeichnis (§6.2, §6.3) —
+/// ohne Thread und mit austauschbarem Transport, damit die Tests denselben
+/// Weg mit Fakes gehen. `None` heißt: beim Beenden abgebrochen, kein Event.
+pub(super) fn run_download(
+    run: RunId,
+    model: &SelectedModel,
+    transport: &dyn Transport,
+    lock_path: &Path,
+    cancel: &AtomicBool,
+    log: &Logger,
+) -> Option<Event> {
+    let manifest = model.manifest();
     let total: u64 = manifest.files.iter().map(|f| f.bytes).sum();
     log.info(format!(
         "Modell wird geladen: {} Dateien, {} nach {}",
         manifest.files.len(),
         human_bytes(total),
-        dir.display()
+        model.dir().display()
     ));
 
-    let transport = HttpTransport::new();
     let t0 = Instant::now();
     let result = download::download_model_locked(
-        &lock_path,
-        &dir,
+        lock_path,
+        model.dir(),
         manifest,
-        &transport,
+        transport,
         cancel,
         &mut |progress| log_progress(log, progress),
     );
@@ -432,12 +450,19 @@ fn download_loop(
                 "Modellartefakte vollständig und geprüft ({:.1} s)",
                 t0.elapsed().as_secs_f64()
             ));
-            let _ = out.send(Msg::Event(Event::DownloadFinished { run }));
+            Some(Event::DownloadFinished { run })
         }
         // Beim Beenden ist der Abbruch gewollt: kein Fehlerzustand, keine
         // Fehlerzeile — der Quit-Pfad läuft ohnehin schon.
-        Err(DownloadError::Cancelled) => log.info("Download abgebrochen (Beenden)"),
-        Err(err) => fail(err.to_string()),
+        Err(DownloadError::Cancelled) => {
+            log.info("Download abgebrochen (Beenden)");
+            None
+        }
+        Err(err) => {
+            let message = err.to_string();
+            log.error(&message);
+            Some(Event::DownloadFailed { run, message })
+        }
     }
 }
 
@@ -515,9 +540,12 @@ impl AudioWorker {
     /// `level`: geteilter Pegel fürs Aufnahme-Overlay (§4.5) oder `None`, wenn
     /// `[overlay] enabled = false` ist — dann rechnet der cpal-Callback ihn
     /// gar nicht erst aus.
+    ///
+    /// `debug_wav`: der beim Start einmal gelesene Dump (§10) oder `None`.
     pub fn spawn(
         config: AudioConfig,
         level: Option<Arc<LevelTap>>,
+        debug_wav: Option<debug_wav::DebugWavConfig>,
         out: Sender<Msg>,
         log: Arc<Logger>,
     ) -> Result<Self, String> {
@@ -525,7 +553,7 @@ impl AudioWorker {
         let worker_out = out.clone();
         let join = thread::Builder::new()
             .name("diktier-audio".into())
-            .spawn(move || audio_loop(rx, worker_out, &config, level, &log))
+            .spawn(move || audio_loop(rx, worker_out, &config, level, debug_wav.as_ref(), &log))
             .map_err(|e| format!("Audio-Thread: {e}"))?;
         Ok(Self {
             tx,
@@ -576,6 +604,7 @@ fn audio_loop(
     out: Sender<Msg>,
     config: &AudioConfig,
     level: Option<Arc<LevelTap>>,
+    debug_wav: Option<&debug_wav::DebugWavConfig>,
     log: &Logger,
 ) {
     let mut source = CpalAudioSource::new(config, level);
@@ -658,7 +687,9 @@ fn audio_loop(
                             log.run(run, "Aufnahme verworfen");
                             continue;
                         }
-                        dump_debug_wav(run, &captured.samples, log);
+                        if let Some(debug_wav) = debug_wav {
+                            dump_debug_wav(debug_wav, run, &captured.samples, log);
+                        }
                         let _ = out.send(Msg::Audio {
                             run,
                             samples: captured.samples,
@@ -685,18 +716,10 @@ fn audio_loop(
     }
 }
 
-/// §10 `DIKTIER_DEBUG_WAV=1`: ein Dump je Aufnahme im Ring der letzten zehn,
+/// §10 `DIKTIER_DEBUG_WAV=1`: ein Dump je Aufnahme im konfigurierten Ring,
 /// genau eine Logzeile. Die Laufnummer im Dateinamen passt zu „Lauf N:“ im Log.
-fn dump_debug_wav(run: RunId, samples: &[f32], log: &Logger) {
-    if !debug_wav::enabled() {
-        return;
-    }
-    match debug_wav::write_recording(
-        &debug_wav::debug_dir(),
-        samples,
-        run,
-        std::time::SystemTime::now(),
-    ) {
+fn dump_debug_wav(config: &debug_wav::DebugWavConfig, run: RunId, samples: &[f32], log: &Logger) {
+    match debug_wav::write_recording(config, samples, run, std::time::SystemTime::now()) {
         Ok(path) => log.info(format!("DIKTIER_DEBUG_WAV: {}", path.display())),
         Err(err) => log.warn(format!("DIKTIER_DEBUG_WAV fehlgeschlagen: {err}")),
     }

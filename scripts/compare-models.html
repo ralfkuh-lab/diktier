@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Vorlage für scripts/compare-models.ps1 -Prepare. Keine externen Ressourcen:
+     die Seite läuft ohne Netz, die Daten stehen im JSON-Block unten. Audio nur
+     über neutrale Aliasse audio/<ID>.wav im Auswertungsordner. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src file:">
+<title>Alltagstest Ultra – verdeckter Vergleich</title>
+<style>
+:root {
+  --bg: #fafafa; --fg: #1d1d1f; --muted: #666; --card: #fff; --line: #d8d8dc;
+  --del: #ffd7d5; --del-fg: #8a1c14; --ins: #d4f5dc; --ins-fg: #145a26; --done: #2e7d32; --open: #b26a00;
+  --err-bg: #fde2e1; --err-fg: #8a1c14; --warn-bg: #fff1d6; --warn-fg: #6b4200; --ok-fg: #1f6b2a;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161618; --fg: #e8e8ea; --muted: #a0a0a6; --card: #212124; --line: #3a3a3f;
+    --del: #5a2320; --del-fg: #ffd2cd; --ins: #1f4a2a; --ins-fg: #c9f5d3; --done: #7cc97f; --open: #f0b35a;
+    --err-bg: #4a1f1d; --err-fg: #ffd2cd; --warn-bg: #4a3712; --warn-fg: #ffe2a8; --ok-fg: #9be09f;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, "Segoe UI", sans-serif; }
+main { max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+h2 { font-size: 1.15rem; margin: 2rem 0 .5rem; }
+.muted { color: var(--muted); }
+.bar { position: sticky; top: 0; z-index: 1; background: var(--bg); padding: .5rem 0; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; }
+.bar button { font: inherit; padding: .3rem .8rem; }
+.msg { border-radius: 6px; padding: .4rem .7rem; margin: .4rem 0; }
+.msg.err { background: var(--err-bg); color: var(--err-fg); font-weight: 600; }
+.msg.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.ok { color: var(--ok-fg); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .75rem 1rem; margin: .75rem 0; }
+.card.done { border-left: 4px solid var(--done); }
+.card.open { border-left: 4px solid var(--open); }
+.head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; margin-bottom: .5rem; }
+.id { font-weight: 600; }
+.texts { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+@media (max-width: 700px) { .texts { grid-template-columns: 1fr; } }
+.text { white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 6px; padding: .5rem; }
+.text .lbl { display: block; font-weight: 600; margin-bottom: .25rem; }
+.side { margin-top: .4rem; display: flex; flex-wrap: wrap; gap: .2rem .8rem; align-items: center; }
+.del { background: var(--del); color: var(--del-fg); border-radius: 3px; }
+.ins { background: var(--ins); color: var(--ins-fg); border-radius: 3px; }
+.ask { display: flex; flex-wrap: wrap; gap: .4rem 1.2rem; margin-top: .6rem; align-items: center; }
+fieldset { border: 0; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: .2rem .8rem; }
+textarea { width: 100%; min-height: 2.2rem; font: inherit; margin-top: .5rem; background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; }
+select { font: inherit; }
+audio { height: 2rem; max-width: 100%; }
+</style>
+</head>
+<body>
+<main>
+<h1>Alltagstest Ultra – verdeckter Vergleich</h1>
+<p class="muted" id="intro"></p>
+<div id="messages"></div>
+<div class="bar">
+  <span id="progress"></span>
+  <button type="button" id="pick">Urteilsdatei anlegen …</button>
+  <button type="button" id="open">Urteilsdatei öffnen …</button>
+  <button type="button" id="reset">Zwischenstand löschen</button>
+  <span id="saveInfo"></span>
+</div>
+
+<h2 id="h-pairs">1. Paare mit unterschiedlichem Text</h2>
+<p class="muted">Welche Seite ist richtiger? Für <strong>beide</strong> Seiten die Fehler markieren, die sie enthalten (keine oder mehrere von K1–K4, dazu K5 „nur Zahlenformat“); bei K1 je Seite, ob gravierend. Bei „A besser“ oder „B besser“ zusätzlich angeben, ob sich die Seiten <strong>nur im Zahlenformat</strong> unterscheiden (dann zählt das Paar als gleich, auch wenn beide Seiten dieselben anderen Fehler haben). Wiederholt ein Paar denselben Fehler eines anderen, „gleicher Fall wie“ setzen. Audio nur bei Unsicherheit anhören.</p>
+<div id="pairs"></div>
+
+<h2 id="h-sample">2. Stichprobe gleicher Ausgaben</h2>
+<p class="muted">Beide Modelle liefern denselben Text. Stimmt er? Bei einem Fehler die Kategorien markieren.</p>
+<div id="sample"></div>
+
+<h2 id="h-hp">3. „Herr Präsident“ am Anfang</h2>
+<p class="muted">Mindestens ein Modell beginnt mit „Herr Präsident“. Wurde es tatsächlich gesprochen? Bitte am Audio prüfen.</p>
+<div id="hp"></div>
+
+<h2 id="h-ich">4. „Ich“ am Anfang</h2>
+<p class="muted">Genau ein Modell beginnt mit dem Wort „Ich“. Wurde „Ich“ tatsächlich gesprochen? Bitte am Audio prüfen.</p>
+<div id="ich"></div>
+</main>
+
+<script type="application/json" id="daten">/*DATEN*/{}</script>
+<script>
+"use strict";
+const D = JSON.parse(document.getElementById("daten").textContent);
+const FORMAT = 3;
+const STORE = "diktier-ultra-test:" + D.auswertung;
+const CATS = Object.keys(D.kategorien);
+const FS_API = typeof window.showSaveFilePicker === "function";
+
+// ------------------------------------------------------------ Meldungen
+const msgs = new Map();
+function setMsg(key, kind, text) {
+  if (text) msgs.set(key, [kind, text]); else msgs.delete(key);
+  const box = document.getElementById("messages");
+  box.replaceChildren(...[...msgs.values()].map(([k, t]) => el("div", { class: "msg " + k, role: k === "err" ? "alert" : "status" }, t)));
+}
+
+function el(tag, attrs, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") n.className = v; else n.setAttribute(k, v);
+  }
+  for (const c of children) n.append(c);  // Strings werden Textknoten, nie HTML.
+  return n;
+}
+
+// ------------------------------------------------------------- Zustand
+function emptySide() { return { kategorien: [], k5: false }; }
+function emptyState() { return { paare: {}, stichprobe: {}, herr_praesident: {}, ich: {} }; }
+let state = emptyState();
+let storeBroken = false;
+
+// Nur Urteilscodes in den Browser-Speicher: keine Notizen, keine Texte.
+function codesOnly(s) {
+  const c = JSON.parse(JSON.stringify(s));
+  for (const j of Object.values(c.paare)) delete j.notiz;
+  return c;
+}
+
+function validShape(s) {
+  if (!s || typeof s !== "object") return false;
+  for (const k of ["paare", "stichprobe", "herr_praesident", "ich"]) {
+    if (!s[k] || typeof s[k] !== "object" || Array.isArray(s[k])) return false;
+  }
+  return true;
+}
+
+function loadStore() {
+  let raw = null;
+  try { raw = localStorage.getItem(STORE); }
+  catch (e) {
+    setMsg("store", "warn", "Browser-Speicher nicht lesbar (" + e.name + "). Urteile gehen nur in die Urteilsdatei.");
+    return;
+  }
+  if (raw === null) return;
+  let s = null;
+  try { s = JSON.parse(raw); } catch (e) { s = null; }
+  if (!validShape(s) || s.format !== FORMAT) {
+    // Nie still ersetzen: der beschädigte Stand bleibt, bis er ausdrücklich verworfen wird.
+    storeBroken = true;
+    setMsg("store", "err", "Der Zwischenstand im Browser ist beschädigt oder hat ein altes Format und wird NICHT überschrieben. Urteilsdatei öffnen oder „Zwischenstand löschen“.");
+    return;
+  }
+  delete s.format;
+  state = s;
+  setMsg("store", "warn", "Zwischenstand aus dem Browser geladen (nur Urteilscodes, ohne Notizen). Zum Weiterarbeiten die Urteilsdatei öffnen oder neu anlegen.");
+}
+
+function saveStore() {
+  if (storeBroken) return;
+  try {
+    localStorage.setItem(STORE, JSON.stringify(Object.assign({ format: FORMAT }, codesOnly(state))));
+    if (msgs.has("storeSave")) setMsg("storeSave");
+  } catch (e) {
+    setMsg("storeSave", "warn", "Browser-Zwischenstand nicht gespeichert (" + e.name + "). Maßgeblich ist die Urteilsdatei.");
+  }
+}
+
+// -------------------------------------------------------- Urteilsdatei
+// Gespeichert ist ein Stand erst, wenn close() seines Schreibvorgangs in die
+// aktuelle Datei erfolgreich war (WP2f F2). changeGen zählt jede Änderung,
+// savedGen ist die höchste so gesicherte Generation, failedGen die des letzten
+// gescheiterten Schreibvorgangs. fileEpoch wechselt mit der Datei, damit ein
+// später fertiger Schreibvorgang in eine alte Datei nichts als gespeichert
+// meldet.
+let fileHandle = null;
+let fileName = "";
+let fileEpoch = 0;
+let writeChain = Promise.resolve();
+let writeTimer = null;
+let changeGen = 0;
+let savedGen = 0;
+let failedGen = -1;
+let running = 0;
+let savedAt = "";
+let asked = false;
+let picking = false;
+
+function saveInfo(kind, text) {
+  const n = document.getElementById("saveInfo");
+  n.className = kind;
+  n.textContent = text;
+}
+
+function unsaved() { return changeGen !== savedGen || running > 0; }
+
+function updateSaveInfo() {
+  if (!FS_API) { saveInfo("", "nicht gespeichert"); return; }
+  if (!fileHandle) { saveInfo("", unsaved() ? "nicht gespeichert" : "noch keine Urteilsdatei"); return; }
+  if (failedGen > savedGen) { saveInfo("", "NICHT gespeichert"); return; }
+  if (changeGen !== savedGen) { saveInfo("", running > 0 ? "wird gespeichert …" : "Änderungen noch nicht gespeichert …"); return; }
+  saveInfo("ok", "gespeichert in " + fileName + " um " + savedAt);
+}
+
+// Neue Datei gebunden: darin steht noch nichts.
+function bindFile(h) {
+  fileEpoch++;
+  fileHandle = h;
+  fileName = h ? h.name : "";
+  clearTimeout(writeTimer); writeTimer = null;
+  savedGen = -1;
+  failedGen = -1;
+  setMsg("fileWrite");
+}
+
+function noFileWarning() {
+  if (!FS_API) return;
+  setMsg("file", "err", "Urteile sind NICHT in einer Datei gespeichert. „Urteilsdatei anlegen …“ wählen und im Auswertungsordner " + D.ordner + " als urteile.json speichern.");
+  saveInfo("", "nicht gespeichert");
+}
+
+async function pickFile() {
+  if (!FS_API || picking) return false;
+  picking = true;
+  try {
+    const h = await window.showSaveFilePicker({ suggestedName: "urteile.json",
+      types: [{ description: "JSON", accept: { "application/json": [".json"] } }] });
+    bindFile(h);
+    setMsg("file");
+    await writeNow();
+    return true;
+  } catch (e) {
+    if (e && e.name === "AbortError") { noFileWarning(); return false; }
+    setMsg("file", "err", "Urteilsdatei nicht angelegt: " + (e && e.name) + " " + (e && e.message));
+    return false;
+  } finally {
+    picking = false;
+  }
+}
+
+async function openFile() {
+  if (!FS_API || typeof window.showOpenFilePicker !== "function") return;
+  let h;
+  try {
+    [h] = await window.showOpenFilePicker({ types: [{ description: "JSON", accept: { "application/json": [".json"] } }] });
+  } catch (e) {
+    if (!(e && e.name === "AbortError")) setMsg("file", "err", "Urteilsdatei nicht geöffnet: " + (e && e.name));
+    return;
+  }
+  let doc;
+  try { doc = JSON.parse(await (await h.getFile()).text()); }
+  catch (e) { setMsg("file", "err", "Urteilsdatei ist kein lesbares JSON und wurde nicht übernommen."); return; }
+  if (!doc || doc.auswertung !== D.auswertung || doc.format !== FORMAT) {
+    setMsg("file", "err", "Diese Datei gehört nicht zu Auswertung " + D.auswertung + " (Format " + FORMAT + ") und wurde nicht übernommen.");
+    return;
+  }
+  const s = { paare: doc.paare || {}, stichprobe: doc.stichprobe || {}, herr_praesident: doc.herr_praesident || {}, ich: doc.ich || {} };
+  if (!validShape(s)) { setMsg("file", "err", "Urteilsdatei hat eine unbekannte Struktur und wurde nicht übernommen."); return; }
+  state = s;
+  bindFile(h);
+  // Der Stand kommt aus genau dieser Datei: nichts ungespeichert.
+  changeGen++; savedGen = changeGen;
+  storeBroken = false;
+  setMsg("store"); setMsg("file");
+  try { if (h.requestPermission) await h.requestPermission({ mode: "readwrite" }); } catch (e) { /* fragt beim ersten Schreiben erneut */ }
+  render();
+  saveInfo("ok", "geöffnet: " + fileName);
+}
+
+function writeNow() {
+  clearTimeout(writeTimer); writeTimer = null;
+  const h = fileHandle, epoch = fileEpoch, gen = changeGen;
+  if (!h) return writeChain;
+  const text = JSON.stringify(exportDoc(), null, 2);
+  running++;
+  updateSaveInfo();
+  writeChain = writeChain.then(async () => {
+    try {
+      const w = await h.createWritable();
+      await w.write(text);
+      await w.close();
+      if (epoch === fileEpoch && gen > savedGen) {
+        savedGen = gen;
+        savedAt = new Date().toLocaleTimeString("de-DE");
+      }
+      if (epoch === fileEpoch && savedGen >= failedGen) setMsg("fileWrite");
+    } catch (e) {
+      if (epoch === fileEpoch) {
+        failedGen = Math.max(failedGen, gen);
+        setMsg("fileWrite", "err", "Speichern in " + fileName + " fehlgeschlagen (" + (e && e.name) + ": " + (e && e.message) + "). Die letzten Änderungen sind NICHT in der Datei.");
+      }
+    } finally {
+      running--;
+      updateSaveInfo();
+    }
+  });
+  return writeChain;
+}
+
+function scheduleWrite() {
+  clearTimeout(writeTimer);
+  writeTimer = setTimeout(writeNow, 400);
+}
+
+// Jede Änderung: Browser-Codes und Urteilsdatei. Ohne Datei fragt die Seite
+// beim ersten Speichern nach (die Änderung ist die nötige Nutzergeste).
+function changed() {
+  changeGen++;
+  saveStore();
+  progress();
+  updateSaveInfo();
+  if (fileHandle) { scheduleWrite(); return; }
+  // Die Dateiauswahl läuft noch: ihr erster Schreibvorgang nimmt diese Änderung mit.
+  if (!FS_API || picking) return;
+  if (!asked) { asked = true; pickFile(); } else { noFileWarning(); }
+}
+
+function exportDoc() {
+  const pick = (all, ids) => Object.fromEntries(ids.filter(id => all[id] && Object.keys(all[id]).length).map(id => [id, all[id]]));
+  return {
+    format: FORMAT,
+    auswertung: D.auswertung,
+    gespeichert: new Date().toISOString(),
+    vollstaendig: progress(),
+    paare: pick(state.paare, D.paare.map(x => x.id)),
+    stichprobe: pick(state.stichprobe, D.stichprobe.map(x => x.id)),
+    herr_praesident: pick(state.herr_praesident, D.herr_praesident.map(x => x.id)),
+    ich: pick(state.ich, D.ich.map(x => x.id)),
+  };
+}
+
+// ------------------------------------------------------------ Anzeige
+function words(t) { return t.match(/\S+/g) || []; }
+
+// Wortdiff per LCS: markiert in A, was B nicht hat, und umgekehrt.
+function wordDiff(a, b) {
+  const x = words(a), y = words(b), n = x.length, m = y.length;
+  const L = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      L[i][j] = x[i] === y[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const ra = [], rb = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (x[i] === y[j]) { ra.push([x[i], 0]); rb.push([y[j], 0]); i++; j++; }
+    else if (L[i + 1][j] >= L[i][j + 1]) { ra.push([x[i], 1]); i++; }
+    else { rb.push([y[j], 1]); j++; }
+  }
+  while (i < n) ra.push([x[i++], 1]);
+  while (j < m) rb.push([y[j++], 1]);
+  return [ra, rb];
+}
+
+function renderWords(box, tokens, cls) {
+  tokens.forEach(([w, changed], k) => {
+    if (k > 0) box.append(" ");
+    box.append(changed ? el("span", { class: cls }, w) : w);
+  });
+  if (tokens.length === 0) box.append(el("span", { class: "muted" }, "(leer)"));
+}
+
+function audio(url) {
+  const a = el("audio", { controls: "", preload: "none" });
+  a.src = url;
+  return a;
+}
+
+function radios(name, options, current, onChange) {
+  const fs = el("fieldset");
+  for (const [value, label] of options) {
+    const input = el("input", { type: "radio", name: name, value: String(value) });
+    input.checked = current === value;
+    input.addEventListener("change", () => onChange(value));
+    fs.append(el("label", {}, input, " " + label));
+  }
+  return fs;
+}
+
+function checkbox(name, label, checked, onChange) {
+  const input = el("input", { type: "checkbox", name: name });
+  input.checked = checked;
+  input.addEventListener("change", () => onChange(input.checked));
+  return [input, el("label", {}, input, " " + label)];
+}
+
+// Kategorien einer Seite (Paar oder Stichprobe): K1–K4 mehrfach, optional K5
+// und bei K1 „gravierend“.
+function sideControls(prefix, side, withK5, withGrave, onChange) {
+  const box = el("div", { class: "side" });
+  const grave = el("span");
+  const setGrave = () => {
+    if (!withGrave) return;
+    const on = side.kategorien.includes("K1");
+    if (!on) delete side.gravierend;
+    grave.replaceChildren(radios(prefix + "-g", [[true, "K1 gravierend"], [false, "K1 nicht gravierend"]], side.gravierend,
+      v => { side.gravierend = v; onChange(); }));
+    grave.querySelectorAll("input").forEach(i => { i.disabled = !on; });
+  };
+  for (const c of CATS) {
+    const [, label] = checkbox(prefix + "-" + c, c + " " + D.kategorien[c], side.kategorien.includes(c), on => {
+      side.kategorien = CATS.filter(x => x === c ? on : side.kategorien.includes(x));
+      setGrave(); onChange();
+    });
+    box.append(label);
+  }
+  if (withK5) {
+    const [, label] = checkbox(prefix + "-K5", "K5 " + D.k5, side.k5 === true, on => { side.k5 = on; onChange(); });
+    box.append(label);
+  }
+  setGrave();
+  box.append(grave);
+  return box;
+}
+
+function sideDone(s) {
+  if (!s || !Array.isArray(s.kategorien) || typeof s.k5 !== "boolean") return false;
+  if (s.kategorien.includes("K1")) return typeof s.gravierend === "boolean";
+  return true;
+}
+// Wie compare-models.ps1 -Resolve (F4): Bei A/B ist „nur Zahlenformat“
+// Pflicht. Ja verlangt K5 auf der schlechteren Seite und dieselben K1–K4 auf
+// beiden Seiten; nein verlangt mindestens ein K1–K4 auf der schlechteren.
+function sameCats(a, b) { return [...a.kategorien].sort().join(",") === [...b.kategorien].sort().join(","); }
+function pairDone(j) {
+  if (!j || !j.urteil || !j.seiten) return false;
+  const a = j.seiten.A, b = j.seiten.B;
+  if (!sideDone(a) || !sideDone(b)) return false;
+  if (j.urteil === "A" || j.urteil === "B") {
+    const loser = j.urteil === "A" ? b : a;
+    if (typeof j.nur_zahlenformat !== "boolean") return false;
+    if (j.nur_zahlenformat) return loser.k5 && sameCats(a, b);
+    return loser.kategorien.length > 0;
+  }
+  return !("nur_zahlenformat" in j);
+}
+function sampleDone(j) {
+  return !!j && (j.urteil === "stimmt" || (j.urteil === "fehler" && Array.isArray(j.kategorien) && j.kategorien.length > 0));
+}
+function spokenDone(j) { return !!j && typeof j.gesprochen === "boolean"; }
+
+function renderPair(p) {
+  const card = el("div", { class: "card", id: p.id });
+  const j = state.paare[p.id] || (state.paare[p.id] = {});
+  if (!j.seiten) j.seiten = { A: emptySide(), B: emptySide() };
+  const mark = () => { card.className = "card " + (pairDone(j) ? "done" : "open"); };
+  const upd = () => { mark(); changed(); };
+  const [da, db] = wordDiff(p.a, p.b);
+  const ta = el("div", { class: "text" }, el("span", { class: "lbl" }, "A"));
+  const tb = el("div", { class: "text" }, el("span", { class: "lbl" }, "B"));
+  renderWords(ta, da, "del");
+  renderWords(tb, db, "ins");
+  ta.append(sideControls(p.id + "-A", j.seiten.A, true, true, upd));
+  tb.append(sideControls(p.id + "-B", j.seiten.B, true, true, upd));
+  const numberOnly = el("span");
+  const setNumberOnly = () => {
+    const ab = j.urteil === "A" || j.urteil === "B";
+    if (!ab) delete j.nur_zahlenformat;
+    numberOnly.replaceChildren(radios(p.id + "-nz", [[true, "Unterschied nur Zahlenformat: ja"], [false, "nein"]], j.nur_zahlenformat,
+      v => { j.nur_zahlenformat = v; upd(); }));
+    numberOnly.querySelectorAll("input").forEach(i => { i.disabled = !ab; });
+  };
+  const verdict = radios(p.id + "-u", [["A", "A besser"], ["B", "B besser"], ["gleich", "gleich gut"], ["unklar", "unklar"]],
+    j.urteil, v => { j.urteil = v; setNumberOnly(); upd(); });
+  setNumberOnly();
+  const same = el("select", { "aria-label": "gleicher Fall wie" });
+  same.append(el("option", { value: "" }, "gleicher Fall wie … (optional)"));
+  for (const other of D.paare) {
+    if (other.id === p.id) continue;
+    const o = el("option", { value: other.id }, "gleicher Fall wie " + other.id);
+    o.selected = j.gleicher_fall_wie === other.id;
+    same.append(o);
+  }
+  same.addEventListener("change", () => { if (same.value) j.gleicher_fall_wie = same.value; else delete j.gleicher_fall_wie; upd(); });
+  const note = el("textarea", { placeholder: "Notiz (optional, nur in der Urteilsdatei, nicht im Browser-Speicher)" });
+  note.value = j.notiz || "";
+  note.addEventListener("input", () => { if (note.value) j.notiz = note.value; else delete j.notiz; upd(); });
+  card.append(
+    el("div", { class: "head" }, el("span", { class: "id" }, p.id), audio(p.audio)),
+    el("div", { class: "texts" }, ta, tb),
+    el("div", { class: "ask" }, verdict, numberOnly, same),
+    note);
+  mark();
+  return card;
+}
+
+function renderSample(s) {
+  const card = el("div", { class: "card", id: s.id });
+  const j = state.stichprobe[s.id] || (state.stichprobe[s.id] = {});
+  if (!Array.isArray(j.kategorien)) j.kategorien = [];
+  const mark = () => { card.className = "card " + (sampleDone(j) ? "done" : "open"); };
+  const cats = el("span");
+  const setCats = () => {
+    if (j.urteil !== "fehler") { j.kategorien = []; cats.replaceChildren(); return; }
+    cats.replaceChildren(sideControls(s.id, j, false, false, () => { mark(); changed(); }));
+  };
+  const verdict = radios(s.id + "-u", [["stimmt", "stimmt"], ["fehler", "Fehler"]], j.urteil, v => {
+    j.urteil = v; setCats(); mark(); changed();
+  });
+  setCats();
+  card.append(
+    el("div", { class: "head" }, el("span", { class: "id" }, s.id), audio(s.audio)),
+    el("div", { class: "text" }, s.text === "" ? el("span", { class: "muted" }, "(leer)") : s.text),
+    el("div", { class: "ask" }, verdict, cats));
+  mark();
+  return card;
+}
+
+function renderSpoken(block, label) {
+  return h => {
+    const card = el("div", { class: "card", id: h.id });
+    const j = state[block][h.id] || (state[block][h.id] = {});
+    const mark = () => { card.className = "card " + (spokenDone(j) ? "done" : "open"); };
+    card.append(
+      el("div", { class: "head" }, el("span", { class: "id" }, h.id), audio(h.audio)),
+      el("div", { class: "ask" }, radios(h.id + "-g", [[true, label + " gesprochen: ja"], [false, label + " gesprochen: nein"]],
+        j.gesprochen, v => { j.gesprochen = v; mark(); changed(); })));
+    mark();
+    return card;
+  };
+}
+
+function progress() {
+  const count = (items, all, done) => items.filter(x => done(all[x.id])).length;
+  const p = count(D.paare, state.paare, pairDone);
+  const s = count(D.stichprobe, state.stichprobe, sampleDone);
+  const h = count(D.herr_praesident, state.herr_praesident, spokenDone);
+  const i = count(D.ich, state.ich, spokenDone);
+  document.getElementById("progress").textContent =
+    `Paare ${p}/${D.paare.length} · Stichprobe ${s}/${D.stichprobe.length} · Herr Präsident ${h}/${D.herr_praesident.length} · Ich ${i}/${D.ich.length}`;
+  return p === D.paare.length && s === D.stichprobe.length && h === D.herr_praesident.length && i === D.ich.length;
+}
+
+function render() {
+  const fill = (id, items, fn, empty) => {
+    const box = document.getElementById(id);
+    box.replaceChildren(...(items.length ? items.map(fn) : [el("p", { class: "muted" }, empty)]));
+  };
+  fill("pairs", D.paare, renderPair, "Keine Paare mit Unterschied.");
+  fill("sample", D.stichprobe, renderSample, "Keine gleichen Ausgaben.");
+  fill("hp", D.herr_praesident, renderSpoken("herr_praesident", "„Herr Präsident“"), "Kein Text beginnt mit „Herr Präsident“.");
+  fill("ich", D.ich, renderSpoken("ich", "„Ich“"), "Kein Fall, in dem genau ein Modell mit „Ich“ beginnt.");
+  progress();
+}
+
+document.getElementById("intro").textContent =
+  `Auswertung ${D.auswertung} (${D.modus}). Urteilsdatei: ${D.ordner}\\urteile.json. Die Zuordnung A/B kennt nur schluessel.json.`;
+document.getElementById("pick").addEventListener("click", () => { asked = true; pickFile(); });
+document.getElementById("open").addEventListener("click", openFile);
+document.getElementById("reset").addEventListener("click", () => {
+  try { localStorage.removeItem(STORE); storeBroken = false; setMsg("store"); }
+  catch (e) { setMsg("store", "warn", "Browser-Zwischenstand nicht löschbar (" + e.name + ")."); }
+  // Die Datei bleibt unberührt; eine neue Runde braucht eine neue Datei.
+  bindFile(null); asked = false;
+  state = emptyState();
+  // Ausdrücklich verworfen: nichts mehr zu sichern.
+  changeGen++; savedGen = changeGen;
+  render();
+  noFileWarning();
+});
+// Warnt bei jeder Änderung, deren Schreibvorgang noch aussteht, läuft oder
+// gescheitert ist, und bei Änderungen ohne Urteilsdatei (F2).
+window.addEventListener("beforeunload", e => {
+  if (unsaved()) { e.preventDefault(); e.returnValue = ""; }
+});
+
+if (!FS_API) {
+  setMsg("api", "err", "Dieser Browser kann nicht direkt in eine Datei speichern (File System Access API fehlt). Urteile gehen so verloren – bitte die Seite in Chrome oder Edge öffnen. Einen Download-Ersatz gibt es bewusst nicht (Datenschutz).");
+  document.getElementById("pick").disabled = true;
+  document.getElementById("open").disabled = true;
+  saveInfo("", "nicht gespeichert");
+}
+loadStore();
+render();
+if (FS_API) saveInfo("", "noch keine Urteilsdatei");
+</script>
+</body>
+</html>

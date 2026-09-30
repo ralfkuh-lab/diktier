@@ -91,7 +91,10 @@ Das Skript liest die Version aus `Cargo.toml`, baut mit `--locked`, legt
 `makensis` mit `installer\diktier.nsi` auf (NSIS 3.x; gefunden wird
 `%LOCALAPPDATA%\tauri\NSIS\makensis.exe`, `makensis` im `PATH` oder
 `%ProgramFiles(x86)%\NSIS`). Mit `-TargetDir target-dev` baut es neben einem
-laufenden Daemon, `-SkipInstaller` lässt das Setup weg. Das Exe-Icon kommt aus
+laufenden Daemon, `-SkipInstaller` lässt das Setup weg. `src\models.toml` und
+die erzeugte `versions.toml` prüft es zusätzlich mit einem echten TOML-Parser;
+dafür braucht es Python 3.11 oder neuer (`tomllib`) als `python` oder `py -3`,
+sonst bricht es ab. Das Exe-Icon kommt aus
 `assets\diktier.ico` (neu erzeugen: `python scripts\make-icon.py`).
 
 ## Das erste Diktat
@@ -173,7 +176,9 @@ enabled = false
 Weitere Schlüssel (selten nötig): `[audio] device`, `max_duration_secs`
 (Obergrenze je Aufnahme, 60 s), `[output] leading_space` (führendes
 Leerzeichen, an), `paste_shortcut` (`auto` erkennt Windows Terminal und nimmt
-dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell ist fest.
+dort Strg+Shift+V), `restore_clipboard`. Das Sprachmodell wählt
+`[engine] model`; ohne Eintrag gilt Parakeet v3 (siehe
+[Alltagstest (Ultra)](#alltagstest-ultra)).
 
 Änderungen gelten nach einem Neustart von Diktier.
 
@@ -191,6 +196,110 @@ output.mode "type" gibt es nicht mehr — bitte "paste" eintragen oder die Zeile
 Migration: in `config.toml` unter `[output]` `mode = "paste"` eintragen oder
 die Zeile `mode = …` löschen (fehlt sie, gilt `"paste"`), dann Diktier neu
 starten. Configs mit `"paste"` oder ohne den Schlüssel sind nicht betroffen.
+
+## Alltagstest (Ultra)
+
+Seit 0.5.0 kennt Diktier zwei Modelle: den Default
+`parakeet-tdt-0.6b-v3-int8` und das Testmodell `parakeet-ultra-0.6b-int8-pc`
+(Moondream Parakeet Ultra, int8 per-channel). Wie der Test abläuft und wann
+Ultra Default würde, steht in
+[docs/ultra-alltagstest-plan.md](docs/ultra-alltagstest-plan.md).
+
+**Umschalten** in `config.toml`, danach Diktier neu starten:
+
+```toml
+[engine]
+model = "parakeet-ultra-0.6b-int8-pc"
+```
+
+Beim ersten Start lädt Diktier das Modell (rund 720 MB) nach
+`%LOCALAPPDATA%\diktier\models\parakeet-ultra-0.6b-int8-pc\`. Das v3-Verzeichnis
+bleibt daneben liegen. Jeder andere Wert als diese beiden Schlüssel ist ein
+Konfigurationsfehler, ein Ersatzmodell gibt es nicht.
+
+**Aufnahmen sammeln.** Für die Testdauer als Benutzervariablen setzen. Der Daemon
+liest sie **nur beim Start**, also danach Diktier neu starten:
+
+```powershell
+[Environment]::SetEnvironmentVariable("DIKTIER_DEBUG_WAV", "1", "User")
+[Environment]::SetEnvironmentVariable("DIKTIER_DEBUG_WAV_KEEP", "5000", "User")
+[Environment]::SetEnvironmentVariable("DIKTIER_DEBUG_WAV_DIR", "$env:LOCALAPPDATA\diktier\ultra-test\wav", "User")
+```
+
+Im Log steht dann beim Start `Debug-WAV an: <verzeichnis>, behalte 5000`.
+
+**Zurück auf v3:** in `config.toml` `model = "parakeet-tdt-0.6b-v3-int8"`
+eintragen (oder die Zeile löschen) und Diktier neu starten. Das geht jederzeit
+und ohne Netz, weil das v3-Modell lokal bleibt. Nach dem Test die drei Variablen
+wieder mit `$null` löschen.
+
+**Wo die Daten liegen.** Unter `%LOCALAPPDATA%\diktier\ultra-test\`:
+
+- `wav\` — die Aufnahmen
+- `auswertung\<zeitstempel>\` — Rohtexte beider Modelle, Zuordnungsschlüssel,
+  Vergleichsseite, Urteile, Berichte
+- `notizen.md` — deine Notizen
+
+Datenschutz: Aufnahmen, Texte, Schlüssel und Notizen enthalten, was du gesagt
+hast. Sie bleiben nur dort: nicht ins Repo, nicht in einen Sync-Ordner, nicht
+hochladen. Ins Repo darf nur die erzeugte `zusammenfassung.md`, die nur
+Kennzahlen enthält. Die Vergleichsseite speichert deine Urteile direkt in eine
+Datei, die du beim ersten Urteil im Auswertungsordner als `urteile.json`
+anlegst (Chrome oder Edge; ohne diese Dateifunktion zeigt die Seite einen Fehler,
+einen Download gibt es bewusst nicht). Im Browser bleiben höchstens die
+Urteilscodes, keine Notizen und keine Texte; „Zwischenstand löschen“ entfernt
+sie. Die Skripte lesen und schreiben nur unter `ultra-test\auswertung\`.
+
+**Auswerten** (PowerShell 7, Daemon darf dabei laufen):
+
+```powershell
+# 1. Verbindlich, erst nach Ablauf: genau 7 Tage (Wanduhr, Zeitumstellung zählt nicht)
+scripts\compare-models.ps1 -Prepare -From "2026-10-01 08:00" -To "2026-10-08 08:00"
+#    Die Vorbereitung hält den Mengenstand nach 7 Tagen fest. Nur wenn er die
+#    Mindestmengen verfehlt, ist die einmalige Verlängerung auf 11 Tage erlaubt,
+#    mit genau dieser Vorbereitung als Grundlage (vor Tag 11 anlegen):
+scripts\compare-models.ps1 -Prepare -From "2026-10-01 08:00" -To "2026-10-12 08:00" -Verlaengert -Grundlage <auswertungsordner der 7 Tage>
+#    Zwischendurch nur explorativ, ohne Urteil:
+scripts\compare-models.ps1 -Prepare -Explorativ
+# → %LOCALAPPDATA%\diktier\ultra-test\auswertung\<zeitstempel>\vergleich.html im Browser öffnen,
+#   beim ersten Urteil urteile.json in genau diesem Ordner anlegen, dann urteilen
+#   (je Paar ein Urteil und für beide Seiten die Fehlerkategorien; bei A/B
+#   zusätzlich, ob sich die Seiten nur im Zahlenformat unterscheiden)
+
+# 2. Auflösen und Kennzahlen (Kriterien 1–3 und 6; explorativ: kein Urteil)
+scripts\compare-models.ps1 -Resolve <auswertungsordner> -Judgments <auswertungsordner>\urteile.json -Ziffern ja
+```
+
+Standardmäßig nimmt das Skript das installierte `diktier.exe`. Mit `-Exe` wählst
+du ein anderes Binary, mit `-WavDir` und `-LogDir` andere Quellen. Mit
+`-ModelRoot <ordner>` sucht nur das aufgerufene `diktier.exe` die Modelle unter
+`<ordner>\diktier\models\` und liest seine Config aus
+`<ordner>\diktier\config.toml` (fehlt sie, legt es dort die Default-Config an).
+Auch die Ausgabe landet dann dort. Audio verlinkt die
+Seite nur über neutrale Kopien bzw. Hardlinks `audio\<ID>.wav`; welche Aufnahme
+dahinter steht, weiß nur `schluessel.json`.
+
+Leistung (Kriterium 4) misst ein zweites Skript auf denselben Aufnahmen. Vorher
+Diktier über das Tray-Menü beenden, sonst bricht das Skript ab:
+
+```powershell
+scripts\bench-models.ps1 -Evaluation <auswertungsordner>
+```
+
+Das Ergebnis steht in `<auswertungsordner>\bench-<zeitstempel>\bench.md`. Ein
+Urteil gibt es nur mit dem festen Protokoll (3 Durchgänge × 3 Läufe) und dem
+installierten 0.5.0-Bundle (`--version`, `lib\onnxruntime.dll` gegen
+`versions.toml`, `engine.threads = 0` in der Config, die `diktier.exe` dabei
+liest, geprüft mit Python 3.11+); andere Aufrufe heißen
+„Funktionsprobe, kein Urteil“, fehlende Belege „nicht belegt“.
+
+Die Regressionssuite der Skripte läuft ohne Modelle:
+`pwsh -File scripts\tests\Test-UltraScripts.ps1`.
+
+**Lizenz Ultra:** CC-BY-4.0. Die Kette NVIDIA Parakeet TDT 0.6B v3 → Moondream
+Parakeet Ultra → ONNX-Export altunenes/parakeet-rs → int8-Quantisierung dieses
+Projekts steht mit Revisionen und Hinweisen in
+[LICENSES/NOTICE-parakeet-ultra.md](LICENSES/NOTICE-parakeet-ultra.md).
 
 ## Wenn etwas nicht klappt
 
@@ -366,7 +475,8 @@ Die Zeit ist UTC wie im Log, `<N>` ist die Laufnummer aus den Logzeilen
 `DIKTIER_DEBUG_WAV: <pfad>`. Ist der Name schon belegt (etwa nach einem
 Neustart mit gleicher Laufnummer), hängt Diktier `-2`, `-3` … an
 (`rec_…_lauf-703-2.wav`); eine vorhandene Datei wird nie überschrieben.
-Diktier behält die **zehn jüngsten** Dateien dieses Musters und löscht
+Diktier behält die **zehn jüngsten** Dateien dieses Musters (einstellbar,
+siehe unten) und löscht
 ältere; liegengebliebene `.part`-Reste eines abgebrochenen Dumps entfernt es
 erst, wenn sie **älter als eine Stunde** sind. Andere Dateien im Ordner fasst
 es nicht an. Die frühere `last_recording.wav` (bis 0.3.0) wird beim ersten
@@ -377,6 +487,12 @@ Einschalten als Benutzervariable, danach Diktier neu starten:
 ```powershell
 [Environment]::SetEnvironmentVariable("DIKTIER_DEBUG_WAV", "1", "User")
 ```
+
+Seit 0.5.0 lassen sich Ort und Umfang einstellen, gelesen einmal beim Start:
+`DIKTIER_DEBUG_WAV_KEEP` (ganze Zahl 1–5000, Default 10) und
+`DIKTIER_DEBUG_WAV_DIR` (absoluter Pfad, Default `%TEMP%\diktier`). Ein
+ungültiger Wert ergibt eine Warnung im Log und den Default; beim Start steht
+dort `Debug-WAV an: <verzeichnis>, behalte <n>`.
 
 Ausschalten: denselben Befehl mit `$null` statt `"1"`. Die Aufnahmen
 enthalten, was du gesagt hast — nicht weitergeben.
@@ -400,6 +516,8 @@ Diktier: MIT ([LICENSE](LICENSE)). Modell: NVIDIA Parakeet TDT 0.6B v3,
 ONNX-INT8-Konvertierung
 [istupakov/parakeet-tdt-0.6b-v3-onnx](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx),
 [CC-BY-4.0](LICENSES/CC-BY-4.0.txt), Attribution in
-[LICENSES/NOTICE-parakeet.md](LICENSES/NOTICE-parakeet.md). ONNX Runtime:
+[LICENSES/NOTICE-parakeet.md](LICENSES/NOTICE-parakeet.md). Testmodell Parakeet
+Ultra (int8 per-channel): CC-BY-4.0, Herkunftskette in
+[LICENSES/NOTICE-parakeet-ultra.md](LICENSES/NOTICE-parakeet-ultra.md). ONNX Runtime:
 MIT ([LICENSES/ONNXRUNTIME-LICENSE.txt](LICENSES/ONNXRUNTIME-LICENSE.txt)).
 Weitere Bestandteile: [LICENSES/THIRD-PARTY.md](LICENSES/THIRD-PARTY.md).

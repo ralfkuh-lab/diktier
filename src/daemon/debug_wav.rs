@@ -1,21 +1,29 @@
-//! `DIKTIER_DEBUG_WAV=1` (Spec §10, v1.8): Ring der letzten zehn Aufnahmen.
+//! `DIKTIER_DEBUG_WAV=1` (Spec §10, v1.8): Ring der letzten Aufnahmen.
 //!
-//! `%TEMP%\diktier\rec_<UTC bis ms>_lauf-<N>.wav`, z. B.
+//! Seit v1.10 einstellbar, einmal beim Daemon-Start gelesen ([`from_env`]):
+//! `DIKTIER_DEBUG_WAV_KEEP` (1–5000, Default [`DEFAULT_KEEP`]) und
+//! `DIKTIER_DEBUG_WAV_DIR` (absolut, Default `%TEMP%\diktier`).
+//!
+//! `<dir>\rec_<UTC bis ms>_lauf-<N>.wav`, z. B.
 //! `rec_2026-09-25T14-47-13-512Z_lauf-703.wav`. Jede Datei entsteht **atomar**
 //! über eine eigene, exklusiv angelegte Temp-Datei
 //! `<ziel>.<pid>-<zähler>.part` im selben Verzeichnis und einen Rename, der
 //! **nie ersetzt**: Ist der Zielname schon belegt (Neustart, Uhrkorrektur,
 //! gleicher Lauf zweimal), bekommt die neue Datei `-2`, `-3` … angehängt
 //! (Final-Review Blocker 3). Erst nach dem Rename zählt sie; danach werden die
-//! ältesten Dateien des **genauen** Musters über zehn gelöscht, verwaiste
-//! `.part`-Reste desselben Musters ab einer Stunde Alter entfernt und die
-//! Altlast `last_recording.wav` (bis 0.3.0) gelöscht. Fremde Dateien bleiben
-//! unangetastet. Ein gescheiterter Schreibvorgang löscht nur die eigene
-//! Temp-Datei. Nie hochladen — deshalb steht der Pfad genau einmal im Log.
+//! ältesten Dateien des **genauen** Musters über der Kapazität gelöscht, verwaiste
+//! `.part`-Reste desselben Musters ab einer Stunde Alter entfernt und — nur im
+//! Default-Verzeichnis `%TEMP%\diktier`, wo sie entstand — die Altlast
+//! `last_recording.wav` (bis 0.3.0) gelöscht. In einem über
+//! `DIKTIER_DEBUG_WAV_DIR` gewählten Verzeichnis ist eine Datei dieses Namens
+//! fremd (Code-Review WP2, W1). Fremde Dateien bleiben unangetastet. Ein
+//! gescheiterter Schreibvorgang löscht nur die eigene Temp-Datei. Nie
+//! hochladen — deshalb steht der Pfad genau einmal im Log.
 //!
 //! Format seit v1.9: 16 kHz mono 32-bit-Float, bitgleich zum Capture-Puffer —
 //! also ohne die Vorlauf-Stille, die erst `engine::transcribe_pcm` voranstellt.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,8 +34,16 @@ use super::logging::civil_from_days;
 use crate::audio::ENGINE_RATE;
 use crate::state::RunId;
 
-/// So viele Dumps bleiben liegen (Plan Leitentscheidung 11).
-pub const KEEP: usize = 10;
+/// So viele Dumps bleiben ohne `DIKTIER_DEBUG_WAV_KEEP` liegen (Plan
+/// Leitentscheidung 11 des Clipboard-Pakets).
+pub const DEFAULT_KEEP: usize = 10;
+/// Gültiger Bereich von `DIKTIER_DEBUG_WAV_KEEP` (Spec §10, v1.10).
+const KEEP_MIN: usize = 1;
+const KEEP_MAX: usize = 5000;
+
+const ENV_SWITCH: &str = "DIKTIER_DEBUG_WAV";
+const ENV_KEEP: &str = "DIKTIER_DEBUG_WAV_KEEP";
+const ENV_DIR: &str = "DIKTIER_DEBUG_WAV_DIR";
 
 const PREFIX: &str = "rec_";
 const RUN_SEP: &str = "_lauf-";
@@ -46,17 +62,135 @@ const MAX_ATTEMPTS: u32 = 1000;
 /// Prozessweiter Zähler für eindeutige Temp-Namen.
 static PART_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// `DIKTIER_DEBUG_WAV=1` — nur exakt `1` schaltet den Dump ein.
-pub fn enabled() -> bool {
-    std::env::var_os("DIKTIER_DEBUG_WAV").is_some_and(|value| value == "1")
+/// Der effektive Dump: Verzeichnis und Kapazität des Rings. Es gibt ihn nur,
+/// wenn `DIKTIER_DEBUG_WAV=1` gesetzt ist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugWavConfig {
+    pub dir: PathBuf,
+    pub keep: usize,
+    /// Nur wenn `dir` der Default ist (kein oder ein ungültiges
+    /// `DIKTIER_DEBUG_WAV_DIR`): dort ist `last_recording.wav` die eigene
+    /// Altlast und wird entfernt. Sonst nie.
+    pub legacy_cleanup: bool,
 }
 
-/// Zielverzeichnis des Dumps.
-pub fn debug_dir() -> PathBuf {
-    let tmp = std::env::var_os("TEMP")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    tmp.join("diktier")
+/// Ergebnis des einmaligen Lesens beim Start: der Dump (`None` = aus) und je
+/// ungültigem Wert genau eine Warnzeile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub config: Option<DebugWavConfig>,
+    pub warnings: Vec<String>,
+    /// Aus, obwohl `DIKTIER_DEBUG_WAV_KEEP` oder `_DIR` gesetzt ist: Dann
+    /// fehlt vermutlich nur der Schalter (Sol-Review zum Alltagstest, W1).
+    pub ignored_settings: bool,
+}
+
+impl Resolved {
+    /// Die Startzeile: bei eingeschaltetem Dump Verzeichnis und Kapazität,
+    /// ohne Inhalte. Aus: nur wenn KEEP/DIR gesetzt sind, sonst keine Zeile.
+    pub fn start_line(&self) -> Option<String> {
+        match &self.config {
+            Some(config) => Some(format!(
+                "Debug-WAV an: {}, behalte {}",
+                config.dir.display(),
+                config.keep
+            )),
+            None if self.ignored_settings => Some(format!(
+                "Debug-WAV aus: {ENV_KEEP}/{ENV_DIR} gesetzt, aber {ENV_SWITCH} ist nicht 1"
+            )),
+            None => None,
+        }
+    }
+}
+
+/// Liest die Variablen **einmal** aus der Prozessumgebung (Daemon-Start).
+pub fn from_env() -> Resolved {
+    resolve(
+        std::env::var_os(ENV_SWITCH).as_deref(),
+        std::env::var_os(ENV_KEEP).as_deref(),
+        std::env::var_os(ENV_DIR).as_deref(),
+        default_dir(std::env::var_os("TEMP").as_deref()),
+    )
+}
+
+/// Reine Auswertung von Schalter, Kapazität und Verzeichnis. Nur exakt `1`
+/// schaltet den Dump ein. Ist er aus, werden KEEP und DIR nicht geprüft —
+/// sie wirken dann ohnehin nicht.
+pub fn resolve(
+    switch: Option<&OsStr>,
+    keep: Option<&OsStr>,
+    dir: Option<&OsStr>,
+    default_dir: PathBuf,
+) -> Resolved {
+    if switch.is_none_or(|value| value != "1") {
+        return Resolved {
+            config: None,
+            warnings: Vec::new(),
+            ignored_settings: keep.is_some() || dir.is_some(),
+        };
+    }
+    let mut warnings = Vec::new();
+    let keep = match keep.map(parse_keep) {
+        None => DEFAULT_KEEP,
+        Some(Ok(keep)) => keep,
+        Some(Err(problem)) => {
+            warnings.push(format!(
+                "{ENV_KEEP} {problem} — nehme den Default {DEFAULT_KEEP}"
+            ));
+            DEFAULT_KEEP
+        }
+    };
+    let (dir, legacy_cleanup) = match dir.map(parse_dir) {
+        None => (default_dir, true),
+        Some(Ok(dir)) => (dir, false),
+        Some(Err(problem)) => {
+            warnings.push(format!(
+                "{ENV_DIR} {problem} — nehme den Default {}",
+                default_dir.display()
+            ));
+            (default_dir, true)
+        }
+    };
+    Resolved {
+        config: Some(DebugWavConfig {
+            dir,
+            keep,
+            legacy_cleanup,
+        }),
+        warnings,
+        ignored_settings: false,
+    }
+}
+
+/// `DIKTIER_DEBUG_WAV_KEEP`: nur Ziffern (kein Vorzeichen, kein Leerraum),
+/// Wert 1–5000. Der Fehlertext nennt den Grund, nicht den Wert.
+fn parse_keep(raw: &OsStr) -> Result<usize, String> {
+    let Some(text) = raw.to_str().filter(|text| is_number(text)) else {
+        return Err(format!("ist keine ganze Zahl ({KEEP_MIN}–{KEEP_MAX})"));
+    };
+    match text.parse::<usize>() {
+        Ok(keep) if (KEEP_MIN..=KEEP_MAX).contains(&keep) => Ok(keep),
+        _ => Err(format!("liegt außerhalb von {KEEP_MIN}–{KEEP_MAX}")),
+    }
+}
+
+/// `DIKTIER_DEBUG_WAV_DIR`: nicht leer (auch nicht nur Leerraum) und absolut.
+fn parse_dir(raw: &OsStr) -> Result<PathBuf, String> {
+    if raw.to_string_lossy().trim().is_empty() {
+        return Err("ist leer".to_owned());
+    }
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err("ist kein absoluter Pfad".to_owned());
+    }
+    Ok(path)
+}
+
+/// Default-Verzeichnis `%TEMP%\diktier`, ohne `TEMP` das System-Temp.
+fn default_dir(temp: Option<&OsStr>) -> PathBuf {
+    temp.map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("diktier")
 }
 
 /// `rec_<UTC bis ms>_lauf-<N>.wav`. Doppelpunkte und Punkt sind durch `-`
@@ -191,21 +325,32 @@ fn is_own_part(name: &str) -> bool {
     parse_name(base).is_some() && is_number(pid) && is_number(counter)
 }
 
-/// Schreibt 16-kHz-mono-f32 als 16-bit-PCM-WAV nach
+/// Schreibt 16-kHz-mono-f32 als 32-bit-Float-WAV nach
 /// `<dir>/rec_<UTC bis ms>_lauf-<N>.wav` (bei belegtem Namen mit `-2`, `-3` …)
-/// und pflegt danach den Ring. Rückgabe ist der endgültige Pfad.
+/// und pflegt danach den Ring mit Kapazität `keep`. Rückgabe ist der
+/// endgültige Pfad.
 pub fn write_recording(
-    dir: &Path,
+    config: &DebugWavConfig,
     samples: &[f32],
     run: RunId,
     at: SystemTime,
 ) -> io::Result<PathBuf> {
-    write_recording_with(dir, samples, run, at, rename_no_replace)
+    write_recording_with(
+        &config.dir,
+        config.keep,
+        config.legacy_cleanup,
+        samples,
+        run,
+        at,
+        rename_no_replace,
+    )
 }
 
 /// Wie [`write_recording`], mit austauschbarem Finalisieren (Tests).
 fn write_recording_with<F>(
     dir: &Path,
+    keep: usize,
+    legacy_cleanup: bool,
     samples: &[f32],
     run: RunId,
     at: SystemTime,
@@ -233,8 +378,10 @@ where
 
     // Erst jetzt zählt die Datei. Aufräumen ist best effort: ein Rest, der
     // sich nicht löschen lässt, verhindert den Dump nicht.
-    prune(dir, SystemTime::now());
-    let _ = fs::remove_file(dir.join(LEGACY_NAME));
+    prune(dir, keep, SystemTime::now());
+    if legacy_cleanup {
+        let _ = fs::remove_file(dir.join(LEGACY_NAME));
+    }
     Ok(final_path)
 }
 
@@ -326,11 +473,11 @@ fn write_wav(file: fs::File, samples: &[f32]) -> io::Result<()> {
     writer.finalize().map_err(hound_io)
 }
 
-/// Ring: die ältesten Dateien des genauen Musters über [`KEEP`] löschen,
+/// Ring: die ältesten Dateien des genauen Musters über `keep` löschen,
 /// `.part`-Reste desselben Musters ab [`STALE_PART_AGE`] entfernen. „Älteste"
 /// nach Zeitstempel im Namen, bei Gleichstand nach Laufnummer und Suffix —
 /// nicht nach Änderungszeit, die ein Kopieren verfälscht.
-fn prune(dir: &Path, now: SystemTime) {
+fn prune(dir: &Path, keep: usize, now: SystemTime) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -356,11 +503,11 @@ fn prune(dir: &Path, now: SystemTime) {
             }
         }
     }
-    if dumps.len() <= KEEP {
+    if dumps.len() <= keep {
         return;
     }
     dumps.sort_by(|a, b| (&a.0, a.1, a.2).cmp(&(&b.0, b.1, b.2)));
-    let excess = dumps.len() - KEEP;
+    let excess = dumps.len() - keep;
     for (_, _, _, path) in dumps.into_iter().take(excess) {
         let _ = fs::remove_file(path);
     }
@@ -373,8 +520,9 @@ fn hound_io(err: hound::Error) -> io::Error {
     }
 }
 
-/// Das Dump-Verzeichnis liegt unter `%TEMP%` im Benutzerprofil und erbt damit
-/// dessen ACL.
+/// Das Default-Verzeichnis liegt unter `%TEMP%` im Benutzerprofil und erbt
+/// damit dessen ACL; ein eigenes `DIKTIER_DEBUG_WAV_DIR` erbt die ACL seines
+/// Elternverzeichnisses.
 fn create_private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)
 }
@@ -389,6 +537,24 @@ fn create_private_file(path: &Path) -> io::Result<fs::File> {
 mod tests {
     use super::*;
     use crate::audio::read_wav_16k_mono;
+
+    /// Der Ring im Default-Verzeichnis (mit Altlast-Bereinigung), wie ihn die
+    /// bisherigen Tests voraussetzen. Verdeckt das `write_recording` des
+    /// Moduls, das eine [`DebugWavConfig`] nimmt.
+    fn write_recording(
+        dir: &Path,
+        keep: usize,
+        samples: &[f32],
+        run: RunId,
+        at: SystemTime,
+    ) -> io::Result<PathBuf> {
+        let config = DebugWavConfig {
+            dir: dir.to_path_buf(),
+            keep,
+            legacy_cleanup: true,
+        };
+        super::write_recording(&config, samples, run, at)
+    }
 
     /// 2026-09-25T14:47:13.512Z
     fn sample_time() -> SystemTime {
@@ -565,7 +731,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("diktier-test");
         let samples: Vec<f32> = (0..16_000).map(|i| (i as f32 / 16_000.0) - 0.5).collect();
-        let path = write_recording(&target, &samples, RunId(703), sample_time()).unwrap();
+        let path =
+            write_recording(&target, DEFAULT_KEEP, &samples, RunId(703), sample_time()).unwrap();
         assert_eq!(
             path,
             target.join("rec_2026-09-25T14-47-13-512Z_lauf-703.wav")
@@ -603,7 +770,8 @@ mod tests {
             -2.0,
             0.123_456_79,
         ];
-        let path = write_recording(dir.path(), &samples, RunId(1), sample_time()).unwrap();
+        let path =
+            write_recording(dir.path(), DEFAULT_KEEP, &samples, RunId(1), sample_time()).unwrap();
 
         let spec = hound::WavReader::open(&path).unwrap().spec();
         assert_eq!(spec.channels, 1);
@@ -626,14 +794,15 @@ mod tests {
         let mut written = Vec::new();
         for run in 1..=12u64 {
             let at = sample_time() + Duration::from_millis(run);
-            written.push(write_recording(target, &[0.0; 160], RunId(run), at).unwrap());
+            written
+                .push(write_recording(target, DEFAULT_KEEP, &[0.0; 160], RunId(run), at).unwrap());
         }
         let expected: Vec<String> = written[2..]
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(ring_names(target), expected);
-        assert_eq!(names(target).len(), KEEP);
+        assert_eq!(names(target).len(), DEFAULT_KEEP);
     }
 
     /// Älteste zuerst nach Namen (Zeit, dann Laufnummer numerisch) — nicht
@@ -657,13 +826,14 @@ mod tests {
 
         let new = write_recording(
             target,
+            DEFAULT_KEEP,
             &[0.0; 160],
             RunId(200),
             sample_time() + Duration::from_secs(3600),
         )
         .unwrap();
         let ring = ring_names(target);
-        assert_eq!(ring.len(), KEEP);
+        assert_eq!(ring.len(), DEFAULT_KEEP);
         assert!(!ring.contains(&same_ms_9), "Lauf 9 vor Lauf 10: {ring:?}");
         assert!(ring.contains(&same_ms_10), "{ring:?}");
         assert!(ring.contains(&newest_old), "{ring:?}");
@@ -691,13 +861,14 @@ mod tests {
         }
         write_recording(
             target,
+            DEFAULT_KEEP,
             &[0.0; 160],
             RunId(99),
             sample_time() + Duration::from_secs(3600),
         )
         .unwrap();
         // Neun alte + eine neue = zehn: nichts gelöscht, fremde bleiben.
-        assert_eq!(ring_names(target).len(), KEEP);
+        assert_eq!(ring_names(target).len(), DEFAULT_KEEP);
         for name in foreign {
             assert!(target.join(name).exists(), "{name} gelöscht");
         }
@@ -733,7 +904,7 @@ mod tests {
         );
         set_age(&target.join(&fresh), Duration::from_secs(60));
 
-        write_recording(target, &[0.0; 160], RunId(3), sample_time()).unwrap();
+        write_recording(target, DEFAULT_KEEP, &[0.0; 160], RunId(3), sample_time()).unwrap();
         assert!(
             !target.join(&stale).exists(),
             "alter .part-Rest bleibt liegen"
@@ -753,17 +924,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path();
         fs::write(target.join(LEGACY_NAME), b"alt").unwrap();
-        write_recording(target, &[0.0; 160], RunId(1), sample_time()).unwrap();
+        write_recording(target, DEFAULT_KEEP, &[0.0; 160], RunId(1), sample_time()).unwrap();
         assert!(!target.join(LEGACY_NAME).exists());
         // Ohne Altlast ist ein weiterer Dump kein Fehler.
         write_recording(
             target,
+            DEFAULT_KEEP,
             &[0.0; 160],
             RunId(2),
             sample_time() + Duration::from_millis(1),
         )
         .unwrap();
         assert_eq!(ring_names(target).len(), 2);
+    }
+
+    /// W1 (Code-Review WP2): In einem über `DIKTIER_DEBUG_WAV_DIR` gewählten
+    /// Verzeichnis ist `last_recording.wav` fremd und bleibt, ebenso fremde
+    /// `.part`-Dateien jeden Alters; Kapazität 5000 wie im Alltagstest.
+    #[test]
+    fn a_chosen_dir_keeps_a_foreign_last_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ultra-test").join("wav");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join(LEGACY_NAME), b"fremd").unwrap();
+        let foreign_parts = ["aufnahme.wav.part", "rec_notiz.part", "x.12-3.part"];
+        for (i, name) in foreign_parts.iter().enumerate() {
+            fs::write(target.join(name), b"fremd").unwrap();
+            if i > 0 {
+                set_age(&target.join(name), STALE_PART_AGE + Duration::from_secs(60));
+            }
+        }
+        let resolved = resolve(
+            Some(os("1")),
+            Some(os("5000")),
+            Some(target.as_os_str()),
+            fallback(),
+        );
+        let config = resolved.config.unwrap();
+        assert!(!config.legacy_cleanup);
+        super::write_recording(&config, &[0.0; 160], RunId(1), sample_time()).unwrap();
+        assert!(
+            target.join(LEGACY_NAME).exists(),
+            "fremde last_recording.wav gelöscht"
+        );
+        for name in foreign_parts {
+            assert!(target.join(name).exists(), "{name} gelöscht");
+        }
+        assert_eq!(ring_names(&target).len(), 1);
+
+        // Gegenprobe: dasselbe Verzeichnis als Default (Variable nicht oder
+        // ungültig gesetzt) räumt die eigene Altlast weg.
+        for dir_var in [None, Some(os("relativ"))] {
+            let resolved = resolve(Some(os("1")), None, dir_var, target.clone());
+            let config = resolved.config.unwrap();
+            assert!(config.legacy_cleanup, "{dir_var:?}");
+        }
+        let default = DebugWavConfig {
+            dir: target.clone(),
+            keep: KEEP_MAX,
+            legacy_cleanup: true,
+        };
+        super::write_recording(
+            &default,
+            &[0.0; 160],
+            RunId(2),
+            sample_time() + Duration::from_millis(1),
+        )
+        .unwrap();
+        assert!(!target.join(LEGACY_NAME).exists());
+        for name in foreign_parts {
+            assert!(target.join(name).exists(), "{name} gelöscht");
+        }
     }
 
     /// Ein gescheiterter Schreibvorgang zählt nicht: kein Ring-Eintrag, kein
@@ -773,7 +1004,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path();
         let mut before = Vec::new();
-        for minute in 0..KEEP as u64 {
+        for minute in 0..DEFAULT_KEEP as u64 {
             before.push(place(target, minute, minute));
         }
         fs::write(target.join(LEGACY_NAME), b"alt").unwrap();
@@ -789,7 +1020,18 @@ mod tests {
         let at = sample_time() + Duration::from_secs(3600);
         let failing =
             |_: &Path, _: &Path| -> io::Result<()> { Err(io::Error::other("Rename verweigert")) };
-        assert!(write_recording_with(target, &[0.0; 160], RunId(500), at, failing).is_err());
+        assert!(
+            write_recording_with(
+                target,
+                DEFAULT_KEEP,
+                true,
+                &[0.0; 160],
+                RunId(500),
+                at,
+                failing
+            )
+            .is_err()
+        );
         assert_eq!(ring_names(target), {
             let mut b = before.clone();
             b.sort();
@@ -817,7 +1059,8 @@ mod tests {
         let name = file_name(sample_time(), RunId(703));
         fs::write(target.join(&name), b"vorhanden").unwrap();
 
-        let path = write_recording(target, &[0.0; 160], RunId(703), sample_time()).unwrap();
+        let path =
+            write_recording(target, DEFAULT_KEEP, &[0.0; 160], RunId(703), sample_time()).unwrap();
         assert_eq!(
             path,
             target.join("rec_2026-09-25T14-47-13-512Z_lauf-703-2.wav")
@@ -827,7 +1070,8 @@ mod tests {
 
         let blocked = file_name(sample_time(), RunId(9));
         fs::create_dir(target.join(&blocked)).unwrap();
-        let path = write_recording(target, &[0.0; 160], RunId(9), sample_time()).unwrap();
+        let path =
+            write_recording(target, DEFAULT_KEEP, &[0.0; 160], RunId(9), sample_time()).unwrap();
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
             "rec_2026-09-25T14-47-13-512Z_lauf-9-2.wav"
@@ -850,7 +1094,8 @@ mod tests {
             fs::write(target.join(part), b"fremd").unwrap();
         }
 
-        let path = write_recording(target, &[0.0; 160], RunId(42), sample_time()).unwrap();
+        let path =
+            write_recording(target, DEFAULT_KEEP, &[0.0; 160], RunId(42), sample_time()).unwrap();
         assert_eq!(path, target.join(&base));
         for part in &parts {
             assert_eq!(fs::read(target.join(part)).unwrap(), b"fremd", "{part}");
@@ -869,9 +1114,11 @@ mod tests {
     fn the_same_run_and_time_twice_gives_two_files() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path();
-        let first = write_recording(target, &[0.25; 160], RunId(5), sample_time()).unwrap();
+        let first =
+            write_recording(target, DEFAULT_KEEP, &[0.25; 160], RunId(5), sample_time()).unwrap();
         let first_bytes = fs::read(&first).unwrap();
-        let second = write_recording(target, &[-0.5; 320], RunId(5), sample_time()).unwrap();
+        let second =
+            write_recording(target, DEFAULT_KEEP, &[-0.5; 320], RunId(5), sample_time()).unwrap();
         assert_ne!(first, second);
         assert_eq!(
             fs::read(&first).unwrap(),
@@ -902,13 +1149,14 @@ mod tests {
         }
         write_recording(
             target,
+            DEFAULT_KEEP,
             &[0.0; 160],
             RunId(200),
             sample_time() + Duration::from_secs(3600),
         )
         .unwrap();
         let ring = ring_names(target);
-        assert_eq!(ring.len(), KEEP);
+        assert_eq!(ring.len(), DEFAULT_KEEP);
         assert!(!ring.contains(&base), "{ring:?}");
         assert!(ring.contains(&suffixed), "{ring:?}");
     }
@@ -917,7 +1165,272 @@ mod tests {
     fn a_missing_directory_is_created() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a").join("b");
-        let path = write_recording(&target, &[0.0; 160], RunId(1), sample_time()).unwrap();
+        let path =
+            write_recording(&target, DEFAULT_KEEP, &[0.0; 160], RunId(1), sample_time()).unwrap();
         assert!(path.is_file());
+    }
+
+    // ------------------------------------------ Einstellungen (Spec §10, v1.10)
+    //
+    // Alles über `resolve`/`parse_*` mit übergebenen Werten: kein Test liest
+    // oder verändert die Prozessumgebung.
+
+    fn os(text: &str) -> &OsStr {
+        OsStr::new(text)
+    }
+
+    #[cfg(windows)]
+    const ABSOLUTE: &str = r"C:\Users\test\AppData\Local\diktier\ultra-test\wav";
+    #[cfg(not(windows))]
+    const ABSOLUTE: &str = "/home/test/diktier/wav";
+
+    fn fallback() -> PathBuf {
+        PathBuf::from(ABSOLUTE).join("fallback")
+    }
+
+    #[test]
+    fn keep_accepts_exactly_one_to_five_thousand() {
+        assert_eq!(parse_keep(os("1")), Ok(1));
+        assert_eq!(parse_keep(os("10")), Ok(10));
+        assert_eq!(parse_keep(os("5000")), Ok(5000));
+        assert_eq!(parse_keep(os("0010")), Ok(10));
+        for out_of_range in ["0", "5001", "000", "99999999999999999999999"] {
+            assert_eq!(
+                parse_keep(os(out_of_range)),
+                Err("liegt außerhalb von 1–5000".to_owned()),
+                "{out_of_range}"
+            );
+        }
+        for not_a_number in [
+            "", " ", "zehn", "10 ", " 10", "+10", "-1", "1.5", "1e3", "10\t", "１０",
+        ] {
+            assert_eq!(
+                parse_keep(os(not_a_number)),
+                Err("ist keine ganze Zahl (1–5000)".to_owned()),
+                "{not_a_number:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dir_must_be_non_empty_and_absolute() {
+        assert_eq!(parse_dir(os(ABSOLUTE)), Ok(PathBuf::from(ABSOLUTE)));
+        #[cfg(windows)]
+        assert_eq!(
+            parse_dir(os(r"\\server\freigabe\wav")),
+            Ok(PathBuf::from(r"\\server\freigabe\wav"))
+        );
+        for empty in ["", " ", "\t \t"] {
+            assert_eq!(
+                parse_dir(os(empty)),
+                Err("ist leer".to_owned()),
+                "{empty:?}"
+            );
+        }
+        let mut relative = vec!["wav", r"diktier\wav", r".\wav", r"..\wav", " C:\\wav"];
+        // Unter Windows ist `\wav` (Wurzel ohne Laufwerk) und `C:wav`
+        // (Laufwerk ohne Wurzel) relativ.
+        #[cfg(windows)]
+        relative.extend([r"\wav", "C:wav", "%LOCALAPPDATA%\\diktier"]);
+        for path in relative {
+            assert_eq!(
+                parse_dir(os(path)),
+                Err("ist kein absoluter Pfad".to_owned()),
+                "{path}"
+            );
+        }
+    }
+
+    /// Umgebungsvariablen werden nicht expandiert — `%TEMP%` bleibt Text.
+    #[test]
+    fn the_default_dir_is_temp_diktier() {
+        let temp = PathBuf::from(ABSOLUTE).join("Temp");
+        assert_eq!(default_dir(Some(temp.as_os_str())), temp.join("diktier"));
+        assert_eq!(default_dir(None), std::env::temp_dir().join("diktier"));
+    }
+
+    #[test]
+    fn switch_off_means_no_dump_and_no_checks() {
+        for switch in [
+            None,
+            Some("0"),
+            Some(""),
+            Some("true"),
+            Some(" 1"),
+            Some("1 "),
+        ] {
+            let resolved = resolve(switch.map(os), None, None, fallback());
+            assert_eq!(resolved.config, None, "{switch:?}");
+            assert!(resolved.warnings.is_empty());
+            assert_eq!(resolved.start_line(), None);
+        }
+        // Ungültige KEEP/DIR bei ausgeschaltetem Dump: keine Warnung, aber
+        // der Hinweis, dass der Schalter fehlt (W1).
+        let resolved = resolve(None, Some(os("0")), Some(os("wav")), fallback());
+        assert_eq!(resolved.config, None);
+        assert!(resolved.warnings.is_empty());
+        assert_eq!(
+            resolved.start_line().as_deref(),
+            Some(
+                "Debug-WAV aus: DIKTIER_DEBUG_WAV_KEEP/DIKTIER_DEBUG_WAV_DIR gesetzt, \
+                 aber DIKTIER_DEBUG_WAV ist nicht 1"
+            )
+        );
+        assert!(resolve(Some(os("0")), None, Some(os(ABSOLUTE)), fallback()).ignored_settings);
+    }
+
+    #[test]
+    fn switch_on_without_settings_uses_the_defaults() {
+        let resolved = resolve(Some(os("1")), None, None, fallback());
+        assert_eq!(
+            resolved.config,
+            Some(DebugWavConfig {
+                dir: fallback(),
+                keep: DEFAULT_KEEP,
+                legacy_cleanup: true,
+            })
+        );
+        assert!(resolved.warnings.is_empty());
+        assert_eq!(
+            resolved.start_line(),
+            Some(format!(
+                "Debug-WAV an: {}, behalte 10",
+                fallback().display()
+            ))
+        );
+    }
+
+    /// Der Testfall aus Leitentscheidung 5: 5000 in einem eigenen Verzeichnis.
+    #[test]
+    fn valid_settings_are_taken_over() {
+        let resolved = resolve(
+            Some(os("1")),
+            Some(os("5000")),
+            Some(os(ABSOLUTE)),
+            fallback(),
+        );
+        assert_eq!(
+            resolved.config,
+            Some(DebugWavConfig {
+                dir: PathBuf::from(ABSOLUTE),
+                keep: 5000,
+                legacy_cleanup: false,
+            })
+        );
+        assert!(resolved.warnings.is_empty());
+        assert_eq!(
+            resolved.start_line(),
+            Some(format!("Debug-WAV an: {ABSOLUTE}, behalte 5000"))
+        );
+    }
+
+    /// Je ungültigem Wert genau eine Warnzeile, und nur der betroffene Wert
+    /// fällt auf den Default.
+    #[test]
+    fn each_invalid_value_warns_once_and_falls_back() {
+        let resolved = resolve(
+            Some(os("1")),
+            Some(os("5001")),
+            Some(os(ABSOLUTE)),
+            fallback(),
+        );
+        assert_eq!(resolved.config.as_ref().unwrap().keep, DEFAULT_KEEP);
+        assert_eq!(
+            resolved.config.as_ref().unwrap().dir,
+            PathBuf::from(ABSOLUTE)
+        );
+        assert_eq!(
+            resolved.warnings,
+            vec!["DIKTIER_DEBUG_WAV_KEEP liegt außerhalb von 1–5000 — nehme den Default 10"]
+        );
+
+        let resolved = resolve(Some(os("1")), Some(os("7")), Some(os("wav")), fallback());
+        assert_eq!(
+            resolved.config,
+            Some(DebugWavConfig {
+                dir: fallback(),
+                keep: 7,
+                legacy_cleanup: true,
+            })
+        );
+        assert_eq!(
+            resolved.warnings,
+            vec![format!(
+                "DIKTIER_DEBUG_WAV_DIR ist kein absoluter Pfad — nehme den Default {}",
+                fallback().display()
+            )]
+        );
+
+        let resolved = resolve(Some(os("1")), Some(os("viele")), Some(os(" ")), fallback());
+        assert_eq!(
+            resolved.config,
+            Some(DebugWavConfig {
+                dir: fallback(),
+                keep: DEFAULT_KEEP,
+                legacy_cleanup: true,
+            })
+        );
+        assert_eq!(resolved.warnings.len(), 2, "{:?}", resolved.warnings);
+        assert!(resolved.warnings[0].starts_with("DIKTIER_DEBUG_WAV_KEEP ist keine ganze Zahl"));
+        assert!(resolved.warnings[1].starts_with("DIKTIER_DEBUG_WAV_DIR ist leer"));
+    }
+
+    /// Ring mit kleiner Kapazität im eigenen Verzeichnis: drei bleiben, die
+    /// ältesten gehen, fremde Dateien und ein junger `.part`-Rest bleiben.
+    #[test]
+    fn a_small_ring_keeps_its_capacity_and_leaves_foreign_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("ultra-test").join("wav");
+        fs::create_dir_all(&target).unwrap();
+        let foreign = ["notiz.txt", "aufnahme.wav", "rec_eigene-notiz_lauf-7.wav"];
+        for name in foreign {
+            fs::write(target.join(name), b"fremd").unwrap();
+        }
+        let fresh_part = format!("{}.part", file_name(sample_time(), RunId(0)));
+        fs::write(target.join(&fresh_part), b"halb").unwrap();
+
+        let mut written = Vec::new();
+        for run in 1..=5u64 {
+            let at = sample_time() + Duration::from_secs(run);
+            written.push(write_recording(&target, 3, &[0.0; 160], RunId(run), at).unwrap());
+        }
+        let expected: Vec<String> = written[2..]
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(ring_names(&target), expected);
+        for name in foreign {
+            assert!(target.join(name).exists(), "{name} gelöscht");
+        }
+        assert!(target.join(&fresh_part).exists());
+    }
+
+    /// Kapazität 1 und eine Kapazität über dem Bestand: nichts Falsches weg.
+    #[test]
+    fn capacity_one_and_large_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path();
+        for run in 1..=3u64 {
+            let at = sample_time() + Duration::from_secs(run);
+            write_recording(target, 1, &[0.0; 160], RunId(run), at).unwrap();
+        }
+        assert_eq!(
+            ring_names(target),
+            vec![file_name(sample_time() + Duration::from_secs(3), RunId(3))]
+        );
+
+        // 5000: vorhandene Dateien bleiben alle, auch über den alten zehn.
+        for minute in 1..=12 {
+            place(target, minute, 100 + minute);
+        }
+        write_recording(
+            target,
+            KEEP_MAX,
+            &[0.0; 160],
+            RunId(200),
+            sample_time() + Duration::from_secs(3600),
+        )
+        .unwrap();
+        assert_eq!(ring_names(target).len(), 14);
     }
 }

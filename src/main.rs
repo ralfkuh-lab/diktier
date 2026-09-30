@@ -20,6 +20,7 @@ mod overlay;
 mod paths;
 mod single_instance;
 mod state;
+mod transcribe_list;
 mod tray;
 
 use std::ffi::OsString;
@@ -66,9 +67,31 @@ struct Cli {
     )]
     transcribe_wav: Option<PathBuf>,
 
-    /// Gemessene Inferenzläufe nach einem ungezählten Warmup (nur mit --transcribe-wav).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    runs: u32,
+    /// WAVs aus einer Liste transkribieren (UTF-8, eine Datei je Zeile), das
+    /// Modell nur einmal geladen. Je Datei eine JSONL-Zeile auf stdout:
+    /// file, status (text | rejected | error), text, infer_ms, samples.
+    /// Exitcode 1, sobald eine Datei `error` hat.
+    #[arg(
+        long,
+        value_name = "LISTE",
+        conflicts_with_all = ["install_autostart", "remove_autostart", "transcribe_wav", "gate_analyze", "clipboard_check", "inject_test", "hotkey_test", "record_test", "tray_test", "hotkey_dialog_test", "overlay_test"]
+    )]
+    transcribe_list: Option<PathBuf>,
+
+    /// Modellschlüssel aus dem Manifest statt `engine.model` (nur mit
+    /// --transcribe-wav oder --transcribe-list). Die Config bleibt unverändert.
+    #[arg(long, value_name = "SCHLÜSSEL")]
+    model: Option<String>,
+
+    /// Gemessene Inferenzläufe nach einem ungezählten Warmup (nur mit
+    /// --transcribe-wav oder --transcribe-list; dort n Zeilen je Datei mit `run`).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    runs: Option<u32>,
+
+    /// SHA-256 des eingebauten Modellmanifests (models.toml) ausgeben, ohne
+    /// ein Modell zu laden oder die Config anzufassen (Release-Prüfung).
+    #[arg(long, exclusive = true)]
+    manifest_sha256: bool,
 
     /// Silence-Gate je WAV auswerten, mit Alternativen für Marge und Laufdauer
     /// (§6.4, kein Modell nötig).
@@ -251,20 +274,34 @@ where
         }
     };
 
+    // §9 (v1.10): modusabhängige Optionen vor **jeder** Aktion prüfen, auch
+    // vor Autostart — ein ignorierter Schalter wäre ein stiller Bedienfehler.
+    if let Err(code) = check_mode_options(&cli) {
+        return code;
+    }
+
     // §5.3: Die CLI-Modi laufen **vor** der Single-Instance-Sperre und fordern
     // sie nie an; §10: sie loggen nur nach stderr, nie in `diktier.log`.
+    if cli.manifest_sha256 {
+        // Ohne Panik bei geschlossener Pipe: ein Aufrufer, der nicht liest,
+        // bekommt Exit 1 statt eines Absturzes.
+        use std::io::Write;
+        return match writeln!(std::io::stdout(), "{}", download::manifest_sha256()) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        };
+    }
     if cli.install_autostart {
         return install_autostart();
     }
     if cli.remove_autostart {
         return remove_autostart();
     }
-    if cli.runs != 1 && cli.transcribe_wav.is_none() {
-        eprintln!("diktier: --runs gilt nur zusammen mit --transcribe-wav");
-        return 2;
-    }
     if let Some(path) = cli.transcribe_wav {
-        return transcribe_wav(&path, cli.runs);
+        return transcribe_wav(&path, cli.model.as_deref(), cli.runs.unwrap_or(1));
+    }
+    if let Some(list) = cli.transcribe_list {
+        return transcribe_list(&list, cli.model.as_deref(), cli.runs);
     }
     if !cli.gate_analyze.is_empty() {
         return gate_analyze(&cli.gate_analyze);
@@ -350,20 +387,70 @@ fn remove_autostart() -> u8 {
     }
 }
 
-fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
+/// §9 (v1.10): `--model` und `--runs` gelten nur mit `--transcribe-wav` oder
+/// `--transcribe-list`; außerhalb davon Exit 2, bevor irgendetwas passiert.
+/// Ein unbekannter Schlüssel ist ebenfalls Exit 2.
+fn check_mode_options(cli: &Cli) -> Result<(), u8> {
+    let transcribing = cli.transcribe_wav.is_some() || cli.transcribe_list.is_some();
+    if cli.runs.is_some() && !transcribing {
+        eprintln!("diktier: --runs gilt nur zusammen mit --transcribe-wav oder --transcribe-list");
+        return Err(2);
+    }
+    if let Some(key) = &cli.model {
+        if !transcribing {
+            eprintln!(
+                "diktier: --model gilt nur zusammen mit --transcribe-wav oder --transcribe-list"
+            );
+            return Err(2);
+        }
+        check_model_key(key)?;
+    }
+    Ok(())
+}
+
+/// §9 (v1.10): `--model` nimmt nur Manifest-Schlüssel; unbekannt ist ein
+/// Bedienfehler (Exit 2), kein Ersatzmodell.
+fn check_model_key(key: &str) -> Result<(), u8> {
+    match download::model_keys() {
+        Ok(keys) if keys.contains(&key) => Ok(()),
+        Ok(keys) => {
+            eprintln!(
+                "diktier: unbekannter Modellschlüssel {key:?} (erlaubt: {})",
+                download::allowed_models_hint(&keys)
+            );
+            Err(2)
+        }
+        Err(err) => {
+            eprintln!("diktier: {err}");
+            Err(1)
+        }
+    }
+}
+
+/// Config für die Transkriptionsmodi: Warnungen auf stderr, Fehler als Exitcode.
+fn load_cli_config() -> Result<config::Config, u8> {
     let loaded = match config::load() {
         Ok(loaded) => loaded,
         Err(err) => {
             eprintln!("{err}");
-            return match err {
+            return Err(match err {
                 ConfigError::Io(_) => 1,
                 _ => 2,
-            };
+            });
         }
     };
     for warning in &loaded.warnings {
         eprintln!("Warnung: {warning}");
     }
+    Ok(loaded.config)
+}
+
+/// `model_override` ist `--model`; ohne ihn gilt `engine.model` (§9).
+fn transcribe_wav(path: &std::path::Path, model_override: Option<&str>, runs: u32) -> u8 {
+    let config = match load_cli_config() {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
 
     let pcm = match audio::read_wav_16k_mono(path) {
         Ok(pcm) => pcm,
@@ -387,10 +474,17 @@ fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
     }
 
     let load_start = Instant::now();
-    let mut transcriber = match ParakeetTranscriber::load(
-        &loaded.config.engine.model,
-        loaded.config.engine.threads,
-    ) {
+    // §6.2: genau ein Modell, ausgewählt an dieser einen Stelle — `--model`
+    // oder das Config-Modell.
+    let key = model_override.unwrap_or(&config.engine.model);
+    let model = match engine::model_artifacts(key) {
+        Ok(model) => model,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    let mut transcriber = match ParakeetTranscriber::load(&model, config.engine.threads) {
         Ok(t) => t,
         Err(err) => {
             eprintln!("{err}");
@@ -423,6 +517,34 @@ fn transcribe_wav(path: &std::path::Path, runs: u32) -> u8 {
     }
     println!("{}", last.text);
     0
+}
+
+/// `--transcribe-list` (§9, v1.10): JSONL auf stdout, Diagnose auf stderr.
+fn transcribe_list(list: &std::path::Path, model_override: Option<&str>, runs: Option<u32>) -> u8 {
+    let config = match load_cli_config() {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    let files = match transcribe_list::read_list(list) {
+        Ok(files) => files,
+        Err(err) => {
+            eprintln!("{err}");
+            return err.exit_code();
+        }
+    };
+    let key = model_override.unwrap_or(&config.engine.model).to_string();
+    let threads = config.engine.threads;
+    let load = || {
+        let model = engine::model_artifacts(&key)?;
+        ParakeetTranscriber::load(&model, threads)
+    };
+    transcribe_list::run_batch(
+        &files,
+        runs,
+        load,
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
 }
 
 /// Silence-Gate-Werkzeug (§6.4, silence-gate-plan WP0): je WAV den Report plus
@@ -950,10 +1072,15 @@ fn record_test(secs: u32) -> u8 {
     }
 
     let load_start = Instant::now();
-    let mut transcriber = match ParakeetTranscriber::load(
-        &loaded.config.engine.model,
-        loaded.config.engine.threads,
-    ) {
+    // §6.2: genau das Config-Modell, ausgewählt an dieser einen Stelle.
+    let model = match engine::model_artifacts(&loaded.config.engine.model) {
+        Ok(model) => model,
+        Err(err) => {
+            eprintln!("{err}");
+            return 1;
+        }
+    };
+    let mut transcriber = match ParakeetTranscriber::load(&model, loaded.config.engine.threads) {
         Ok(t) => t,
         Err(err) => {
             eprintln!("{err}");
@@ -1419,6 +1546,163 @@ mod tests {
     #[test]
     fn runs_without_transcribe_wav_exits_2() {
         assert_eq!(cli_main(["diktier", "--runs", "5"]), 2);
+        assert_eq!(
+            cli_main(["diktier", "--transcribe-list", "l.txt", "--runs", "0"]),
+            2
+        );
+    }
+
+    /// Zwei Sekunden digitale Stille: Regel C, nie ein Modell.
+    fn silent_wav(dir: &std::path::Path) -> String {
+        let path = dir.join("still.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for _ in 0..16_000 * 2 {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        path.to_str().expect("utf-8 path").to_string()
+    }
+
+    const ULTRA: &str = "parakeet-ultra-0.6b-int8-pc";
+
+    /// §9 (v1.10): `--model` gibt es nur mit einem Transkriptionsmodus.
+    #[test]
+    fn model_without_transcription_mode_exits_2() {
+        assert_eq!(cli_main(["diktier", "--model", config::DEFAULT_MODEL]), 2);
+        assert_eq!(cli_main(["diktier", "--foreground", "--model", ULTRA]), 2);
+        assert_eq!(
+            cli_main(["diktier", "--gate-analyze", "a.wav", "--model", ULTRA]),
+            2
+        );
+        assert_eq!(
+            cli_main(["diktier", "--transcribe-wav", "a.wav", "--model"]),
+            2
+        );
+    }
+
+    /// Nur Manifest-Schlüssel; die Prüfung kommt vor Config und Datei.
+    #[test]
+    fn unknown_model_key_exits_2() {
+        let missing = "/no/such/diktier-missing.wav";
+        assert_eq!(
+            cli_main(["diktier", "--transcribe-wav", missing, "--model", "nope"]),
+            2
+        );
+        assert_eq!(
+            cli_main([
+                "diktier",
+                "--transcribe-list",
+                missing,
+                "--model",
+                "Parakeet-TDT-0.6b-v3-int8"
+            ]),
+            2
+        );
+    }
+
+    /// L1 (Review WP2): Clap nimmt Autostart mit `--model`/`--runs` an; die
+    /// Optionsprüfung — in `cli_main` der erste Schritt nach dem Parsen, vor
+    /// jeder Aktion — lehnt es mit 2 ab, auch mit gültigem Schlüssel. Nur
+    /// geparst, nie `cli_main`: der echte Autostart bleibt unberührt.
+    #[test]
+    fn mode_options_are_checked_before_autostart() {
+        for action in ["--install-autostart", "--remove-autostart"] {
+            for extra in [
+                vec!["--model", "nope"],
+                vec!["--model", config::DEFAULT_MODEL],
+                vec!["--model", ULTRA],
+                vec!["--runs", "3"],
+            ] {
+                let mut args = vec!["diktier", action];
+                args.extend(extra.iter().copied());
+                let cli = Cli::try_parse_from(args.clone()).expect("Clap nimmt es an");
+                assert_eq!(check_mode_options(&cli), Err(2), "{args:?}");
+            }
+            let cli = Cli::try_parse_from(["diktier", action]).unwrap();
+            assert_eq!(check_mode_options(&cli), Ok(()), "{action} allein");
+        }
+    }
+
+    /// §9 (v1.10): `--manifest-sha256` gibt es nur allein; die Prüfung selbst
+    /// kommt ohne Modell und Config aus.
+    #[test]
+    fn manifest_sha256_is_exclusive_and_needs_nothing() {
+        assert_eq!(cli_main(["diktier", "--manifest-sha256"]), 0);
+        for other in [
+            vec!["--foreground"],
+            vec!["--install-autostart"],
+            vec!["--model", ULTRA],
+            vec!["--transcribe-list", "l.txt"],
+        ] {
+            let mut args = vec!["diktier", "--manifest-sha256"];
+            args.extend(other.iter().copied());
+            assert_eq!(cli_main(args.clone()), 2, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn transcribe_list_parser_conflicts_exit_2() {
+        assert_eq!(cli_main(["diktier", "--transcribe-list"]), 2);
+        for other in [
+            vec!["--transcribe-wav", "a.wav"],
+            vec!["--gate-analyze", "a.wav"],
+            vec!["--clipboard-check"],
+            vec!["--install-autostart"],
+            vec!["--foreground", "--record-test", "3"],
+        ] {
+            let mut args = vec!["diktier", "--transcribe-list", "l.txt"];
+            args.extend(other.iter().copied());
+            assert_eq!(cli_main(args.clone()), 2, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn transcribe_list_unreadable_or_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("fehlt.txt");
+        assert_eq!(
+            cli_main(["diktier", "--transcribe-list", missing.to_str().unwrap()]),
+            1
+        );
+        let empty = dir.path().join("leer.txt");
+        std::fs::write(&empty, "\n  \n").unwrap();
+        assert_eq!(
+            cli_main(["diktier", "--transcribe-list", empty.to_str().unwrap()]),
+            2
+        );
+    }
+
+    /// Ende zu Ende ohne Modell: nur abgelehnte Aufnahmen, `--runs` und ein
+    /// anderer Schlüssel als die Config — das Modell wird nie gebraucht.
+    #[test]
+    fn transcribe_list_with_only_rejected_files_needs_no_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = silent_wav(dir.path());
+        let list = dir.path().join("liste.txt");
+        std::fs::write(&list, format!("{wav}\r\n\r\n{wav}\r\n")).unwrap();
+        let list = list.to_str().unwrap();
+        assert_eq!(
+            cli_main([
+                "diktier",
+                "--transcribe-list",
+                list,
+                "--model",
+                ULTRA,
+                "--runs",
+                "2"
+            ]),
+            0
+        );
+        assert_eq!(
+            cli_main(["diktier", "--transcribe-wav", &wav, "--model", ULTRA]),
+            0
+        );
     }
 
     #[test]

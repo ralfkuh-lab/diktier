@@ -1,6 +1,6 @@
 [package]
 name = "diktier"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 description = "Lokales Push-to-Talk-Diktiertool"
@@ -10,6 +10,9 @@ publish = false
 clap = { version = "4", features = ["derive"] }
 hound = "3.5"
 serde = { version = "1", features = ["derive"] }
+# WP2c `--transcribe-list` (§9): JSONL mit korrektem Escaping. 1.0.151 steht
+# ohnehin schon transitiv im Lock (parakeet-rs), kein neuer Baum.
+serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 toml = "0.8"

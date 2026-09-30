@@ -1,28 +1,69 @@
-# Artefakt-Manifest, byte-identisch zu Voxtype auf Omarchy (Spec §6.3).
-# Immutable HF-URLs: resolve/<git-commit>/… Revision 8f23f0c0…
+# Artefakt-Manifest (Spec §6.2, §6.3): ein Eintrag je freigegebenem
+# Modellschlüssel, ein Artefaktvertrag pro Schlüssel — andere Bytes bekommen
+# einen neuen Schlüssel. `engine.model` wählt genau einen Eintrag.
+#
+# Herkunft steht strukturiert je Modell (`source`, `repository`, `revision`
+# bzw. `release_tag`); jede URL muss daraus exakt folgen (download.rs prüft das,
+# scripts\release.ps1 schreibt daraus versions.toml, §11). Unveränderlich heißt
+# Hugging-Face `resolve/<git-commit>/…` oder Asset eines immutable
+# GitHub-Releases.
 
+# Default für `engine.model` — muss `config::DEFAULT_MODEL` sein.
+default_model = "parakeet-tdt-0.6b-v3-int8"
+
+# v3, byte-identisch zu Voxtype auf Omarchy (Golden Set, §6.3).
+[[models]]
 key = "parakeet-tdt-0.6b-v3-int8"
+source = "huggingface"
+repository = "istupakov/parakeet-tdt-0.6b-v3-onnx"
+revision = "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce"
 
-[[files]]
+[[models.files]]
 name = "encoder-model.int8.onnx"
 bytes = 652183999
 sha256 = "6139d2fa7e1b086097b277c7149725edbab89cc7c7ae64b23c741be4055aff09"
 url = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/encoder-model.int8.onnx"
 
-[[files]]
+[[models.files]]
 name = "decoder_joint-model.int8.onnx"
 bytes = 18202004
 sha256 = "eea7483ee3d1a30375daedc8ed83e3960c91b098812127a0d99d1c8977667a70"
 url = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/decoder_joint-model.int8.onnx"
 
-[[files]]
+[[models.files]]
 name = "vocab.txt"
 bytes = 93939
 sha256 = "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"
 url = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/vocab.txt"
 
-[[files]]
+[[models.files]]
 name = "config.json"
 bytes = 97
 sha256 = "666903c76b9798caf2c210afd4f6cd60b08a8dbf9800ec8d7a3bc0d2148ac466"
 url = "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/config.json"
+
+# Parakeet Ultra, eigene int8-per-channel-Quantisierung (§6.3 „Ultra-Artefakte",
+# Rezept scripts\quantize-ultra.py). Kein config.json — parakeet-rs liest es nicht.
+[[models]]
+key = "parakeet-ultra-0.6b-int8-pc"
+source = "github-release"
+repository = "ralfkuh-lab/diktier-models"
+release_tag = "model-parakeet-ultra-0.6b-int8-pc-r1"
+
+[[models.files]]
+name = "encoder-model.int8.onnx"
+bytes = 700507227
+sha256 = "2cc01c15a08d6976ca9ebe97739d15890f3088cfedd3a4aa4d969ba7a1702038"
+url = "https://github.com/ralfkuh-lab/diktier-models/releases/download/model-parakeet-ultra-0.6b-int8-pc-r1/encoder-model.int8.onnx"
+
+[[models.files]]
+name = "decoder_joint-model.int8.onnx"
+bytes = 18300628
+sha256 = "afcb9459250ab5c2e48e657d852501c233e8b7f5daed1894a2a7101d21165a5e"
+url = "https://github.com/ralfkuh-lab/diktier-models/releases/download/model-parakeet-ultra-0.6b-int8-pc-r1/decoder_joint-model.int8.onnx"
+
+[[models.files]]
+name = "vocab.txt"
+bytes = 93939
+sha256 = "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"
+url = "https://github.com/ralfkuh-lab/diktier-models/releases/download/model-parakeet-ultra-0.6b-int8-pc-r1/vocab.txt"

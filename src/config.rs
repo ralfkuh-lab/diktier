@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::download;
+
+/// Default für `engine.model` (§6.2). Muss `default_model` in `models.toml`
+/// sein; erlaubt sind alle Schlüssel des Manifests.
 pub const DEFAULT_MODEL: &str = "parakeet-tdt-0.6b-v3-int8";
 
 /// Inhalt der Default-Datei, kommentiert wie in Spec §8.
@@ -20,7 +24,7 @@ sample_rate = 16000     # Engine-Zielrate, nur 16000
 max_duration_secs = 60
 
 [engine]
-model = "parakeet-tdt-0.6b-v3-int8"
+model = "parakeet-tdt-0.6b-v3-int8"   # v1.10 auch "parakeet-ultra-0.6b-int8-pc"
 threads = 0             # 0 = Runtime-Default
 
 [output]
@@ -457,10 +461,14 @@ fn validate_and_clamp(raw: RawConfig, warnings: &mut Vec<String>) -> Result<Conf
         )));
     }
 
-    if raw.engine.model != DEFAULT_MODEL {
+    // §6.2: erlaubt sind genau die Manifest-Schlüssel; alles andere bleibt
+    // fatal, ohne Ersatzmodell.
+    let models = download::model_keys().map_err(|e| ConfigError::Fatal(e.to_string()))?;
+    if !models.contains(&raw.engine.model.as_str()) {
         return Err(ConfigError::Fatal(format!(
-            "ungültiges engine.model {:?}",
-            raw.engine.model
+            "ungültiges engine.model {:?} (erlaubt: {})",
+            raw.engine.model,
+            download::allowed_models_hint(&models)
         )));
     }
 
@@ -877,6 +885,8 @@ leading_space = false
         assert_eq!(loaded.config.output.mode, OutputMode::Paste);
     }
 
+    const ULTRA: &str = "parakeet-ultra-0.6b-int8-pc";
+
     #[test]
     fn fatal_invalid_engine_model() {
         let err = parse_toml(
@@ -887,9 +897,72 @@ model = "whisper-medium"
         )
         .unwrap_err();
         match err {
-            ConfigError::Fatal(msg) => assert!(msg.contains("engine.model"), "{msg}"),
+            // §6.2/§8: fatal, und die Meldung nennt die erlaubten Werte.
+            ConfigError::Fatal(msg) => {
+                assert!(msg.contains("engine.model"), "{msg}");
+                assert!(msg.contains("whisper-medium"), "{msg}");
+                assert!(msg.contains(DEFAULT_MODEL), "{msg}");
+                assert!(msg.contains(ULTRA), "{msg}");
+            }
             other => panic!("expected Fatal, got {other:?}"),
         }
+    }
+
+    /// v1.10: beide Manifest-Schlüssel sind gültig und kommen unverändert an.
+    #[test]
+    fn both_manifest_models_are_accepted() {
+        for key in [DEFAULT_MODEL, ULTRA] {
+            let loaded = parse_toml(&format!(
+                "[engine]
+model = \"{key}\"
+"
+            ))
+            .unwrap();
+            assert_eq!(loaded.config.engine.model, key);
+            assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        }
+    }
+
+    #[test]
+    fn missing_engine_model_is_the_default() {
+        let loaded = parse_toml(
+            "[engine]
+threads = 2
+",
+        )
+        .unwrap();
+        assert_eq!(loaded.config.engine.model, DEFAULT_MODEL);
+        let loaded = parse_toml(
+            "[audio]
+max_duration_secs = 30
+",
+        )
+        .unwrap();
+        assert_eq!(loaded.config.engine.model, DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn default_model_is_the_manifest_default() {
+        assert_eq!(download::default_model_key().unwrap(), DEFAULT_MODEL);
+    }
+
+    /// §8: Die Vorlage schreibt den Default und nennt im Kommentar jeden
+    /// weiteren Manifest-Schlüssel.
+    #[test]
+    fn default_file_writes_v3_and_names_the_other_model() {
+        let line = DEFAULT_TOML
+            .lines()
+            .find(|l| l.starts_with("model = "))
+            .expect("engine.model in der Default-Datei");
+        assert!(
+            line.starts_with(&format!("model = \"{DEFAULT_MODEL}\"")),
+            "{line}"
+        );
+        for key in download::model_keys().unwrap() {
+            assert!(line.contains(key), "{key} fehlt in {line}");
+        }
+        let loaded = parse_toml(DEFAULT_TOML).unwrap();
+        assert_eq!(loaded.config.engine.model, DEFAULT_MODEL);
     }
 
     #[test]

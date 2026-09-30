@@ -22,6 +22,8 @@
 mod debug_wav;
 mod dispatch;
 mod logging;
+#[cfg(test)]
+mod model_wiring_tests;
 mod signals;
 mod workers;
 
@@ -32,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use crate::autostart;
 use crate::config::{self, ConfigError};
-use crate::download::{self, ArtifactManifest, load_manifest};
+use crate::download::{DownloadError, SelectedModel};
 use crate::hotkey::HotkeySpec;
 #[cfg(windows)]
 use crate::hotkey_dialog::{self, DialogOutcome};
@@ -62,6 +64,9 @@ const QUIT_HARD_LIMIT: Duration = Duration::from_secs(5);
 
 /// Frist für den `SAVE_TARGETS`-Handshake im Quit-Pfad.
 const SAVE_TARGETS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Tray-Tooltip im Configfehler-Modus, in dem kein Modell gewählt ist.
+const NO_MODEL_LABEL: &str = "kein Modell";
 
 /// Der Daemon: `diktier` bzw. `diktier --foreground` (§9).
 pub fn run(foreground: bool) -> u8 {
@@ -120,8 +125,10 @@ fn config_error_mode(message: String, log: &Arc<Logger>) -> u8 {
     signals::install();
 
     let (tx, rx) = mpsc::channel::<Msg>();
+    // Ohne gültige Config ist kein Modell gewählt — der Tooltip nennt deshalb
+    // auch keins, statt v3 vorzutäuschen (§6.2: kein Default-Fallback).
     let mut tray = match TrayWorker::spawn(
-        config::DEFAULT_MODEL.to_string(),
+        NO_MODEL_LABEL.to_string(),
         AppState::Error,
         false,
         tx,
@@ -195,32 +202,38 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
     }
     let config = loaded.config;
 
-    let manifest = match load_manifest() {
-        Ok(manifest) => manifest,
+    // §6.2: Hier und nur hier wird das Modell gewählt. Verzeichnis, Download,
+    // Engine und Tray bekommen genau diesen Eintrag.
+    let model = match SelectedModel::select(&config.engine.model) {
+        Ok(model) => model,
+        // Ein unbekannter Modellschlüssel ist ein fataler Configfehler, auch
+        // der zeigt sich im Tray (§8-Tabelle, codex M3). Die Config-Prüfung
+        // fängt ihn schon ab; hier gibt es trotzdem keinen Ersatz.
+        Err(err @ DownloadError::UnknownModel { .. }) => {
+            return config_error_mode(format!("engine.model: {err}"), &log);
+        }
         Err(err) => {
             log.error(err.to_string());
             return 1;
         }
     };
-    if config.engine.model != manifest.key {
-        // §6.2: unbekannter Modellschlüssel ist ein fataler Configfehler —
-        // auch der zeigt sich im Tray (§8-Tabelle, codex M3).
-        return config_error_mode(
-            format!(
-                "engine.model {:?} ist unbekannt — v1 kennt nur {:?}",
-                config.engine.model, manifest.key
-            ),
-            &log,
-        );
-    }
 
     signals::install();
     log.info(format!(
         "diktier {} startet ({}, Modell {})",
         env!("CARGO_PKG_VERSION"),
         if foreground { "--foreground" } else { "Daemon" },
-        manifest.key
+        model.key()
     ));
+
+    // §10 (v1.10): Debug-WAV einmal hier lesen und nur noch durchreichen.
+    let debug_wav = debug_wav::from_env();
+    for warning in &debug_wav.warnings {
+        log.warn(format!("Debug-WAV: {warning}"));
+    }
+    if let Some(line) = debug_wav.start_line() {
+        log.info(line);
+    }
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
@@ -238,7 +251,7 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
 
     // §10: „Tray-Aufbau gescheitert → Prozessende, stderr+Log, Exit 1."
     let tray_worker = match TrayWorker::spawn(
-        manifest.key.clone(),
+        model.key().to_string(),
         AppState::Starting,
         false,
         tx.clone(),
@@ -283,7 +296,13 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
 
     // codex M2: Ein Worker, der nicht startet, ist ein Startfehler — sonst
     // liefe der Daemon ohne Mikrofon bzw. ohne Hotkey stumm weiter.
-    let audio = match AudioWorker::spawn(config.audio.clone(), level_tap, tx.clone(), log.clone()) {
+    let audio = match AudioWorker::spawn(
+        config.audio.clone(),
+        level_tap,
+        debug_wav.config,
+        tx.clone(),
+        log.clone(),
+    ) {
         Ok(worker) => worker,
         Err(err) => {
             log.error(format!("Audio-Worker nicht gestartet: {err}"));
@@ -317,7 +336,7 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
 
     let mut daemon = Daemon {
         log: log.clone(),
-        manifest,
+        model,
         threads: config.engine.threads,
         tx,
         engine: None,
@@ -350,7 +369,8 @@ fn run_locked(foreground: bool, log: &Arc<Logger>) -> u8 {
 
 struct Daemon {
     log: Arc<Logger>,
-    manifest: ArtifactManifest,
+    /// §6.2: das eine, beim Start aus `engine.model` gewählte Modell.
+    model: SelectedModel,
     threads: u32,
     tx: Sender<Msg>,
     /// `None`, solange kein Modell geladen wird — nach dem Watchdog kurzzeitig
@@ -636,20 +656,6 @@ impl Daemon {
         }
     }
 
-    /// §6.3: Existenz und Größe der Artefakte. Der SHA-256-Vollcheck gehört in
-    /// den Download-Pfad (Phase 3d) — er kostet beim Kaltstart Sekunden.
-    fn artifacts_complete(&self) -> Result<(), String> {
-        let dir = download::model_dir(&self.manifest.key).map_err(|e| e.to_string())?;
-        download::check_artifacts(&dir, &self.manifest).map_err(|e| e.to_string())
-    }
-
-    fn model_dir_hint(&self) -> String {
-        match download::model_dir(&self.manifest.key) {
-            Ok(dir) => dir.display().to_string(),
-            Err(err) => err.to_string(),
-        }
-    }
-
     /// Quit-Pfad (§5.2): Clipboard sichern, Worker beenden, notfalls hart raus.
     fn shutdown(mut self, exit: u8) -> u8 {
         let deadline = Instant::now() + QUIT_HARD_LIMIT;
@@ -742,21 +748,29 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-impl Actors for Daemon {
-    fn check_artifacts(&mut self, run: RunId) {
-        match self.artifacts_complete() {
-            Ok(()) => self.emitted.push(Event::ArtifactsChecked {
+/// §6.3 „Prüfumfang": Startprüfung des gewählten Modells, nur Existenz und
+/// Größe. Der SHA-256-Vollcheck gehört in den Download-Pfad — er kostet beim
+/// Kaltstart Sekunden.
+fn artifacts_checked(model: &SelectedModel, run: RunId, log: &Logger) -> Event {
+    match model.check() {
+        Ok(()) => Event::ArtifactsChecked {
+            run,
+            complete: true,
+        },
+        Err(problem) => {
+            log.warn(format!("Modellartefakte: {problem}"));
+            Event::ArtifactsChecked {
                 run,
-                complete: true,
-            }),
-            Err(problem) => {
-                self.log.warn(format!("Modellartefakte: {problem}"));
-                self.emitted.push(Event::ArtifactsChecked {
-                    run,
-                    complete: false,
-                });
+                complete: false,
             }
         }
+    }
+}
+
+impl Actors for Daemon {
+    fn check_artifacts(&mut self, run: RunId) {
+        let event = artifacts_checked(&self.model, run, &self.log);
+        self.emitted.push(event);
     }
 
     fn start_download(&mut self, run: RunId) {
@@ -767,14 +781,9 @@ impl Actors for Daemon {
         }
         self.log.run(
             run,
-            format!("Modellartefakte fehlen in {}", self.model_dir_hint()),
+            format!("Modellartefakte fehlen in {}", self.model.dir().display()),
         );
-        match DownloadWorker::spawn(
-            run,
-            self.manifest.clone(),
-            self.tx.clone(),
-            self.log.clone(),
-        ) {
+        match DownloadWorker::spawn(run, self.model.clone(), self.tx.clone(), self.log.clone()) {
             Ok(worker) => self.download = Some(worker),
             // codex M2: sonst bliebe der Kern für immer in `downloading`.
             Err(message) => {
@@ -787,7 +796,7 @@ impl Actors for Daemon {
     fn load_model(&mut self, run: RunId) {
         if self.engine.is_none() {
             match EngineWorker::spawn(
-                self.manifest.key.clone(),
+                self.model.clone(),
                 self.threads,
                 self.tx.clone(),
                 self.log.clone(),
