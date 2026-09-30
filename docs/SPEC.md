@@ -1,6 +1,6 @@
-# Diktier — Spec v1.8
+# Diktier — Spec v1.9
 
-Stand: 2026-09-25. Verbindlich für die Implementierung. Änderungen nur über
+Stand: 2026-09-30. Verbindlich für die Implementierung. Änderungen nur über
 diesen Text.
 
 v1.1: Codex-Review (`docs/reviews/spec-codex.md`). v1.2: Agy-Kreuz-Review
@@ -32,6 +32,11 @@ Tooltips aus §4.3/§7.1/§7.3; `output.mode = "type"` gestrichen (§7.5,
 §8); Debug-WAV als Ring der letzten zehn (§10). Plan
 `docs/clipboard-restore-plan.md`, Review
 `docs/reviews/plan-clipboard-restore-sol.md`. §18 #14.
+v1.9 (2026-09-30, Ralf): **Vorlauf-Stille** vor jedem Engine-Aufruf
+(§6.4) gegen die Halluzination „Herr Präsident“ am Diktatanfang;
+Debug-WAV als **32-bit-Float** statt 16-bit (§10), damit ein Fall
+bitgenau nachstellbar ist. Messbelege in `docs/SPIKES.md`
+(„Vorlauf-Stille“). §18 #15.
 
 ## 1. Ziel
 
@@ -482,6 +487,26 @@ Ein gleichmäßiges Geräusch zwischen 0,004 und 0,0075 über ≥ 2 s erreicht
 seit v1.7 die Engine; der Schutz ist dort die Engine selbst (liefert auf
 Nicht-Sprache leer, SPIKES 2026-09-21).
 
+#### Vorlauf-Stille (v1.9)
+
+Gibt der Gate die Aufnahme frei, bekommt die Engine den Puffer mit
+`LEAD_IN_SILENCE_SAMPLES = 4800` (300 ms) vorangestellten Samples
+`0.0`. Der Gate, sein Report und die Dauer im Ergebnis beziehen sich
+auf den **unveränderten** Puffer; die Stille zählt nirgends mit. Es gibt
+genau diese eine Stelle (`transcribe_pcm`), damit Daemon,
+`--transcribe-wav`, `--record-test` und `stt-smoke` identisch rechnen.
+Keine Config-Option.
+
+Anlass: Parakeet stellt einem Diktat, das mit leisem Vorlauf
+(Raumgeräusch, Atmen, Tastenklick) beginnt, gelegentlich ein
+erfundenes „Herr Präsident.“ voran. Schon Rauschen um −90 dBFS reicht
+dafür. Digitale Nullen davor machen die Phrase deutlich seltener,
+schließen sie aber nicht aus (Lauf 545 mit Dither: ohne Stille 8 von 8,
+mit 300 ms 1 von 24); die WER der Fixtures sinkt dabei leicht (SPIKES
+2026-09-30). Bekannte
+Grenze: Ein vorangestelltes „Ich“ bei Imperativen („Schau …“ → „Ich
+schaue …“) hängt nicht am Vorlauf und bleibt.
+
 Log-Vertrag: pro Aufnahme genau eine Zeile mit dem Gate-Report
 (Entscheidung und Regel, Sample- und Fensterzahl, RMS, floor, Maximum,
 Schwelle D, Laufdauern; RMS-Werte mit fünf Nachkommastellen) — auch bei
@@ -789,7 +814,9 @@ bereinigte Formatnamen (druckbares ASCII, höchstens 40 Zeichen), Größen,
 Dauern und Verlustgründe; keine Pfade aus `CF_HDROP`.
 
 `DIKTIER_DEBUG_WAV=1` (v1.8): schreibt je Aufnahme
-`%TEMP%\diktier\rec_<UTC bis ms>_lauf-<N>[-<k>].wav` atomar: exklusiv
+`%TEMP%\diktier\rec_<UTC bis ms>_lauf-<N>[-<k>].wav` (seit v1.9 16 kHz
+mono **32-bit-Float-PCM**, bitgleich zum Engine-Puffer vor der
+Vorlauf-Stille aus §6.4) atomar: exklusiv
 angelegte Temp-Datei `<ziel>.<pid>-<n>.part`, dann Rename **ohne
 Ersetzen**; ist der Name belegt, folgt das Suffix `-2`, `-3` … Behalten
 werden die **zehn** jüngsten Dateien dieses Musters (mit gültigem
@@ -1010,3 +1037,4 @@ Kein Code-Import.
 | 12 | Relativer Silence-Gate (v1.6) | Bisherige Ja-Pfade (B1/B2) bleiben, Regel D relativ zum Grundrauschen kommt hinzu; Engine ist pegelrobust (`alltag.wav` −22 dB wortidentisch, 2026-09-21); Grenzen in §6.4; Windows-Mikrofonpegel wird nicht angefasst (Ralf, 2026-09-21). |
 | 13 | Regel B3 (v1.7) | Absoluter Lauf ≥ 2,0 s über 0,004 zusätzlich zu B1/B2/D — pausenloses leises Diktat (WP0-Aufnahme 07: 4,5 s) gegen Störgeräusche (≤ 1,0 s); akzeptiertes Restrisiko: gleichmäßiges Geräusch 0,004–0,0075 über 2 s geht an die Engine (Ralf, 2026-09-21). |
 | 14 | Mehrformat-Restore, Hinweiskarte (v1.8) | Anlass: 33× „Nicht-Text-Clipboard“ im Log, Screenshots/Dateien/Formatierung gingen verloren, die versprochenen Tooltips erreichten den Nutzer nie (2026-09-25). „Vollständig“ heißt alle Win32-auslesbaren Nutzdaten byte-gleich in Originalreihenfolge; nicht zugesagt: OLE-Objektsemantik, virtuelle Dateien, Owner-Identität, synthetisch ersetzte GDI-Formate. Akzeptierte Restrisiken: Eine hängende Quelle blockiert den Inject-Worker bis zu ihrer Rückkehr (Quit beendet trotzdem), Speicherspitze ≈ 2 × 128 MiB, Drittanbieter-Clipboard-Manager ignorieren ggf. den Verlaufsausschluss. `output.mode = "type"` ist ein bewusster Breaking Change (Fatal statt stillem Paste). Plan `docs/clipboard-restore-plan.md`, Review `docs/reviews/plan-clipboard-restore-sol.md` (Ralf, 2026-09-25). |
+| 15 | Vorlauf-Stille, Float-Debug-WAV (v1.9) | 300 ms digitale Nullen vor jedem Engine-Aufruf nach Messung mit 0/200/300/500 ms an Fixtures, Kalibrierungsaufnahmen und dem WAV-Ring (roh und mit ±1-LSB-Dither): „Herr Präsident“ in der Matrix überall weg, in der Nachprüfung mit 24 Dither-Seeds von Lauf 545 noch 1 von 24 (ohne Stille 8 von 8), WER-Summe 75,2/53,8 → 51,2/51,2 (roh/Dither), 300 ms als einziger Wert gleich stabil in beiden Reihen. Stille statt Abschneiden, weil kein Sprachbeginn geschätzt werden muss. Debug-WAV als f32, weil die 16-bit-Rundung den Fall in Lauf 545 unsichtbar machte. Akzeptiert: seltenes Restauftreten; mehr Stille hätte den Einzelfall gelöst, wäre aber auf ihn optimiert, und 500 ms war in der WER schlechter. Ebenso akzeptiert: einzelne Wortkipper in beide Richtungen, wie sie schon durch den Dither allein entstehen. Ein Modellwechsel (etwa auf Parakeet Ultra) ist davon getrennt (Ralf, 2026-09-30). |

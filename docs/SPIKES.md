@@ -233,3 +233,48 @@ Befunde:
   0,1000 („Rust Demon“, „ONX Modell“ = 2/20), nicht 0,0500. Der historische
   Eintrag bleibt stehen; der Smoke-Test vergleicht relativ zur unabgesenkten
   Datei und ist davon unberührt.
+
+## Vorlauf-Stille gegen „Herr Präsident“ (Windows, 2026-09-30)
+
+Anlass: Diktate beginnen gelegentlich mit einem erfundenen „Herr
+Präsident.“. Belegfälle aus dem Debug-WAV-Ring, gesichert unter
+`testdata/stt/local/herr_praesident/` (lokal, nie committen, Übersicht in
+`FAELLE.md`): Lauf 523 (reproduziert direkt), Lauf 545 (live 180 Zeichen,
+nachgestellt 164; Differenz = „Herr Präsident. “), Lauf 547 (zusätzlich
+„Ich schaue“ statt „Schau“).
+
+- **Debug-WAV nicht bitgenau:** Der Ring speichert 16-bit, die Engine
+  bekommt f32. Lauf 545 zeigt die Phrase nur mit ±1 LSB Zufallsrauschen
+  (8 von 8 Seeds). Das Modell kippt also schon bei Rauschen um −90 dBFS im
+  Vorlauf. Deshalb v1.9: Debug-WAV als 32-bit-Float.
+- **Kein Zustand zwischen Aufrufen:** `parakeet-rs` 0.3.7 setzt den
+  Decoder-Zustand pro Aufruf auf null, der Feature-Cache hält nur
+  Filterbank und FFT-Plan.
+- **Schnitt- und Stille-Varianten (Lauf 523):** 0,10/0,15 s abschneiden →
+  Phrase bleibt; ab 0,20 s abschneiden → weg; 0,1–1,0 s Nullen voranstellen
+  → weg, obwohl das Geräusch erhalten bleibt.
+- **Matrix** (`--transcribe-wav` der installierten 0.4.0, 0/200/300/500 ms
+  Nullen, jede Datei roh und mit ±1-LSB-Dither Seed 0): 7 Fixtures, 5
+  Kalibrierungsaufnahmen, 12 Ring-Aufnahmen.
+
+  | Stille | WER-Summe roh | WER-Summe Dither | „Herr Präsident“ (ohne 527) |
+  |---|---|---|---|
+  | 0 ms | 75,2 | 53,8 | roh 2, Dither 3 |
+  | 200 ms | 48,8 | 65,5 | 0 |
+  | 300 ms | 51,2 | 51,2 | 0 |
+  | 500 ms | 75,5 | 60,7 | 0 |
+
+  WER-Summe = Summe der Einzel-WER in Prozent über die 12 Dateien mit
+  Referenz (je Wortfehler 4,8 bzw. 5,0/6,7). Lauf 527 enthält „Herr
+  Präsident“ wirklich (gesprochen). Die übrigen Unterschiede sind einzelne
+  Wortkipper in beide Richtungen („Werkstatt“/„Werstadt“, „lassen“/
+  „schlossen“), wie sie auch der Dither allein erzeugt. Entscheidung:
+  300 ms (SPEC §6.4, §18 #15).
+- **Nachprüfung mit dem 0.4.1-Build** (`target-dev`, 300 ms eingebaut):
+  Lauf 545 mit 24 Dither-Seeds → 23 sauber, Seed 4 zeigt weiterhin „Herr
+  Präsident.“ (ohne Stille waren es 8 von 8). Seed 4 mit zusätzlich 200,
+  500 oder 1000 ms Stille oder mit genulltem Vorlauf bis 0,85 s → sauber.
+  Die Stille senkt die Rate also stark, beseitigt die Phrase aber nicht
+  garantiert. 300 ms bleibt (Matrix oben).
+- **Grenze:** Das vorangestellte „Ich“ in Lauf 547 bleibt bei jeder
+  Vorlauf-Variante (abgeschnitten, genullt, 0,3–1,0 s Stille).

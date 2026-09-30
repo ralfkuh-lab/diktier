@@ -12,6 +12,9 @@
 //! Altlast `last_recording.wav` (bis 0.3.0) gelöscht. Fremde Dateien bleiben
 //! unangetastet. Ein gescheiterter Schreibvorgang löscht nur die eigene
 //! Temp-Datei. Nie hochladen — deshalb steht der Pfad genau einmal im Log.
+//!
+//! Format seit v1.9: 16 kHz mono 32-bit-Float, bitgleich zum Capture-Puffer —
+//! also ohne die Vorlauf-Stille, die erst `engine::transcribe_pcm` voranstellt.
 
 use std::fs;
 use std::io;
@@ -306,16 +309,19 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 16 kHz mono 32-bit-Float (Spec §10, v1.9): die Samples unverändert, ohne
+/// Clamp und Rundung, damit ein Fall bitgenau nachstellbar ist
+/// (docs/SPIKES.md 2026-09-30: die 16-bit-Rundung verdeckte Lauf 545).
 fn write_wav(file: fs::File, samples: &[f32]) -> io::Result<()> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: ENGINE_RATE,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
     };
     let mut writer = hound::WavWriter::new(io::BufWriter::new(file), spec).map_err(hound_io)?;
-    for sample in samples {
-        writer.write_sample(to_i16(*sample)).map_err(hound_io)?;
+    for &sample in samples {
+        writer.write_sample(sample).map_err(hound_io)?;
     }
     writer.finalize().map_err(hound_io)
 }
@@ -358,11 +364,6 @@ fn prune(dir: &Path, now: SystemTime) {
     for (_, _, _, path) in dumps.into_iter().take(excess) {
         let _ = fs::remove_file(path);
     }
-}
-
-fn to_i16(sample: f32) -> i16 {
-    let clamped = sample.clamp(-1.0, 1.0);
-    (clamped * i16::MAX as f32).round() as i16
 }
 
 fn hound_io(err: hound::Error) -> io::Error {
@@ -577,7 +578,44 @@ mod tests {
 
         let read_back = read_wav_16k_mono(&path).unwrap();
         assert_eq!(read_back.len(), samples.len());
-        assert!((read_back[0] - samples[0]).abs() < 1e-3);
+        assert_eq!(read_back[0].to_bits(), samples[0].to_bits());
+    }
+
+    /// Spec §10 (v1.9): 32-bit-Float, Roundtrip bitgleich — auch Werte, die
+    /// 16 bit auf 0 oder einen Nachbarwert gerundet hätte, und Werte über 1,
+    /// die früher abgeschnitten wurden.
+    #[test]
+    fn the_dump_is_float32_and_bit_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples = [
+            0.0,
+            -0.0,
+            1e-6,
+            -1e-6,
+            f32::MIN_POSITIVE,
+            -0.5,
+            0.5,
+            0.99999,
+            -0.99999,
+            1.0,
+            -1.0,
+            1.5,
+            -2.0,
+            0.123_456_79,
+        ];
+        let path = write_recording(dir.path(), &samples, RunId(1), sample_time()).unwrap();
+
+        let spec = hound::WavReader::open(&path).unwrap().spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, ENGINE_RATE);
+        assert_eq!(spec.bits_per_sample, 32);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+
+        let read_back = read_wav_16k_mono(&path).unwrap();
+        assert_eq!(read_back.len(), samples.len());
+        for (got, want) in read_back.iter().zip(&samples) {
+            assert_eq!(got.to_bits(), want.to_bits(), "{got} ≠ {want}");
+        }
     }
 
     /// G5 im Kleinen: zwölf Dumps → genau zehn, die zwei ältesten sind weg.
@@ -881,12 +919,5 @@ mod tests {
         let target = dir.path().join("a").join("b");
         let path = write_recording(&target, &[0.0; 160], RunId(1), sample_time()).unwrap();
         assert!(path.is_file());
-    }
-
-    #[test]
-    fn clipping_stays_in_range() {
-        assert_eq!(to_i16(2.0), i16::MAX);
-        assert_eq!(to_i16(-2.0), -i16::MAX);
-        assert_eq!(to_i16(0.0), 0);
     }
 }

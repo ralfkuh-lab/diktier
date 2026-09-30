@@ -9,6 +9,7 @@ use std::time::Duration;
 use parakeet_rs::{ExecutionConfig, ParakeetTDT};
 use thiserror::Error;
 
+use crate::audio::ENGINE_RATE;
 use crate::download::{self, ArtifactManifest, DownloadError};
 
 /// 16 kHz × 250 ms. Kürzer → kein Engine-Aufruf (Spec §6.4).
@@ -34,6 +35,13 @@ pub const MIN_SPEECH_RUN_ABS_SECS: f32 = 2.0;
 /// höchstens 1,0 s. Die Laufdauer ist dieselbe wie bei B2
 /// ([`MIN_SPEECH_RUN_ABS_SECS`]).
 pub const QUIET_SPEECH_RMS: f32 = 0.004;
+
+/// Vorlauf-Stille (Spec §6.4, v1.9): 300 ms digitale Nullen, die
+/// [`transcribe_pcm`] einem freigegebenen Puffer voranstellt, bevor die Engine
+/// ihn bekommt. Gegen das erfundene „Herr Präsident.“ am Diktatanfang, das
+/// schon feines Rauschen im Vorlauf auslöst (docs/SPIKES.md 2026-09-30).
+/// Gate, Report und Dauer sehen die Stille nicht.
+pub const LEAD_IN_SILENCE_SAMPLES: usize = 4800;
 
 /// Regel C/D: absolute Untergrenze, −70,5 dBFS ≈ 9,8 LSB bei 16 bit.
 /// Fenster darunter sind nie aktiv und unterbrechen einen Lauf.
@@ -489,6 +497,12 @@ pub trait Transcriber {
 /// pro geglückter Aufnahme.
 ///
 /// Bei Ablehnung: leeres Transkript, **kein** Engine-Aufruf.
+///
+/// Bei Freigabe bekommt die Engine den Puffer mit
+/// [`LEAD_IN_SILENCE_SAMPLES`] vorangestellten Nullen (Spec §6.4, v1.9). Das
+/// geschieht nur hier, damit Daemon, `--transcribe-wav`, `--record-test` und
+/// stt-smoke gleich rechnen. Die Dauer im Ergebnis setzt ebenfalls nur diese
+/// Funktion, und zwar aus der Originallänge ohne Stille.
 pub fn transcribe_pcm<T: Transcriber>(
     engine: &mut T,
     pcm_f32_16khz: &[f32],
@@ -497,7 +511,15 @@ pub fn transcribe_pcm<T: Transcriber>(
     if report.is_rejected() {
         return (report, Ok(Transcription::empty()));
     }
-    let result = engine.transcribe(pcm_f32_16khz);
+    let mut padded = Vec::with_capacity(LEAD_IN_SILENCE_SAMPLES + pcm_f32_16khz.len());
+    padded.resize(LEAD_IN_SILENCE_SAMPLES, 0.0);
+    padded.extend_from_slice(pcm_f32_16khz);
+    let result = engine.transcribe(&padded).map(|mut out| {
+        out.timing = Some(Timing {
+            duration: Duration::from_secs_f64(pcm_f32_16khz.len() as f64 / f64::from(ENGINE_RATE)),
+        });
+        out
+    });
     (report, result)
 }
 
@@ -543,20 +565,19 @@ impl ParakeetTranscriber {
 
 impl Transcriber for ParakeetTranscriber {
     fn transcribe(&mut self, pcm_f32_16khz: &[f32]) -> Result<Transcription, EngineError> {
-        let sample_rate = 16_000u32;
         let result = parakeet_rs::Transcriber::transcribe_samples(
             &mut self.inner,
             pcm_f32_16khz.to_vec(),
-            sample_rate,
+            ENGINE_RATE,
             1,
             None,
         )
         .map_err(|e| EngineError::Failed(format!("parakeet-rs: {e}")))?;
-        let duration = Duration::from_secs_f64(pcm_f32_16khz.len() as f64 / f64::from(sample_rate));
+        // Die Dauer setzt `transcribe_pcm` aus der Länge ohne Vorlauf-Stille.
         Ok(Transcription {
             text: result.text,
             language: None,
-            timing: Some(Timing { duration }),
+            timing: None,
         })
     }
 }
@@ -715,7 +736,8 @@ mod tests {
             "erwartet {rule:?}, Report: {report}"
         );
         assert_eq!(calls, 1, "Engine muss laufen: {report}");
-        assert_eq!(text, pcm.len().to_string());
+        // Die Engine sieht den Puffer samt Vorlauf-Stille (Spec §6.4, v1.9).
+        assert_eq!(text, (pcm.len() + LEAD_IN_SILENCE_SAMPLES).to_string());
         report
     }
 
@@ -753,6 +775,181 @@ mod tests {
         assert!(matches!(result, Err(EngineError::Failed(_))));
     }
 
+    /// Merkt sich den übergebenen Puffer. Im Erfolgsfall meldet er absichtlich
+    /// eine falsche Dauer — `transcribe_pcm` muss sie durch die Originallänge
+    /// ersetzen. Mit `fail` liefert er nach dem Aufzeichnen einen Fehler.
+    struct RecordingStub {
+        seen: Option<Vec<f32>>,
+        fail: bool,
+    }
+
+    impl RecordingStub {
+        fn ok() -> Self {
+            Self {
+                seen: None,
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                seen: None,
+                fail: true,
+            }
+        }
+    }
+
+    impl Transcriber for RecordingStub {
+        fn transcribe(&mut self, pcm_f32_16khz: &[f32]) -> Result<Transcription, EngineError> {
+            assert!(self.seen.is_none(), "Engine zweimal gerufen");
+            self.seen = Some(pcm_f32_16khz.to_vec());
+            if self.fail {
+                return Err(EngineError::Failed("kaputt".into()));
+            }
+            Ok(Transcription {
+                text: "ok".into(),
+                language: None,
+                timing: Some(Timing {
+                    duration: Duration::from_secs(999),
+                }),
+            })
+        }
+    }
+
+    /// Der Engine-Puffer ist [`LEAD_IN_SILENCE_SAMPLES`] × `+0.0`, gefolgt vom
+    /// bitgleichen Original.
+    fn assert_lead_in_then_original(seen: &[f32], pcm: &[f32]) {
+        assert_eq!(seen.len(), pcm.len() + LEAD_IN_SILENCE_SAMPLES);
+        let (lead_in, rest) = seen.split_at(LEAD_IN_SILENCE_SAMPLES);
+        assert!(
+            lead_in.iter().all(|s| s.to_bits() == 0.0f32.to_bits()),
+            "Vorlauf muss exakt +0.0 sein"
+        );
+        assert_eq!(rest.len(), pcm.len());
+        assert!(
+            rest.iter()
+                .zip(pcm)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "Original muss bitgleich folgen"
+        );
+    }
+
+    /// Nicht-konstantes Signal (B1) mit Werten, die bei einem Versatz oder
+    /// einer Rundung auffallen würden.
+    fn wobble(samples: usize) -> Vec<f32> {
+        (0..samples)
+            .map(|i| 0.02 * ((i as f32) * 0.05).sin() + 1e-6 * (i % 7) as f32)
+            .collect()
+    }
+
+    /// Spec §6.4 (v1.9): 4800 Nullen vor dem unveränderten Original, Gate und
+    /// Dauer ohne Stille.
+    #[test]
+    fn accepted_audio_gets_lead_in_silence() {
+        assert_eq!(LEAD_IN_SILENCE_SAMPLES, 16_000 * 300 / 1_000);
+        let pcm = wobble(secs(3.0));
+
+        let mut stub = RecordingStub::ok();
+        let (report, result) = transcribe_pcm(&mut stub, &pcm);
+        let out = result.expect("Stub schlägt hier nicht fehl");
+        let seen = stub.seen.expect("Engine muss laufen");
+
+        assert_lead_in_then_original(&seen, &pcm);
+        assert_eq!(report, silence_gate(&pcm), "Report ohne Stille gerechnet");
+        assert_eq!(report.samples, pcm.len());
+        assert_eq!(
+            out.timing,
+            Some(Timing {
+                duration: Duration::from_secs(3)
+            }),
+            "Dauer = Originallänge"
+        );
+        assert_eq!(out.text, "ok");
+    }
+
+    /// Keine Ganzsekunden: 48001 Samples = 3 s + 62 500 ns. Eine Trunkierung
+    /// auf Sekunden oder Millisekunden fiele hier auf.
+    #[test]
+    fn duration_is_exact_for_a_fraction_of_a_second() {
+        let pcm = wobble(48_001);
+
+        let mut stub = RecordingStub::ok();
+        let (report, result) = transcribe_pcm(&mut stub, &pcm);
+        let out = result.expect("Stub schlägt hier nicht fehl");
+        let seen = stub.seen.expect("Engine muss laufen");
+
+        assert_eq!(report.decision, GateDecision::Speech(SpeechRule::B1));
+        assert_lead_in_then_original(&seen, &pcm);
+        assert_eq!(report, silence_gate(&pcm));
+        assert_eq!(
+            out.timing,
+            Some(Timing {
+                duration: Duration::new(3, 62_500)
+            }),
+            "Dauer = 48001 / 16000 s"
+        );
+    }
+
+    /// Dieselben Zusagen, wenn Regel D freigibt: leise Sprache nach Stille,
+    /// unter [`QUIET_SPEECH_RMS`], damit weder B1/B2 noch B3 greifen.
+    #[test]
+    fn lead_in_silence_also_on_rule_d() {
+        let mut pcm = level(0.0, secs(10.0));
+        pcm.extend((0..secs(3.0)).map(|i| if i % 2 == 0 { 0.0035 } else { -0.0035 }));
+
+        let mut stub = RecordingStub::ok();
+        let (report, result) = transcribe_pcm(&mut stub, &pcm);
+        let out = result.expect("Stub schlägt hier nicht fehl");
+        let seen = stub.seen.expect("Engine muss laufen");
+
+        assert_eq!(
+            report.decision,
+            GateDecision::Speech(SpeechRule::D),
+            "{report}"
+        );
+        assert_lead_in_then_original(&seen, &pcm);
+        assert_eq!(report, silence_gate(&pcm), "Report ohne Stille gerechnet");
+        assert_eq!(
+            out.timing,
+            Some(Timing {
+                duration: Duration::from_secs(13)
+            })
+        );
+    }
+
+    /// Scheitert die Engine, bleiben Report und Engine-Puffer dieselben wie im
+    /// Erfolgsfall; der Fehler kommt unverändert durch.
+    #[test]
+    fn engine_error_keeps_report_and_lead_in() {
+        let pcm = wobble(secs(3.0));
+
+        let mut stub = RecordingStub::failing();
+        let (report, result) = transcribe_pcm(&mut stub, &pcm);
+        let seen = stub.seen.expect("Engine muss laufen");
+
+        assert_eq!(report, silence_gate(&pcm), "Report ohne Stille gerechnet");
+        assert_lead_in_then_original(&seen, &pcm);
+        assert!(
+            matches!(result, Err(EngineError::Failed(ref m)) if m == "kaputt"),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_audio_never_reaches_the_engine() {
+        let mut stub = RecordingStub::ok();
+        let pcm = level(0.0, secs(3.0));
+        let (report, result) = transcribe_pcm(&mut stub, &pcm);
+        assert!(report.is_rejected(), "{report}");
+        assert!(stub.seen.is_none(), "Engine darf nicht laufen");
+        assert_eq!(result.unwrap(), Transcription::empty());
+
+        let short = level(0.1, MIN_SAMPLES_16KHZ - 1);
+        let (report, _) = transcribe_pcm(&mut stub, &short);
+        assert!(report.is_rejected(), "{report}");
+        assert!(stub.seen.is_none(), "Engine darf nicht laufen");
+    }
+
     #[test]
     fn stub_silence_yields_empty_transcript() {
         let mut engine = StubTranscriber;
@@ -783,7 +980,10 @@ mod tests {
         let exact = level(0.1, MIN_SAMPLES_16KHZ);
         let (_, result) = transcribe_pcm(&mut stub, &exact);
         assert_eq!(stub.calls, 1);
-        assert_eq!(result.unwrap().text, MIN_SAMPLES_16KHZ.to_string());
+        assert_eq!(
+            result.unwrap().text,
+            (MIN_SAMPLES_16KHZ + LEAD_IN_SILENCE_SAMPLES).to_string()
+        );
     }
 
     // ------------------------------------------------------------ Regel B1

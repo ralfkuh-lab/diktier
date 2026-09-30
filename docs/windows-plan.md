@@ -305,6 +305,9 @@ dem Inject-Worker-Thread (dort läuft bereits `serve_for(10 ms)` im Idle,
   Inhalte als Hinweiskarte im Overlay, streicht `output.mode = "type"`
   (Breaking Change) und hält `DIKTIER_DEBUG_WAV` als Ring der letzten zehn
   Aufnahmen (SPEC v1.8, [clipboard-restore-plan.md](clipboard-restore-plan.md)).
+  0.4.1 stellt jeder Aufnahme vor der Engine 300 ms digitale Stille voran
+  (gegen das erfundene „Herr Präsident.“ am Diktatanfang) und schreibt das
+  Debug-WAV als 32-bit-Float (SPEC v1.9, Messung in [SPIKES.md](SPIKES.md)).
 - Gate am 2026-08-31 gefahren: 0.2.0-Zip in leeren Ordner **mit
   Leerzeichen im Pfad** entpackt, `--version` und `--transcribe-wav`
   (Modell-Load 2,2 s, Transkript korrekt, Exit 0).

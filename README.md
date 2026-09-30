@@ -6,7 +6,7 @@ Parakeet (TDT 0.6B v3), kein Cloud-Dienst, kein Konto.
 
 Status: **läuft auf Windows 11** (Hotkey, Tray, Einfügen am Cursor,
 Modell-Download, Autostart, Aufnahme-Overlay mit Mikrofonpegel).
-Aktuelle Version: [v0.4.0](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.4.0).
+Aktuelle Version: [v0.4.1](https://github.com/ralfkuh-lab/diktier/releases/tag/v0.4.1).
 Privates Werkzeug, bewusst klein gehalten.
 
 Linux (Mint/X11) war die Ausgangsplattform; der Linux-Code ist inzwischen
@@ -229,6 +229,13 @@ starten. Configs mit `"paste"` oder ohne den Schlüssel sind nicht betroffen.
   kein Rauschfenster als Bezug gibt. Bleibt es bei `Regel D`, hilft meist:
   deutlicher sprechen, eine kurze Pause vor dem Diktat lassen und den
   Eingangspegel in den Windows-Soundeinstellungen anheben.
+- **Diktat beginnt mit „Herr Präsident.“, obwohl du das nie gesagt hast.**
+  Das Modell erfindet die Phrase gelegentlich, wenn die Aufnahme mit leisem
+  Vorlauf (Raumgeräusch, Atmen, Tastenklick) anfängt. Seit 0.4.1 stellt
+  Diktier jeder Aufnahme 300 ms digitale Stille voran. Das macht die Phrase
+  deutlich seltener, schließt sie aber nicht ganz aus.
+  Bekannte Grenze: Bei Befehlen setzt das Modell manchmal ein „Ich“ davor
+  („Schau …“ wird „Ich schaue …“); das hängt nicht am Vorlauf.
 - **Gate nachrechnen.** `diktier.exe --gate-analyze <datei.wav> …` wertet
   fertige 16-kHz-Mono-WAVs ohne Modell aus: Report je Datei, die Laufdauern
   über den absoluten Schwellen von B3 und B2 sowie die Laufdauern bei
@@ -342,7 +349,12 @@ oder nichts sicherbar, `1` = Fehler.
 ### Debug-WAV
 
 Mit der Umgebungsvariable `DIKTIER_DEBUG_WAV=1` speichert der Daemon jede
-Aufnahme als 16-kHz-Mono-WAV:
+Aufnahme als 16-kHz-Mono-WAV im Format **32-bit-Float** (seit 0.4.1, bis
+0.4.0 16-bit). Die Samples sind genau die aufgenommenen, ohne Rundung und
+ohne die 300 ms Vorlauf-Stille, die erst die Engine bekommt. Eine Datei ist
+dadurch etwa doppelt so groß wie früher (rund 64 KB je Sekunde), und
+`diktier.exe --transcribe-wav <datei>` rechnet den Fall bitgenau nach. Die
+Dateien liegen unter:
 
 ```
 %TEMP%\diktier\rec_<UTC-Zeit bis Millisekunde>_lauf-<N>.wav
