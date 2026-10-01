@@ -1,6 +1,6 @@
 # TODO
 
-## 🔍 Modell-Repo `ralfkuh-lab/diktier-models` anlegen (Ralf, privater Account)
+## ✅ Modell-Repo `ralfkuh-lab/diktier-models` anlegen (Ralf, privater Account)
 
 Für den Ultra-Alltagstest ([docs/ultra-alltagstest-plan.md](docs/ultra-alltagstest-plan.md),
 WP3a Schritt 2). Das geht nur mit `ralfkuh-lab` selbst: Der Account `fsrakul`,

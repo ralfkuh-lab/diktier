@@ -341,71 +341,53 @@ wichtig:** Die 7-Tage-Vorbereitung vor dem Ende von Tag 11 anlegen und
 aufbewahren. Neu vorausgesetzt ist Python ≥ 3.11 für
 `release.ps1` und das Thread-Urteil in `bench-models.ps1`.
 
-### ⚠️ WP3a — Veröffentlichen (einzeln mit Ralfs Go)
+### ✅ WP3a — Veröffentlichen (einzeln mit Ralfs Go)
 
-Stand 2026-10-01, 00:40 (Ralfs Go für alle vier Schritte am 2026-09-30):
+- ✅ Schritt 1 (2026-10-01): [f6ae94f](https://github.com/ralfkuh-lab/diktier/commit/f6ae94f1bfec55a692f4a4bdf6e473390d3a5ccd)
+  (0.5.0), [5657e12](https://github.com/ralfkuh-lab/diktier/commit/5657e123b417e8a7b337ea15d4288f6231f2f793)
+  (NOTICE mit Rezept-Commit) und [357235d](https://github.com/ralfkuh-lab/diktier/commit/357235d1a39b50e9f47315cc8cd2730856227ea4)
+  (TODO) sind auf `main` gepusht.
+- ✅ Schritt 2: Ralf hat `ralfkuh-lab/diktier-models` angelegt, öffentlich, mit
+  Immutable Releases, und `fsrakul` mit Write eingeladen. Die Einladung ist
+  angenommen. Der erste Commit mit README und NOTICE ist
+  [8ddc6a2](https://github.com/ralfkuh-lab/diktier-models/commit/8ddc6a2c64b25c74e5582085f85c6b194d1d5902).
+- ✅ Schritte 3–4: Der Entwurf zeigt auf `8ddc6a2`. Fünf Assets mit Status
+  `uploaded`, Größen wie im Manifest. Authentifiziert per Asset-API
+  zurückgelesen, `sha256sum -c` grün, `SHA256SUMS` identisch zum Staging.
+  Veröffentlicht am 2026-10-01T09:03:35Z mit `make_latest=false`, die API meldet
+  `immutable: true`. Die öffentlichen URLs entsprechen exakt dem Manifest; anonym
+  antworten sie mit 302 auf `release-assets.githubusercontent.com`.
+- ✅ Schritt 5, abweichend vom Plan zusammen mit WP3b: Das anonyme
+  Transport-Gate war der erste Ultra-Start des produktiven Daemons ohne Token,
+  in ein frisches Modellverzeichnis. Ergebnis: „Modellartefakte vollständig und
+  geprüft (79.7 s)“, danach „Modell geladen in 2.218 s
+  (parakeet-ultra-0.6b-int8-pc)“. Die Abweichung ist vertretbar, weil v3
+  unverändert und hashgeprüft auf der Platte lag und der Rückweg nur einen
+  Neustart kostet.
 
-- ✅ Schritt 1: Commits [f6ae94f](https://github.com/ralfkuh-lab/diktier/commit/f6ae94f1bfec55a692f4a4bdf6e473390d3a5ccd)
-  (0.5.0) und [5657e12](https://github.com/ralfkuh-lab/diktier/commit/5657e123b417e8a7b337ea15d4288f6231f2f793)
-  (Rezept-Commit in der NOTICE) sind auf `main` gepusht, mit 0.4.0/0.4.1 davor. Das
-  Staging unter `.herd/model-release/…-r1/` hat die neue NOTICE und ein neu
-  erzeugtes `SHA256SUMS`.
-- 🤔 Schritt 2 blockiert: `ralfkuh-lab` ist ein persönlicher Account. Der
-  angemeldete `gh`-Account `fsrakul` hat dort nur Push-Rechte, keine Admin-Rechte.
-  Damit kann er kein Repo unter `ralfkuh-lab` anlegen und keine Immutability
-  einschalten. Ralf legt `ralfkuh-lab/diktier-models` an (öffentlich,
-  Immutable Releases an, `fsrakul` als Collaborator mit Write) oder meldet
-  `gh` zusätzlich als `ralfkuh-lab` an.
-- Schritte 3–5 folgen danach.
+### ✅ WP3b — Umstellen (mit Ralfs Go)
 
+Stand 2026-10-01:
 
-1. `main` pushen (0.4.0, 0.4.1, WP0–WP2). Historische App-Releases gehören
-   nicht dazu (F4).
-2. Immutability für das Ziel-Repo einschalten (F6).
-3. Vorab (aus WP0): In der NOTICE die Zeile „Commit des Rezepts“ auf den
-   gepushten Commit mit Skript und Lock setzen, sowohl in `LICENSES/` als auch im
-   Staging. `SHA256SUMS` neu erzeugen. Hochgeladen wird aus
-   `.herd/model-release/…` (LF), nicht aus einem Checkout, weil
-   `core.autocrlf=true` den Hash der NOTICE ändern würde. Danach den
-   Modell-Release als Draft auf den festgehaltenen Commit mit Rezept und NOTICE
-   anlegen. Assets hochladen: Encoder, Decoder, `vocab.txt`,
-   `NOTICE-parakeet-ultra.md`, `SHA256SUMS`. Danach Namen, Größen und
-   `uploaded`-Status prüfen, die Assets authentifiziert per Asset-API zurücklesen
-   und gegen die festen Hashes prüfen.
-4. Mit `--latest=false` veröffentlichen, dann Immutable-Status und öffentliche
-   URLs prüfen.
-5. **Anonymes Transport-Gate:** das 0.5.0-Binary lädt mit dem echten
-   `HttpTransport`, ohne Token und ohne Cache, aus den eingebetteten URLs in ein
-   frisches, isoliertes Verzeichnis. Größe und Hash stimmen, das Modell lädt.
+- ✅ Gesichert sind Logs, Umgebung (`DIKTIER_DEBUG_WAV=1`, `_KEEP` und `_DIR`
+  vorher leer) und `config.toml` in `%LOCALAPPDATA%\diktier\ultra-test\vorher\`.
+- ✅ Der v3-Vollcheck ist grün, 0.5.0 ist installiert.
+- ✅ Umgestellt um 09:04 UTC: `DIKTIER_DEBUG_WAV_KEEP=5000` und
+  `DIKTIER_DEBUG_WAV_DIR=%LOCALAPPDATA%\diktier\ultra-test\wav` als
+  Benutzervariablen und in der Startumgebung, `engine.model =
+  "parakeet-ultra-0.6b-int8-pc"`. Die Startzeile lautet „Debug-WAV an:
+  …\ultra-test\wav, behalte 5000“.
+- ✅ Rückweg-Gate live um 09:05 UTC: v3 lädt in 2,6 s ohne Netz, danach zurück
+  auf Ultra (2,2 s). Die Config steht auf Ultra.
+- ✅ Probediktat (Ralfs erstes Diktat) um 09:22:25Z, Lauf 1: Gate B1,
+  Inferenz 0,539 s, eingefügt. `rec_2026-10-01T09-22-25-500Z_lauf-1.wav` liegt im
+  Testverzeichnis, 16 kHz mono 32-bit-Float (WAVE_FORMAT_EXTENSIBLE), Größe
+  passend zu 151200 Samples.
+- **Testbeginn:** 2026-10-01T09:05:54Z (11:05:54 Ortszeit), der letzte
+  Ultra-Start. Das Ende für `-Prepare` ist 2026-10-08 11:05:54 Ortszeit, bei
+  Verlängerung 2026-10-12.
 
-### ⚠️ WP3b — Umstellen (mit Ralfs Go)
-
-Vorgezogen am 2026-10-01, ohne Umstellung: Die Logs und die bisherigen
-Debug-WAV-Variablen (`DIKTIER_DEBUG_WAV=1`, `_KEEP` und `_DIR` leer) liegen in
-`%LOCALAPPDATA%\diktier\ultra-test\vorher\`. Der v3-Vollcheck war grün (alle
-vier Hashes = Golden Set). 0.5.0 ist per `release.ps1` gebaut und still
-installiert; der Daemon läuft mit v3 („diktier 0.5.0 startet … v3“, „Debug-WAV
-an: …\Temp\diktier, behalte 10“). Offen sind Variablen, Config, Ultra-Download
-und das Rückweg-Gate; sie hängen an WP3a. Das Probediktat ist Ralfs erstes
-Diktat am nächsten Tag.
-
-
-1. `diktier.log` und `diktier.log.1` sichern, ebenso die bisherigen Werte der
-   `DIKTIER_DEBUG_WAV*`-Variablen.
-2. v3-Vollcheck, also Hashes des installierten v3-Verzeichnisses, und ein
-   v3-Probediktat.
-3. 0.5.0 per `release.ps1` bauen, silent installieren.
-4. Variablen nach Leitentscheidung 5 als Benutzervariablen setzen **und**
-   ausdrücklich in der Umgebung des gestarteten Daemons (Start-Process mit
-   gesetzter Umgebung). Config auf den Ultra-Schlüssel, Daemon starten.
-5. **Gate:** Das Log zeigt die Debug-WAV-Startzeile mit dem Testverzeichnis und
-   5000, „Modellartefakte vollständig und geprüft“ und „Modell geladen …
-   (parakeet-ultra-0.6b-int8-pc)“. Ein Probediktat erzeugt eine f32/16-kHz/
-   mono-WAV im Testverzeichnis, deren Laufnummer im Log steht.
-6. **Rückweg-Gate live:** Daemon beenden, Config auf v3, starten, diktieren
-   (v3-Ladezeile). Danach zurück auf Ultra. Ab hier läuft die Uhr des Tests.
-
-### 🔍 WP4 — Testlauf (7 Tage, Ralf)
+### ⏳ WP4 — Testlauf (7 Tage, Ralf)
 
 - Normal diktieren. Auffälliges (UX, Latenz, Ziffern) kurz mit Uhrzeit in
   `%LOCALAPPDATA%\diktier\ultra-test\notizen.md` festhalten.
