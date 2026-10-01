@@ -204,6 +204,13 @@ Ultra wird Default, wenn **alle** gelten:
 5. **Betrieb:** Im Testzeitraum gab es keinen Ultra-exklusiven Fehlerzustand
    (Watchdog, Engine-Fehler), und das Rückweg-Gate aus WP3b ist bestanden.
 6. **Ziffern:** Ralf sagt ausdrücklich Ja zur Zahlenschreibweise von Ultra.
+   ✅ **Erteilt am 2026-10-01:** „Dass Zahlen als Ziffern ausgegeben werden, ist
+   auch genau das, was ich möchte. Es nervt mich ehrlich gesagt ziemlich, dass
+   bei der Diktatfunktion bisher immer die Zahlen ausgeschrieben wurden.
+   Besonders bei Release-Nummern … wie zum Beispiel 2026.1 von Icaros.“ Für
+   `-Resolve` heißt das `-Ziffern ja`. Paare mit „Unterschied nur
+   Zahlenformat“ zählen in Kriterium 1 weiter als gleich (K5 ist nie ein
+   Erkennungsgewinn); die Vorliebe wirkt nur über Kriterium 6.
 
 Sonst: kein Wechsel oder „nicht belegt“.
 
