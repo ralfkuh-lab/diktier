@@ -341,7 +341,23 @@ wichtig:** Die 7-Tage-Vorbereitung vor dem Ende von Tag 11 anlegen und
 aufbewahren. Neu vorausgesetzt ist Python ≥ 3.11 für
 `release.ps1` und das Thread-Urteil in `bench-models.ps1`.
 
-### 🔍 WP3a — Veröffentlichen (einzeln mit Ralfs Go)
+### ⚠️ WP3a — Veröffentlichen (einzeln mit Ralfs Go)
+
+Stand 2026-10-01, 00:40 (Ralfs Go für alle vier Schritte am 2026-09-30):
+
+- ✅ Schritt 1: Commits [f6ae94f](https://github.com/ralfkuh-lab/diktier/commit/f6ae94f1bfec55a692f4a4bdf6e473390d3a5ccd)
+  (0.5.0) und [5657e12](https://github.com/ralfkuh-lab/diktier/commit/5657e123b417e8a7b337ea15d4288f6231f2f793)
+  (Rezept-Commit in der NOTICE) sind auf `main` gepusht, mit 0.4.0/0.4.1 davor. Das
+  Staging unter `.herd/model-release/…-r1/` hat die neue NOTICE und ein neu
+  erzeugtes `SHA256SUMS`.
+- 🤔 Schritt 2 blockiert: `ralfkuh-lab` ist ein persönlicher Account. Der
+  angemeldete `gh`-Account `fsrakul` hat dort nur Push-Rechte, keine Admin-Rechte.
+  Damit kann er kein Repo unter `ralfkuh-lab` anlegen und keine Immutability
+  einschalten. Ralf legt `ralfkuh-lab/diktier-models` an (öffentlich,
+  Immutable Releases an, `fsrakul` als Collaborator mit Write) oder meldet
+  `gh` zusätzlich als `ralfkuh-lab` an.
+- Schritte 3–5 folgen danach.
+
 
 1. `main` pushen (0.4.0, 0.4.1, WP0–WP2). Historische App-Releases gehören
    nicht dazu (F4).
@@ -362,7 +378,17 @@ aufbewahren. Neu vorausgesetzt ist Python ≥ 3.11 für
    `HttpTransport`, ohne Token und ohne Cache, aus den eingebetteten URLs in ein
    frisches, isoliertes Verzeichnis. Größe und Hash stimmen, das Modell lädt.
 
-### 🔍 WP3b — Umstellen (mit Ralfs Go)
+### ⚠️ WP3b — Umstellen (mit Ralfs Go)
+
+Vorgezogen am 2026-10-01, ohne Umstellung: Die Logs und die bisherigen
+Debug-WAV-Variablen (`DIKTIER_DEBUG_WAV=1`, `_KEEP` und `_DIR` leer) liegen in
+`%LOCALAPPDATA%\diktier\ultra-test\vorher\`. Der v3-Vollcheck war grün (alle
+vier Hashes = Golden Set). 0.5.0 ist per `release.ps1` gebaut und still
+installiert; der Daemon läuft mit v3 („diktier 0.5.0 startet … v3“, „Debug-WAV
+an: …\Temp\diktier, behalte 10“). Offen sind Variablen, Config, Ultra-Download
+und das Rückweg-Gate; sie hängen an WP3a. Das Probediktat ist Ralfs erstes
+Diktat am nächsten Tag.
+
 
 1. `diktier.log` und `diktier.log.1` sichern, ebenso die bisherigen Werte der
    `DIKTIER_DEBUG_WAV*`-Variablen.
